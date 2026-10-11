@@ -7,10 +7,13 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import psycopg
 from fastapi.exceptions import RequestValidationError
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from psycopg_pool import PoolTimeout
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.local.errors import EngineError
 from app.local.pg_index import PostgresKnowledgeIndex
@@ -171,6 +174,33 @@ async def create_app(
             status_code=400,
             content={"error": "invalid_request", "detail": f"{where}: {first.get('msg', 'invalid value')}".strip(": ")},
         )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        # Unknown addresses and wrong methods get the same {error, detail} shape as every other failure.
+        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "http_error")
+        detail = {404: "no such address", 405: "this method is not allowed here"}.get(exc.status_code, str(exc.detail))
+        return JSONResponse(status_code=exc.status_code, content={"error": code, "detail": detail}, headers=getattr(exc, "headers", None))
+
+    @app.exception_handler(psycopg.errors.DataError)
+    async def bad_value_handler(request: Request, exc: psycopg.errors.DataError):
+        # A value PostgreSQL cannot store (a NUL byte, a number out of range) is the caller's mistake, not ours.
+        return JSONResponse(status_code=400, content={"error": "invalid_request", "detail": "a value in the request is not acceptable"})
+
+    @app.exception_handler(psycopg.errors.IntegrityError)
+    async def integrity_handler(request: Request, exc: psycopg.errors.IntegrityError):
+        # A constraint said no. Unique and foreign-key violations are conflicts with what is stored (it already
+        # exists, it does not exist, or something still depends on it); anything else is a bad value.
+        if isinstance(exc, (psycopg.errors.UniqueViolation, psycopg.errors.ForeignKeyViolation)):
+            detail = "this already exists" if isinstance(exc, psycopg.errors.UniqueViolation) else "it refers to something that does not exist, or something still depends on it"
+            return JSONResponse(status_code=409, content={"error": "conflict", "detail": detail})
+        return JSONResponse(status_code=400, content={"error": "invalid_request", "detail": "a value in the request is not acceptable"})
+
+    @app.exception_handler(psycopg.OperationalError)
+    @app.exception_handler(PoolTimeout)
+    async def database_down_handler(request: Request, exc: Exception):
+        print(f"Database unavailable: {exc}", file=sys.stderr, flush=True)
+        return JSONResponse(status_code=503, content={"error": "database_unavailable", "detail": "the database is not reachable, try again shortly"}, headers={"Retry-After": "5"})
 
     @app.exception_handler(Exception)
     async def general_exception_handler(request: Request, exc: Exception):
@@ -341,9 +371,10 @@ async def create_app(
             module = importlib.import_module(full_module_name)
             if hasattr(module, "router"):
                 app.include_router(module.router)
-        except (ImportError, AttributeError):
-            # Routers not yet fully implemented
-            pass
+        except (ImportError, AttributeError) as exc:
+            # A router that cannot load must stop the engine from starting. Skipping it would leave every one of
+            # its addresses answering 404 while health still says ok.
+            raise RuntimeError(f"router {full_module_name} failed to load: {exc}") from exc
 
     return app
 

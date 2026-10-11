@@ -3,12 +3,12 @@
 import json
 import uuid
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 
 from app.local.chat_grounding import AsyncAnswerComposer
 from app.local.errors import NotFoundError
-from app.local.models import Citation, CreateThreadRequest
+from app.local.models import Citation, CreateThreadRequest, SendMessageRequest
 from app.local.pg_sync_index import PostgresKnowledgeIndexSync, PostgresSyncRetriever
 from app.local.store_chat import ChatStore
 
@@ -57,8 +57,16 @@ async def get_thread(request: Request, thread_id: str):
     }
 
 
+@router.delete("/threads/{thread_id}", status_code=204)
+async def delete_thread(request: Request, thread_id: str):
+    """Delete a thread and its messages. Idempotent: deleting one that is already gone is still 204."""
+    store = ChatStore(request.app.state.store.pool)
+    await store.delete_thread(thread_id)
+    return Response(status_code=204)
+
+
 @router.post("/threads/{thread_id}/messages")
-async def send_message(request: Request, thread_id: str, body: dict):
+async def send_message(request: Request, thread_id: str, body: SendMessageRequest):
     """Send a message and stream the response."""
 
     store = ChatStore(request.app.state.store.pool)
@@ -68,9 +76,7 @@ async def send_message(request: Request, thread_id: str, body: dict):
     if not thread:
         raise NotFoundError(f"thread {thread_id} not found")
 
-    text = body.get("text")
-    if not text:
-        raise ValueError("message text is required")
+    text = body.text  # already trimmed, non-empty and bounded by the request model
 
     user_message_id = str(uuid.uuid4())
     assistant_message_id = str(uuid.uuid4())

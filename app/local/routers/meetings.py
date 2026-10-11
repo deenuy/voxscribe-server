@@ -8,7 +8,8 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
-from app.local.errors import ConflictError, ConsentRequiredError
+from app.local.errors import ConflictError, ConsentRequiredError, InvalidRequestError, NetworkDisabledError, NotFoundError
+from app.local.http_utils import json_object, parse_model
 from app.local.export import export_meeting_markdown
 from app.local.models import (
     CreateMeetingRequest,
@@ -336,15 +337,33 @@ async def export_meeting(request: Request, meeting_id: str, format: str = "markd
 @router.post("/{meeting_id}/attachments")
 async def attach_source(request: Request, meeting_id: str):
     """Attach a source to a meeting."""
-    body = await request.json()
+    body = await json_object(request)
     source_id = body.get("sourceId")
-    if not source_id:
-        raise HTTPException(status_code=400, detail="sourceId required")
+    if not isinstance(source_id, str) or not source_id:
+        raise InvalidRequestError("sourceId: required")
 
     store = MeetingStore(request.app.state.store.pool)
     await store.get_meeting(meeting_id)  # Verify exists
+    async with request.app.state.store.pool.connection() as conn:
+        if not await (await conn.execute("SELECT 1 FROM sources WHERE id = %s", (source_id,))).fetchone():
+            raise NotFoundError(f"source {source_id} not found")
     await store.attach_source(meeting_id, source_id)
     return ""
+
+
+@router.get("/{meeting_id}/attachments")
+async def list_attachments(request: Request, meeting_id: str):
+    """The sources attached to a meeting (the count on the meeting says how many; this says which)."""
+    store = MeetingStore(request.app.state.store.pool)
+    await store.get_meeting(meeting_id)  # 404 if there is no such meeting
+    async with request.app.state.store.pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT s.id, s.name, s.kind FROM meeting_attachments a JOIN sources s ON s.id = a.source_id
+               WHERE a.meeting_id = %s ORDER BY s.name""",
+            (meeting_id,),
+        )
+        rows = await cur.fetchall()
+    return {"items": [{"sourceId": r[0], "name": r[1], "kind": r[2]} for r in rows]}
 
 
 @router.delete("/{meeting_id}/attachments/{source_id}")
@@ -366,8 +385,15 @@ async def import_meeting(request: Request):
     from app.local.job_runner import get_runner
     from app.local.models import ImportMeetingRequest
 
-    body = await request.json()
-    import_req = ImportMeetingRequest(**body)
+    import_req = parse_model(ImportMeetingRequest, await json_object(request))
+    # Everything the job needs is checked now, so a bad request is a 400 and not a job that fails later.
+    if import_req.kind in ("audio", "file") and not import_req.path:
+        raise InvalidRequestError(f"path: required to import {import_req.kind}")
+    if import_req.kind == "youtube":
+        if not import_req.url:
+            raise InvalidRequestError("url: required to import a YouTube link")
+        if request.app.state.settings.privacy_mode == "offline":
+            raise NetworkDisabledError("importing a YouTube link needs the network, which is off in offline mode")
 
     store = MeetingStore(request.app.state.store.pool)
 

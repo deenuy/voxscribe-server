@@ -1,5 +1,18 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.2.0
+
+### New Features
+- Added the ability to rename a label, delete a chat thread, list the sources attached to a meeting, and open a single project.
+
+### Bug Fixes
+- Fixed requests with unusual characters or oversized page sizes crashing the engine instead of being refused politely.
+- Fixed unknown addresses and wrong methods answering in a different format from every other error.
+- Fixed deleting a project or an idea answering with a body that browsers and proxies are not allowed to expect.
+- Fixed idea extraction claiming to run when it could not, and it now says clearly that it is not available yet.
+- Prevented blank or oversized names and titles, unknown idea types, ideas pointing at missing projects, and negative note times from being saved.
+- Prevented an engine with a broken part from starting and looking healthy.
+
 ## What's New in VoxScribe Server 0.1.1
 
 ### Bug Fixes
