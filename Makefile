@@ -86,3 +86,41 @@ db-reset: ## Drop and recreate the engine schema (requires CONFIRM=yes)
 .PHONY: clean
 clean: ## Remove the local data directory (sessions + sqlite db)
 	rm -rf ./data
+
+# ---------------------------------------------------------------------------
+# Core wheel management (rebuild from source, switch between pinned/dev)
+# ---------------------------------------------------------------------------
+
+CORE_DIR ?= ../core-pkg
+CORE_TAG ?= v0.1.1
+
+.PHONY: core-wheel
+core-wheel: ## Rebuild the pinned wheel from core repo git tag
+	@echo "Building voxscribe-core from tag $(CORE_TAG)..."
+	@TMPDIR=$$(mktemp -d); \
+	  git -C $(CORE_DIR) archive $(CORE_TAG) | tar -x -C $$TMPDIR; \
+	  cd $$TMPDIR && \
+	  python3.13 -m venv .venv && \
+	  .venv/bin/python -m pip install -q build && \
+	  .venv/bin/python -m build --wheel && \
+	  WHL=$$(ls -1 dist/voxscribe_core-*.whl | tail -1); \
+	  WHL_BASE=$$(basename $$WHL); \
+	  cd - > /dev/null; \
+	  rm -f wheels/voxscribe_core-*.whl; \
+	  cp $$TMPDIR/dist/$$WHL_BASE wheels/; \
+	  WHL_HASH=$$(shasum -a 256 wheels/$$WHL_BASE | cut -d' ' -f1); \
+	  echo "Wheel ready: wheels/$$WHL_BASE"; \
+	  echo "SHA256: $$WHL_HASH"; \
+	  echo "Content changed: config version, CHANGELOG style, resource path docs."; \
+	  echo "Next: git add wheels/ && git commit && uv lock"
+
+.PHONY: core-dev
+core-dev: ## Switch to editable development source of voxscribe-core (sibling repo)
+	uv pip install --python .venv/bin/python -e $(CORE_DIR)
+	@echo "Switched to editable voxscribe-core from $(CORE_DIR)"
+	@echo "Run: uv sync to update dependencies"
+
+.PHONY: core-pinned
+core-pinned: ## Switch back to the pinned wheel version
+	uv sync --frozen --reinstall-package voxscribe-core
+	@echo "Switched back to pinned wheel from wheels/"
