@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## What's New in VoxScribe Server 0.2.0
 
 ### New Features
 - Added the ability to rename a label, delete a chat thread, list the sources attached to a meeting, and open a single project.
