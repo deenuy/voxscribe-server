@@ -51,31 +51,39 @@ claim a device, since the recording already finished client-side.
 ## voxscribe-core dependency
 
 This server depends on voxscribe-core, the shared intelligence kernel. The
-wheel is built from the core repo, tracked here at `wheels/voxscribe_core-0.1.1-py3-none-any.whl`,
-and pinned in uv.lock to ensure every checkout builds identically.
+dependency is pinned to an exact version and resolved from a wheel that is
+tracked in this repository at `wheels/voxscribe_core-0.1.1-py3-none-any.whl`.
+The path is relative to `pyproject.toml` and `uv.lock` records the wheel's
+sha256, so any checkout builds the same way with no sibling repository needed.
+The `knowledge` extra (pypdf, openpyxl) is requested, so PDF and spreadsheet
+ingestion work.
 
-The wheel includes the knowledge extra (pypdf, openpyxl) for PDF and spreadsheet
-support. To rebuild it from source (after a core update):
+To rebuild the wheel from a core release tag (after a core update):
 
 ```bash
-make core-wheel          # build from ../core-pkg tag v0.1.1
-git add wheels/ && git commit && uv lock
+make core-wheel                       # builds from ../voxscribe-core at tag v0.1.1
+make core-wheel CORE_TAG=v0.1.2       # or another tag; CORE_DIR=... for another checkout
+# if the version changed, update the pin and the file name in pyproject.toml, then:
+uv lock --upgrade-package voxscribe-core && git add wheels pyproject.toml uv.lock
 ```
 
-### Development: switch between pinned wheel and editable source
+Rebuilding from the same tag gives the same bytes (the build uses the tag's commit
+time), so the hash only changes when core's content changes. If you swap the wheel
+without refreshing the lock, `uv sync --frozen` refuses it because the hash no longer
+matches. That is the pin doing its job.
+
+### Development: switch between the pinned wheel and the sibling core
 
 To work on voxscribe-core while running this server:
 
 ```bash
-make core-dev            # use editable ../core-pkg
-uv sync                  # pick up any new core dependencies
-# ... make changes to ../core-pkg ...
-# when done:
+make core-dev            # installs ../voxscribe-core in editable mode
+# ... change ../voxscribe-core; changes are picked up on the next import ...
 make core-pinned         # back to the pinned wheel
 ```
 
-The editable install works seamlessly: changes to ../core-pkg are picked up on
-the next import, no rebuild needed.
+Switching back uses `uv sync --frozen --reinstall-package voxscribe-core`. A plain
+`uv sync` does not undo the editable install, because the version number is the same.
 
 ## Run it
 

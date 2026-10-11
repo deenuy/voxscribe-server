@@ -88,15 +88,14 @@ voxscribe-engine = "app.local.engine:run"
 # ---------------------------------------------------------------------------
 # Path dependencies (uv)
 # ---------------------------------------------------------------------------
-# Production: resolve voxscribe-core from tracked wheel in project root.
-# The wheel is built from core repo and committed to enable zero-setup deployment.
-# find-links with project-anchored path allows extras to resolve from wheel metadata.
-# Development override: to use editable source instead of wheel, run:
-#   uv pip install --python .venv/bin/python -e ../voxscribe-core
-# To return to pinned wheel:
-#   uv sync --frozen --reinstall-package voxscribe-core
-[tool.uv]
-find-links = ["wheels"]
+# voxscribe-core comes from a wheel that is tracked in this repository under
+# wheels/, so any checkout works with no sibling repository. The path is relative
+# to this file, and uv.lock records the wheel's sha256. When the pinned version
+# changes, update the dependency pin above and the file name below, or run
+# `make core-wheel` and follow what it prints.
+# Development against the sibling core: `make core-dev`. Back to the wheel: `make core-pinned`.
+[tool.uv.sources]
+voxscribe-core = { path = "wheels/voxscribe_core-0.1.1-py3-none-any.whl" }
 
 # ---------------------------------------------------------------------------
 # Tool: pytest

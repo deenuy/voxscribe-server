@@ -91,28 +91,24 @@ clean: ## Remove the local data directory (sessions + sqlite db)
 # Core wheel management (rebuild from source, switch between pinned/dev)
 # ---------------------------------------------------------------------------
 
-CORE_DIR ?= ../core-pkg
+CORE_DIR ?= ../voxscribe-core
 CORE_TAG ?= v0.1.1
 
 .PHONY: core-wheel
-core-wheel: ## Rebuild the pinned wheel from core repo git tag
-	@echo "Building voxscribe-core from tag $(CORE_TAG)..."
-	@TMPDIR=$$(mktemp -d); \
-	  git -C $(CORE_DIR) archive $(CORE_TAG) | tar -x -C $$TMPDIR; \
-	  cd $$TMPDIR && \
-	  python3.13 -m venv .venv && \
-	  .venv/bin/python -m pip install -q build && \
-	  .venv/bin/python -m build --wheel && \
-	  WHL=$$(ls -1 dist/voxscribe_core-*.whl | tail -1); \
-	  WHL_BASE=$$(basename $$WHL); \
-	  cd - > /dev/null; \
+core-wheel: ## Rebuild the pinned voxscribe-core wheel from a core git tag
+	@echo "Building voxscribe-core from tag $(CORE_TAG) in $(CORE_DIR)..."
+	@set -e; TMPDIR=$$(mktemp -d); \
+	  git -C "$(CORE_DIR)" archive "$(CORE_TAG)" | tar -x -C "$$TMPDIR"; \
+	  SOURCE_DATE_EPOCH=$$(git -C "$(CORE_DIR)" log -1 --format=%ct "$(CORE_TAG)") \
+	    uv build --wheel --out-dir "$$TMPDIR/dist" "$$TMPDIR"; \
+	  WHL_BASE=$$(basename "$$(ls -1 $$TMPDIR/dist/voxscribe_core-*.whl | tail -1)"); \
 	  rm -f wheels/voxscribe_core-*.whl; \
-	  cp $$TMPDIR/dist/$$WHL_BASE wheels/; \
-	  WHL_HASH=$$(shasum -a 256 wheels/$$WHL_BASE | cut -d' ' -f1); \
+	  cp "$$TMPDIR/dist/$$WHL_BASE" wheels/; \
+	  rm -rf "$$TMPDIR"; \
 	  echo "Wheel ready: wheels/$$WHL_BASE"; \
-	  echo "SHA256: $$WHL_HASH"; \
-	  echo "Content changed: config version, CHANGELOG style, resource path docs."; \
-	  echo "Next: git add wheels/ && git commit && uv lock"
+	  echo "SHA256: $$(shasum -a 256 wheels/$$WHL_BASE | cut -d' ' -f1)"; \
+	  echo "Next: make sure pyproject.toml pins this version and names this file under [tool.uv.sources],"; \
+	  echo "      then run: uv lock --upgrade-package voxscribe-core && git add wheels pyproject.toml uv.lock"
 
 .PHONY: core-dev
 core-dev: ## Switch to editable development source of voxscribe-core (sibling repo)
