@@ -5,10 +5,10 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
-from app.local.errors import ConflictError, ConsentRequiredError, InvalidRequestError, NetworkDisabledError, NotFoundError
+from app.local.errors import ConflictError, ConsentRequiredError, EngineError, InvalidRequestError, NetworkDisabledError, NotFoundError
 from app.local.http_utils import json_object, parse_model
 from app.local.export import export_meeting_markdown
 from app.local.models import (
@@ -87,8 +87,30 @@ async def update_meeting(request: Request, meeting_id: str, body: UpdateMeetingR
         reminder_enabled=body.reminderEnabled,
         enhance_style=body.enhanceStyle,
         auto_stop_minutes=body.autoStopMinutes,
+        base_revision=body.baseRevision,
+        **({"project_id": (body.projectId or "").strip() or None} if "projectId" in body.model_fields_set else {}),
     )
     return meeting.model_dump(exclude_none=True)
+
+
+@router.post("/{meeting_id}/edits")
+async def commit_edits(request: Request, meeting_id: str, idempotency_key: str | None = Header(None)):
+    """Commit an edit session on a scribe atomically: title, context and project, transcript lines, the summary and
+    tasks in one transaction. Every piece carries the revision the person last saw; if any changed, nothing is written
+    and the 409 `revision_conflict` lists the pieces (`items`). Send an `Idempotency-Key` header to make a retry safe:
+    a commit that already succeeded answers again with the same body. 400 for a bad value anywhere (nothing written)."""
+    from fastapi.responses import JSONResponse
+
+    from app.local.edit_models import EditRequest
+    from app.local.store_edits import apply_edits
+
+    body = parse_model(EditRequest, await json_object(request))
+    if body.is_empty():
+        raise InvalidRequestError("nothing to change")
+    if idempotency_key is not None and not (1 <= len(idempotency_key) <= 200):
+        raise InvalidRequestError("Idempotency-Key: 1 to 200 characters")
+    response, replayed = await apply_edits(MeetingStore(request.app.state.store.pool), meeting_id, body, idempotency_key)
+    return JSONResponse(content=response, headers={"Idempotent-Replay": "true"} if replayed else None)
 
 
 @router.delete("/{meeting_id}", status_code=204)
@@ -250,11 +272,20 @@ async def regenerate_summary(request: Request, meeting_id: str):
 
     Returns 202 Accepted if the provider is available.
     Returns 503 Provider Unavailable if the LLM provider is down.
+    Returns 409 `summary_edited` when a person wrote or changed the summary: regenerating replaces their words, so it
+    needs a body of `{"overwriteEdits": true}`.
     """
     from fastapi import Response
 
     store = MeetingStore(request.app.state.store.pool)
     await store.get_meeting(meeting_id)  # Verify exists
+    if (await store.get_summary(meeting_id)).get("edited"):
+        try:
+            sent = await request.json()
+        except ValueError:
+            sent = {}
+        if not (isinstance(sent, dict) and sent.get("overwriteEdits") is True):
+            raise EngineError("summary_edited", "this summary was edited by hand; regenerating replaces it. Send overwriteEdits: true to confirm", 409)
 
     job_id = str(uuid.uuid4())
     # Mark summary as pending

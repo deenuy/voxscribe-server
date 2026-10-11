@@ -16,7 +16,9 @@ from fastapi.responses import JSONResponse
 from psycopg_pool import PoolTimeout
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.local import tenancy
 from app.local.errors import EngineError
+from app.local.identity import IdentityError, tenant_for
 from app.local.version import engine_version
 from app.local.pg_index import PostgresKnowledgeIndex
 from app.local.providers import select_providers
@@ -38,7 +40,13 @@ async def lifespan(app: FastAPI):
     try:
         from app.local.model_service import restore_selected_roles
 
-        await restore_selected_roles(app.state.store.pool)
+        pool = app.state.store.pool
+        if getattr(pool, "enforced", False):
+            for key in await pool.provisioner.known_tenants():
+                with tenancy.tenant_scope(key):
+                    await restore_selected_roles(pool)
+        else:
+            await restore_selected_roles(pool)
     except Exception as exc:  # the defaults from configuration still apply
         print(f"Restoring chosen models failed: {exc}", file=sys.stderr, flush=True)
 
@@ -84,7 +92,7 @@ async def create_app(
 
     # Connect to database
     try:
-        store = await Store.create(settings.database_url, schema=schema)
+        store = await Store.create(settings.database_url, schema=schema, enforced=settings.tenancy_enforced)
     except Exception as e:
         raise RuntimeError(f"Failed to connect to database: {e}") from e
 
@@ -124,37 +132,70 @@ async def create_app(
     app.state.auth_token = os.environ.get("VOXSCRIBE_TOKEN", str(uuid.uuid4()))
     app.state.settings = settings
     app.state.started_at = time.time()
+    # Tenant isolation: with an identity service configured, every request names a person and each person's data is
+    # kept in a schema of their own. Without one, nothing changes (one person at a time).
+    app.state.identity = None
+    if settings.tenancy_enforced:
+        from app.local.identity import IdentityVerifier
+
+        app.state.identity = IdentityVerifier(
+            issuer=settings.identity_issuer,
+            audience=settings.identity_audience,
+            jwks_url=settings.identity_jwks_url,
+            jwks_file=settings.identity_jwks_file or None,
+        )
 
     # Auth middleware
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        if app.state.auth_disabled or request.url.path == "/health":
+        if request.url.path == "/health":
             return await call_next(request)
 
-        # Check Authorization header
-        auth_header = request.headers.get("Authorization", "")
-        token = None
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-        elif request.url.path.endswith("/live") or request.url.path == "/v1/events":
-            # Query token only where a browser cannot set a header (WebSocket and SSE).
-            token = request.query_params.get("token")
+        if not app.state.auth_disabled:
+            # Check Authorization header
+            auth_header = request.headers.get("Authorization", "")
+            token = None
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+            elif request.url.path.endswith("/live") or request.url.path == "/v1/events":
+                # Query token only where a browser cannot set a header (WebSocket and SSE).
+                token = request.query_params.get("token")
 
-        if not token:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "unauthorized", "detail": "token required"},
-            )
+            if not token:
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "unauthorized", "detail": "token required"},
+                )
 
-        # Check token (constant time comparison)
-        if not _constant_time_compare(token, app.state.auth_token):
-            return JSONResponse(
-                status_code=401,
-                content={"error": "unauthorized", "detail": "invalid token"},
-            )
+            # Check token (constant time comparison)
+            if not _constant_time_compare(token, app.state.auth_token):
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "unauthorized", "detail": "invalid token"},
+                )
 
-        request.state.token = token
-        return await call_next(request)
+            request.state.token = token
+
+        if app.state.identity is None:
+            return await call_next(request)  # tenant isolation is off: one shared scope
+
+        # Tenant isolation is on. Facts about the machine (health, the AI runtime's state) touch no one's data;
+        # everything else needs a verified person, and runs inside that person's scope.
+        path = request.url.path
+        if path == "/v1/health" or path.startswith("/v1/engine/"):
+            with tenancy.system_scope():
+                return await call_next(request)
+        identity_token = request.headers.get("X-Identity-Token")
+        if not identity_token and path == "/v1/events":
+            identity_token = request.query_params.get("identity")  # an EventSource cannot set headers
+        try:
+            scope = await tenant_for(app, identity_token)
+        except IdentityError as exc:
+            code = "identity_required" if not identity_token else "identity_invalid"
+            return JSONResponse(status_code=401, content={"error": code, "detail": exc.detail})
+        request.state.tenant = scope
+        with tenancy.tenant_scope(scope):
+            return await call_next(request)
 
     # CORS is added after the auth middleware so it is the OUTERMOST layer: preflight requests
     # (which cannot carry a token) and 401 responses must still get CORS headers, or a browser
@@ -173,7 +214,7 @@ async def create_app(
     async def engine_error_handler(request: Request, exc: EngineError):
         return JSONResponse(
             status_code=exc.status,
-            content={"error": exc.code, "detail": exc.detail},
+            content={"error": exc.code, "detail": exc.detail, **exc.extra},
         )
 
     @app.exception_handler(RequestValidationError)

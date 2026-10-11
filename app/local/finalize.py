@@ -8,8 +8,9 @@ visible. Tasks are kept in a set while they run, since the event loop only holds
 
 import asyncio
 import logging
+from contextlib import nullcontext
 
-from . import meeting_bus
+from . import meeting_bus, tenancy
 from .store_meetings import MeetingStore
 
 log = logging.getLogger(__name__)
@@ -46,11 +47,20 @@ def schedule_finalize(app, meeting_id: str) -> asyncio.Task:
 
 
 async def recover_unfinished(app) -> int:
-    """At startup, finish meetings a crash left in 'processing'. Returns how many were scheduled."""
-    async with app.state.store.pool.connection() as conn:
-        rows = await (await conn.execute("SELECT id FROM meetings WHERE status = 'processing'")).fetchall()
-    for (meeting_id,) in rows:
-        schedule_finalize(app, meeting_id)
-    if rows:
-        log.info("Recovering %d meeting(s) left processing by a restart", len(rows))
-    return len(rows)
+    """At startup, finish meetings a crash left in 'processing'. Returns how many were scheduled.
+
+    With tenant isolation on, every tenant's schema is checked and each meeting is finished inside its own tenant's
+    scope (the tasks it starts inherit that scope). With it off there is one shared scope."""
+    pool = app.state.store.pool
+    enforced = getattr(pool, "enforced", False)
+    total = 0
+    for scope in (await pool.provisioner.known_tenants()) if enforced else [None]:
+        with tenancy.tenant_scope(scope) if scope else nullcontext():
+            async with pool.connection() as conn:
+                rows = await (await conn.execute("SELECT id FROM meetings WHERE status = 'processing'")).fetchall()
+            for (meeting_id,) in rows:
+                schedule_finalize(app, meeting_id)
+            total += len(rows)
+    if total:
+        log.info("Recovering %d meeting(s) left processing by a restart", total)
+    return total

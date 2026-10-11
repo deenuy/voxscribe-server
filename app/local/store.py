@@ -7,6 +7,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from .db import reset_connection
+from .tenancy import TenantPool
 from .errors import DatabaseUnavailableError, NotFoundError
 from .models import (
     Block,
@@ -35,12 +36,13 @@ class Store:
         self.pool = pool
 
     @classmethod
-    async def create(cls, database_url: str, schema: str | None = None) -> "Store":
+    async def create(cls, database_url: str, schema: str | None = None, enforced: bool = False) -> "Store":
         """Create a store with a connection pool.
 
         Args:
             database_url: PostgreSQL connection URL
             schema: Optional schema name to set search_path (for tests)
+            enforced: tenant isolation on: every connection is borrowed for the tenant in scope (see tenancy.py)
         """
         async def configure_conn(conn):
             """Configure each connection with the test schema if provided."""
@@ -57,7 +59,7 @@ class Store:
             reset=reset_connection,
         )
         await pool.open()
-        return cls(pool)
+        return cls(TenantPool(pool, database_url=database_url, enforced=enforced, base_schema=schema))
 
     async def close(self):
         """Close the connection pool."""

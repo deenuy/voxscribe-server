@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
-from app.local import events
+from app.local import events, tenancy
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class JobRunner:
                 "kind": kind,
                 "state": "queued",
                 "detail": detail or {},
+                "tenant": tenancy.current_tenant(),
             }
 
         # Publish initial queued event
@@ -106,7 +107,10 @@ class JobRunner:
     async def get_job(self, job_id: str) -> dict | None:
         """Get job status."""
         async with self._lock:
-            return self.jobs.get(job_id)
+            job = self.jobs.get(job_id)
+        if job is None or job.get("tenant") != tenancy.current_tenant():
+            return None  # someone else's job looks exactly like a job that does not exist
+        return {k: v for k, v in job.items() if k != "tenant"}
 
 
 # Global job runner instance

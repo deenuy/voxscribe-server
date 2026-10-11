@@ -37,8 +37,36 @@ EXPERT_MODELS = {
     },
 }
 
-# In-memory model role selection (persisted to database by store)
-_selected_roles: dict[str, list[str]] = {}
+# In-memory model role selection (persisted to the database as settings). Which model holds a role is a choice each
+# person makes for themselves, so it is kept per tenant: one person's choice never changes another's.
+_roles_by_tenant: dict[str | None, dict[str, list[str]]] = {}
+
+
+class _TenantRoles:
+    """`_selected_roles` for whichever tenant is in scope (the single shared scope when isolation is off)."""
+
+    def _d(self) -> dict[str, list[str]]:
+        from . import tenancy
+
+        return _roles_by_tenant.setdefault(tenancy.current_tenant(), {})
+
+    def __getitem__(self, k):
+        return self._d()[k]
+
+    def __setitem__(self, k, v):
+        self._d()[k] = v
+
+    def get(self, k, default=None):
+        return self._d().get(k, default)
+
+    def items(self):
+        return self._d().items()
+
+    def clear(self):
+        self._d().clear()
+
+
+_selected_roles = _TenantRoles()
 
 
 def set_selected_roles(model_id: str, roles: list[str]) -> None:

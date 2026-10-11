@@ -3,7 +3,11 @@
 import asyncio
 from typing import Any
 
-_buses: dict[str, "MeetingBus"] = {}
+from . import tenancy
+
+# (tenant, meeting id) -> bus. A meeting id is only unique inside its tenant, and one tenant must never receive
+# another's live events.
+_buses: dict[tuple[str | None, str], "MeetingBus"] = {}
 
 
 class MeetingBus:
@@ -29,9 +33,10 @@ class MeetingBus:
 
 def get_bus(meeting_id: str) -> MeetingBus:
     """Get or create the bus for a meeting."""
-    if meeting_id not in _buses:
-        _buses[meeting_id] = MeetingBus(meeting_id)
-    return _buses[meeting_id]
+    key = (tenancy.current_tenant(), meeting_id)
+    if key not in _buses:
+        _buses[key] = MeetingBus(meeting_id)
+    return _buses[key]
 
 
 async def publish(meeting_id: str, event_type: str, data: Any) -> None:

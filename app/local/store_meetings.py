@@ -23,6 +23,9 @@ MAX_SPEAKER_CHARS = 120
 _WORDS_SQL = "COALESCE(sum(cardinality(regexp_split_to_array(btrim(text), '\\s+'))) FILTER (WHERE btrim(text) <> ''), 0)"
 
 
+_UNSET = object()  # "not sent", as distinct from None ("clear it")
+
+
 class MeetingStore:
     """PostgreSQL storage for meetings and related data."""
 
@@ -117,8 +120,11 @@ class MeetingStore:
         reminder_enabled: bool | None = None,
         enhance_style: str | None = None,
         auto_stop_minutes: int | None = None,
+        project_id=_UNSET,
+        base_revision: int | None = None,
     ) -> Meeting:
-        """Update meeting fields (only the allowed ones from PATCH)."""
+        """Update meeting fields (only the allowed ones from PATCH). `project_id` None takes it out of its project; left
+        out, the project is not touched."""
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         updates = {"updated_at": now}
         if title is not None:
@@ -131,18 +137,37 @@ class MeetingStore:
             updates["enhance_style"] = enhance_style
         if auto_stop_minutes is not None:
             updates["auto_stop_minutes"] = auto_stop_minutes
+        if project_id is not _UNSET:
+            updates["project_id"] = project_id
 
         cols = [k for k in updates.keys()]
         vals = [updates[k] for k in cols]
         vals.append(meeting_id)
 
-        set_clause = ", ".join(f"{k} = %s" for k in cols)
-        async with self.pool.connection() as conn:
-            await conn.execute(
-                f"UPDATE meetings SET {set_clause} WHERE id = %s",
-                vals,
-            )
-            await conn.commit()
+        set_clause = ", ".join(f"{k} = %s" for k in cols) + ", revision = revision + 1"
+        where = "id = %s"
+        if base_revision is not None:
+            where += " AND revision = %s"
+            vals.append(base_revision)
+        try:
+            async with self.pool.connection() as conn:
+                cur = await conn.execute(
+                    f"UPDATE meetings SET {set_clause} WHERE {where} RETURNING revision",
+                    vals,
+                )
+                changed = await cur.fetchone()
+                if not changed and base_revision is not None:
+                    row = await (await conn.execute("SELECT revision FROM meetings WHERE id = %s", (meeting_id,))).fetchone()
+                    if row:
+                        raise EngineError(
+                            "revision_conflict",
+                            f"this scribe changed (now revision {row[0]}); reload and try again",
+                            409,
+                            {"items": [{"kind": "meeting", "id": meeting_id, "currentRevision": row[0]}]},
+                        )
+                await conn.commit()
+        except psycopg.errors.ForeignKeyViolation:
+            raise InvalidRequestError("projectId: no such project") from None
         return await self.get_meeting(meeting_id)
 
     async def start_meeting(self, meeting_id: str) -> Meeting:
@@ -287,6 +312,7 @@ class MeetingStore:
             publishedAt=iso(row["published_at"]),
             transcriptRevision=row["transcript_revision"],
             summaryStale=bool(row["summary_stale"]),
+            revision=row["revision"],
             createdAt=iso_z(row["created_at"]),
             updatedAt=iso_z(row["updated_at"]),
         )
@@ -366,6 +392,36 @@ class MeetingStore:
             raise NotFoundError(f"meeting {meeting_id} not found")
         return row["status"] == "done", row["transcript_revision"]
 
+    async def _apply_segment_edit(self, conn, meeting_id: str, seg: dict, new_text, speaker_given: bool, new_speaker, now: str) -> bool:
+        """Write one segment edit inside the caller's transaction (the segment row is already locked and its revision
+        already checked). Keeps the previous wording, bumps the transcript revision and marks the summary stale. A change
+        that changes nothing writes nothing. Returns whether anything changed."""
+        text_after = new_text if new_text is not None else seg["text"]
+        speaker_after = new_speaker if speaker_given else seg["speaker"]
+        if text_after == seg["text"] and speaker_after == seg["speaker"]:
+            return False
+        revision = seg["revision"] + 1
+        await conn.execute(
+            """UPDATE transcript_segments
+               SET text = %s, speaker = %s, revision = %s, edited_at = %s, state = 'stable'
+               WHERE id = %s""",
+            (text_after, speaker_after, revision, now, seg["id"]),
+        )
+        await conn.execute(
+            """INSERT INTO transcript_edits
+               (meeting_id, segment_id, revision, before_text, after_text, before_speaker, after_speaker, edited_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (meeting_id, seg["id"], revision, seg["text"], text_after, seg["speaker"], speaker_after, now),
+        )
+        await conn.execute(
+            f"""UPDATE meetings SET transcript_revision = transcript_revision + 1, summary_stale = true,
+                updated_at = %s,
+                word_count = (SELECT {_WORDS_SQL} FROM transcript_segments WHERE meeting_id = %s)
+                WHERE id = %s""",
+            (now, meeting_id, meeting_id),
+        )
+        return True
+
     async def edit_segment(
         self,
         meeting_id: str,
@@ -427,29 +483,7 @@ class MeetingStore:
                         409,
                     )
 
-                text_after = new_text if new_text is not None else seg["text"]
-                speaker_after = new_speaker if speaker_given else seg["speaker"]
-                if text_after != seg["text"] or speaker_after != seg["speaker"]:
-                    revision = seg["revision"] + 1
-                    await conn.execute(
-                        """UPDATE transcript_segments
-                           SET text = %s, speaker = %s, revision = %s, edited_at = %s, state = 'stable'
-                           WHERE id = %s""",
-                        (text_after, speaker_after, revision, now, segment_id),
-                    )
-                    await conn.execute(
-                        """INSERT INTO transcript_edits
-                           (meeting_id, segment_id, revision, before_text, after_text, before_speaker, after_speaker, edited_at)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (meeting_id, segment_id, revision, seg["text"], text_after, seg["speaker"], speaker_after, now),
-                    )
-                    await conn.execute(
-                        f"""UPDATE meetings SET transcript_revision = transcript_revision + 1, summary_stale = true,
-                            updated_at = %s,
-                            word_count = (SELECT {_WORDS_SQL} FROM transcript_segments WHERE meeting_id = %s)
-                            WHERE id = %s""",
-                        (now, meeting_id, meeting_id),
-                    )
+                await self._apply_segment_edit(conn, meeting_id, seg, new_text, speaker_given, new_speaker, now)
                 cur = await conn.execute("SELECT * FROM transcript_segments WHERE id = %s", (segment_id,))
                 row = await cur.fetchone()
                 cur = await conn.execute(
@@ -621,8 +655,10 @@ class MeetingStore:
                 "overview": row["overview"],
                 "details": row["details"] or [],
                 "generatedAt": generated_at,
+                "revision": row["revision"],
+                "edited": bool(row["edited"]),
             }
-        return {"status": "none", "overview": None, "details": [], "generatedAt": None}
+        return {"status": "none", "overview": None, "details": [], "generatedAt": None, "revision": 0, "edited": False}
 
     async def set_summary_pending(self, meeting_id: str):
         """Mark summary as pending (during processing)."""
@@ -654,6 +690,9 @@ class MeetingStore:
                     overview = EXCLUDED.overview,
                     details = EXCLUDED.details,
                     generated_at = EXCLUDED.generated_at,
+                    revision = summaries.revision + 1,
+                    edited = false,
+                    edited_at = NULL,
                     updated_at = EXCLUDED.updated_at""",
                 (meeting_id, "ready", overview, json.dumps(details), generated_at, now, now),
             )

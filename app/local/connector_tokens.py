@@ -8,10 +8,14 @@ When a token expires, the engine publishes connector.token_needed event.
 import asyncio
 from datetime import datetime
 
-from . import events
+from . import events, tenancy
 
-# In-memory token storage: {connector: (token, expires_at)}
-_tokens: dict[str, tuple[str, datetime]] = {}
+# In-memory token storage: {(tenant, connector): (token, expires_at)}. A person's Google token is theirs alone.
+_tokens: dict[tuple[str | None, str], tuple[str, datetime]] = {}
+
+
+def _key() -> tuple[str | None, str]:
+    return (tenancy.current_tenant(), "google")
 _token_lock = asyncio.Lock()
 
 
@@ -31,7 +35,7 @@ async def set_google_token(token: str, expires_at: str) -> None:
         except (ValueError, AttributeError):
             exp = datetime.utcnow()
 
-        _tokens["google"] = (token, exp)
+        _tokens[_key()] = (token, exp)
 
 
 async def get_google_access_token() -> tuple[str, datetime] | None:
@@ -41,16 +45,16 @@ async def get_google_access_token() -> tuple[str, datetime] | None:
         (token, expiry_time) tuple or None if absent or expired
     """
     async with _token_lock:
-        if "google" not in _tokens:
+        if _key() not in _tokens:
             return None
 
-        token, expires_at = _tokens["google"]
+        token, expires_at = _tokens[_key()]
         now = datetime.utcnow()
 
         # Check if token is expired (with 5-minute buffer)
         if expires_at <= now:
             # Token is expired, remove it and request a new one
-            del _tokens["google"]
+            del _tokens[_key()]
             events.publish("connector.token_needed", {"connector": "google"})
             return None
 
@@ -60,7 +64,7 @@ async def get_google_access_token() -> tuple[str, datetime] | None:
 async def clear_google_token() -> None:
     """Clear the stored Google access token."""
     async with _token_lock:
-        _tokens.pop("google", None)
+        _tokens.pop(_key(), None)
 
 
 async def request_token() -> None:

@@ -5,10 +5,11 @@
 class EngineError(Exception):
     """Base error for the engine API."""
 
-    def __init__(self, code: str, detail: str, status: int):
+    def __init__(self, code: str, detail: str, status: int, extra: dict | None = None):
         self.code = code
         self.detail = detail
         self.status = status
+        self.extra = extra or {}  # more fields for the response body, e.g. which items conflicted
         super().__init__(f"{code}: {detail}")
 
 
