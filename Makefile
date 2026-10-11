@@ -93,6 +93,8 @@ clean: ## Remove the local data directory (sessions + sqlite db)
 
 CORE_DIR ?= ../voxscribe-core
 CORE_TAG ?= v0.1.1
+# Name the interpreter explicitly: a stale ~/.python-version makes uv build fail under $HOME otherwise.
+CORE_PYTHON ?= 3.13
 
 .PHONY: core-wheel
 core-wheel: ## Rebuild the pinned voxscribe-core wheel from a core git tag
@@ -100,7 +102,7 @@ core-wheel: ## Rebuild the pinned voxscribe-core wheel from a core git tag
 	@set -e; TMPDIR=$$(mktemp -d); \
 	  git -C "$(CORE_DIR)" archive "$(CORE_TAG)" | tar -x -C "$$TMPDIR"; \
 	  SOURCE_DATE_EPOCH=$$(git -C "$(CORE_DIR)" log -1 --format=%ct "$(CORE_TAG)") \
-	    uv build --wheel --out-dir "$$TMPDIR/dist" "$$TMPDIR"; \
+	    uv build --wheel --python "$(CORE_PYTHON)" --out-dir "$$TMPDIR/dist" "$$TMPDIR"; \
 	  WHL_BASE=$$(basename "$$(ls -1 $$TMPDIR/dist/voxscribe_core-*.whl | tail -1)"); \
 	  rm -f wheels/voxscribe_core-*.whl; \
 	  cp "$$TMPDIR/dist/$$WHL_BASE" wheels/; \
@@ -114,9 +116,9 @@ core-wheel: ## Rebuild the pinned voxscribe-core wheel from a core git tag
 core-dev: ## Switch to editable development source of voxscribe-core (sibling repo)
 	uv pip install --python .venv/bin/python -e $(CORE_DIR)
 	@echo "Switched to editable voxscribe-core from $(CORE_DIR)"
-	@echo "Run: uv sync to update dependencies"
+	@echo "Do not run a plain 'uv sync' now: it reinstalls the pinned wheel. Use 'make core-pinned' to switch back."
 
 .PHONY: core-pinned
-core-pinned: ## Switch back to the pinned wheel version
-	uv sync --frozen --reinstall-package voxscribe-core
+core-pinned: ## Switch back to the pinned wheel version (keeps the dev tools such as pytest)
+	uv sync --frozen --extra dev --reinstall-package voxscribe-core
 	@echo "Switched back to pinned wheel from wheels/"

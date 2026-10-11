@@ -82,8 +82,17 @@ make core-dev            # installs ../voxscribe-core in editable mode
 make core-pinned         # back to the pinned wheel
 ```
 
-Switching back uses `uv sync --frozen --reinstall-package voxscribe-core`. A plain
-`uv sync` does not undo the editable install, because the version number is the same.
+Switching back uses `uv sync --frozen --extra dev --reinstall-package voxscribe-core`.
+While you are working against the sibling core, do not run a plain `uv sync`: it
+reinstalls the pinned wheel and, without `--extra dev`, removes pytest and the other
+dev tools.
+
+### About the wheel in git
+
+`wheels/*.whl` is a binary (about 240 KB) that lives in git history, so each distinct
+rebuild adds a blob. Rebuild only when core has a new release tag, and squash
+intermediate rebuilds before merging. When a private package index exists, replace
+the tracked wheel with it.
 
 ## Run it
 
