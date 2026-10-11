@@ -12,10 +12,12 @@ from . import tenancy
 class PostgresKnowledgeIndexSync:
     """Synchronous PostgreSQL index for ingestion."""
 
-    def __init__(self, database_url: str):
+    def __init__(self, database_url: str, base_schema: str | None = None):
         self.database_url = database_url
-        # A connection of its own, so it must be pointed at the tenant in scope here: the pool cannot do it for us.
-        self._get_connection = lambda: psycopg.connect(database_url, options=tenancy.search_path_option())
+        # A connection of its own, so it must be pointed at the right schema here: the pool cannot do it for us. The
+        # tenant in scope decides; without one, the shared schema the pool itself was built on (a test's throwaway one).
+        base = f"-c search_path={base_schema},public" if base_schema else None
+        self._get_connection = lambda: psycopg.connect(database_url, options=tenancy.search_path_option() or base)
 
     def add_source(
         self,

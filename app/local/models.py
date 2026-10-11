@@ -128,10 +128,12 @@ class StartMeetingResponse(BaseModel):
 
 class ImportMeetingRequest(BaseModel):
     kind: Literal["text", "file", "audio", "youtube"]
-    title: str | None = None
-    text: str | None = None
-    path: str | None = None
-    url: str | None = None
+    title: str | None = Field(default=None, max_length=300)
+    text: str | None = Field(default=None, max_length=5_000_000)  # the transcript itself: pasted, or a file the browser read
+    filename: str | None = Field(default=None, max_length=255)  # tells .srt / .vtt / .txt / .md apart when `text` is a file
+    path: str | None = Field(default=None, max_length=4096)  # a file on this computer (the desktop app)
+    url: str | None = Field(default=None, max_length=2000)
+    projectId: str | None = Field(default=None, max_length=200)
     extractIdeas: bool = False
 
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.6.0
+
+### New Features
+- Added real transcript import: a pasted text or a transcript file (.txt, .md, .srt, .vtt) becomes a finished scribe with a line for every cue or paragraph, keeping times and speaker names where the file has them.
+- Added importing a YouTube link from the video's captions, with the video's title, when connectors are allowed.
+- Added reading web pages added as sources: they are now fetched and indexed, and a page that cannot be read ends in an error with the reason.
+
+### Changed
+- Changed importing an audio file to answer that it is not available yet, instead of saving made-up text.
+- Changed an import that fails to remove the scribe it started, so no empty scribe is left behind.
+
+### Fixed
+- Fixed imports of files and YouTube links saving the placeholder text "Imported file content" and "Transcribed YouTube video".
+- Fixed web page sources being marked ready without ever being read.
+- Fixed ingestion and retrieval in a throwaway test schema reading and writing the shared one.
+
 ## What's New in VoxScribe Server 0.5.0
 
 ### New Features

@@ -13,7 +13,7 @@ def build_retriever(app) -> PostgresSyncRetriever | None:
     if embedder is None:
         return None
     return PostgresSyncRetriever(
-        PostgresKnowledgeIndexSync(app.state.settings.database_url), embedder
+        PostgresKnowledgeIndexSync(app.state.settings.database_url, getattr(app.state.store.pool, "base_schema", None)), embedder
     )
 
 
