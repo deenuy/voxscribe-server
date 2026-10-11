@@ -1,5 +1,16 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.1.1
+
+### Bug Fixes
+- Fixed every save of notes erasing the enhanced notes, including ones you had edited.
+- Fixed meetings that stopped automatically after silence staying in processing forever.
+- Fixed meetings left in processing by a restart by finishing them at startup.
+- Fixed stopping a meeting twice changing its end time or sending a finished meeting back to processing.
+- Prevented two meetings from recording at the same time, and prevented a finished meeting from being started again.
+- Prevented a late recognizer update from replacing a line you had edited.
+- Prevented live connections from being cut by idle timeouts with a regular heartbeat.
+
 ## What's New in VoxScribe Server 0.1.0
 
 ### New Features

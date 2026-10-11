@@ -1574,7 +1574,7 @@ wheels = [
 
 [[package]]
 name = "voxscribe-core"
-version = "0.0.4"
+version = "0.1.0"
 source = { editable = "../voxscribe-core" }
 dependencies = [
     { name = "pyyaml" },
@@ -1594,11 +1594,11 @@ requires-dist = [
     { name = "sounddevice", marker = "extra == 'listen'", specifier = ">=0.4" },
     { name = "tzdata", specifier = ">=2026.2" },
 ]
-provides-extras = ["dev", "mac", "listen", "knowledge"]
+provides-extras = ["dev", "mac", "listen", "knowledge", "meeting"]
 
 [[package]]
 name = "voxscribe-server"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

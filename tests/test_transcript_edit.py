@@ -179,3 +179,134 @@ async def test_transcript_text_is_searchable_and_edits_are_exported(client):
     await edit(client, mid, ids[1], text="Offline mode ships in March")
     md = (await client.get(f"/v1/meetings/{mid}/export", params={"format": "markdown"})).text
     assert "Offline mode ships in March" in md and "ships first" not in md
+
+
+# --------------------------------------------------------------------------- start, stop and notes safety
+
+
+async def _new_meeting(client):
+    return (await client.post("/v1/meetings", json={})).json()["id"]
+
+
+async def _start(client, mid):
+    return await client.post(f"/v1/meetings/{mid}/start", json={"consentAcknowledged": True})
+
+
+@pytest.mark.asyncio
+async def test_two_simultaneous_starts_one_wins(client):
+    a, b = await _new_meeting(client), await _new_meeting(client)
+    ra, rb = await asyncio.gather(_start(client, a), _start(client, b))
+    assert sorted([ra.status_code, rb.status_code]) == [200, 409]
+    async with client._transport.app.state.store.pool.connection() as conn:
+        n = (await (await conn.execute("SELECT count(*) FROM meetings WHERE status = 'recording'")).fetchone())[0]
+    assert n == 1
+
+
+@pytest.mark.asyncio
+async def test_a_meeting_cannot_be_started_twice_or_after_it_finished(client):
+    mid = await _new_meeting(client)
+    assert (await _start(client, mid)).status_code == 200
+    again = await _start(client, mid)
+    assert again.status_code == 409 and "already recording" in again.json()["detail"]
+    await client.post(f"/v1/meetings/{mid}/stop")
+    await store_of(client).mark_done(mid)
+    assert (await _start(client, mid)).status_code == 409  # a finished meeting does not go back to recording
+    assert (await client.get(f"/v1/meetings/{mid}")).json()["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_stop_is_idempotent_and_does_not_rewrite_history(client):
+    mid = await _new_meeting(client)
+    await _start(client, mid)
+    first = (await client.post(f"/v1/meetings/{mid}/stop")).json()
+    second = (await client.post(f"/v1/meetings/{mid}/stop")).json()
+    assert second["endedAt"] == first["endedAt"]  # the end time is not overwritten
+    await store_of(client).mark_done(mid)
+    third = await client.post(f"/v1/meetings/{mid}/stop")
+    assert third.status_code == 200 and third.json()["status"] == "done"  # a finished meeting stays finished
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_meeting_that_never_started_is_a_conflict(client):
+    mid = await _new_meeting(client)
+    res = await client.post(f"/v1/meetings/{mid}/stop")
+    assert res.status_code == 409
+    assert (await client.post(f"/v1/meetings/{uuid.uuid4()}/stop")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_the_database_itself_refuses_two_recordings_and_bad_values(client):
+    pool = client._transport.app.state.store.pool
+    a, b = await _new_meeting(client), await _new_meeting(client)
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE meetings SET status = 'recording' WHERE id = %s", (a,))
+        await conn.commit()
+        with pytest.raises(Exception):
+            await conn.execute("UPDATE meetings SET status = 'recording' WHERE id = %s", (b,))
+        await conn.rollback()
+        with pytest.raises(Exception):
+            await conn.execute("UPDATE meetings SET status = 'done-temp' WHERE id = %s", (b,))
+        await conn.rollback()
+
+
+@pytest.mark.asyncio
+async def test_saving_notes_keeps_enhanced_notes_and_the_ones_a_person_edited(client):
+    mid = await _new_meeting(client)
+    store = store_of(client)
+    from app.local.models import Block
+
+    await store.put_notes(mid, [Block(blockId=f"{mid}-a", text="first", offsetMs=0), Block(blockId=f"{mid}-b", text="second", offsetMs=5)])
+    await store.set_enhanced_block(mid, f"{mid}-a", "Enhanced first", [], status="stable")
+    await store.set_enhanced_block(mid, f"{mid}-b", "Enhanced second", [], status="stable")
+    await store.edit_enhanced_block(mid, f"{mid}-b", "My own wording")
+
+    # The client saves again (as it does every few seconds) with one line changed and one unchanged.
+    await store.put_notes(mid, [Block(blockId=f"{mid}-a", text="first, longer", offsetMs=0), Block(blockId=f"{mid}-b", text="second", offsetMs=5)])
+    enhanced = {b.blockId: b for b in (await store.get_enhanced(mid))["blocks"]}
+    assert enhanced[f"{mid}-b"].text == "My own wording" and enhanced[f"{mid}-b"].status == "edited"  # not wiped, not overwritten
+    assert enhanced[f"{mid}-a"].status == "pending"  # the changed line will be enhanced again
+
+
+@pytest.mark.asyncio
+async def test_notes_removed_by_the_client_are_deleted_and_duplicates_refused(client):
+    mid = await _new_meeting(client)
+    store = store_of(client)
+    from app.local.models import Block
+    from app.local.errors import InvalidRequestError
+
+    await store.put_notes(mid, [Block(blockId=f"{mid}-a", text="a", offsetMs=0), Block(blockId=f"{mid}-b", text="b", offsetMs=1)])
+    await store.put_notes(mid, [Block(blockId=f"{mid}-b", text="b", offsetMs=1)])
+    assert [b.blockId for b in await store.get_notes(mid)] == [f"{mid}-b"]
+    with pytest.raises(InvalidRequestError):
+        await store.put_notes(mid, [Block(blockId="dup", text="x", offsetMs=0), Block(blockId="dup", text="y", offsetMs=1)])
+    other = await _new_meeting(client)
+    with pytest.raises(InvalidRequestError):  # a block id belongs to one meeting
+        await store.put_notes(other, [Block(blockId=f"{mid}-b", text="steal", offsetMs=0)])
+    await store.put_notes(mid, [])
+    assert await store.get_notes(mid) == []
+
+
+@pytest.mark.asyncio
+async def test_a_late_recogniser_write_never_overwrites_a_persons_edit(client):
+    mid, ids = await meeting_with_segments(client, texts=("original wording",))
+    await edit(client, mid, ids[0], text="corrected by a person")
+    await store_of(client).append_segment(mid, Segment(id=ids[0], startMs=0, endMs=5000, source="mic", text="late recogniser text", state="stable"))
+    seg = (await client.get(f"/v1/meetings/{mid}/transcript")).json()["segments"][0]
+    assert seg["text"] == "corrected by a person"
+
+
+@pytest.mark.asyncio
+async def test_a_meeting_left_processing_by_a_restart_is_finished(client):
+    from app.local.finalize import recover_unfinished
+
+    mid = await _new_meeting(client)
+    await _start(client, mid)
+    async with client._transport.app.state.store.pool.connection() as conn:
+        await conn.execute("UPDATE meetings SET status = 'processing' WHERE id = %s", (mid,))
+        await conn.commit()
+    assert await recover_unfinished(client._transport.app) >= 1
+    for _ in range(100):
+        await asyncio.sleep(0.05)
+        if (await client.get(f"/v1/meetings/{mid}")).json()["status"] == "done":
+            break
+    assert (await client.get(f"/v1/meetings/{mid}")).json()["status"] == "done"

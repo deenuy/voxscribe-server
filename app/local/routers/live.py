@@ -253,7 +253,11 @@ async def live_meeting(websocket: WebSocket, meeting_id: str, token: str = Query
                             silence_threshold_ms = meeting.autoStopMinutes * 60 * 1000
                             if silence_ms >= silence_threshold_ms:
                                 log.info(f"Auto-stopping meeting {meeting_id} due to silence")
-                                await store.stop_meeting(meeting_id)
+                                _, stopped_now = await store.stop_once(meeting_id)
+                                if stopped_now:
+                                    from app.local.finalize import schedule_finalize
+
+                                    schedule_finalize(websocket.app, meeting_id)  # auto-stop must finish the meeting too
                                 await websocket.send_json({"type": "status", "state": "processing"})
                                 break
 

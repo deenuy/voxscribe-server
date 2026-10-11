@@ -8,9 +8,12 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from .errors import EngineError, InvalidRequestError, NotFoundError
+from .errors import ConflictError, EngineError, InvalidRequestError, NotFoundError
 from .models import Block, Citation, EnhancedBlock, Meeting, Segment
 
+
+# One lock number serialises starting a recording, so "only one meeting records at a time" holds under concurrency.
+_RECORDING_LOCK = 7_283_117_002
 
 MAX_SEGMENT_CHARS = 20_000  # a single spoken turn is a paragraph, never a document
 MAX_SPEAKER_CHARS = 120
@@ -142,26 +145,57 @@ class MeetingStore:
         return await self.get_meeting(meeting_id)
 
     async def start_meeting(self, meeting_id: str) -> Meeting:
-        """Start recording: set status to 'recording' and startedAt."""
+        """Start recording, atomically: at most one meeting records at a time, and only a scheduled meeting can start.
+
+        Check and change happen in one transaction under an advisory lock, so two simultaneous starts cannot both
+        succeed. A repeat start of the same meeting, or a start of one that already finished, is a 409."""
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         async with self.pool.connection() as conn:
-            await conn.execute(
-                "UPDATE meetings SET status = %s, started_at = %s, updated_at = %s WHERE id = %s",
-                ("recording", now, now, meeting_id),
-            )
-            await conn.commit()
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(%s)", (_RECORDING_LOCK,))
+                other = await (await conn.execute(
+                    "SELECT 1 FROM meetings WHERE status = 'recording' AND id <> %s LIMIT 1", (meeting_id,)
+                )).fetchone()
+                if other:
+                    raise ConflictError("another meeting is already recording")
+                updated = await (await conn.execute(
+                    "UPDATE meetings SET status = 'recording', started_at = %s, updated_at = %s "
+                    "WHERE id = %s AND status = 'scheduled' RETURNING id",
+                    (now, now, meeting_id),
+                )).fetchone()
+                if not updated:
+                    row = await (await conn.execute("SELECT status FROM meetings WHERE id = %s", (meeting_id,))).fetchone()
+                    if not row:
+                        raise NotFoundError(f"meeting {meeting_id} not found")
+                    if row[0] == "recording":
+                        raise ConflictError("this meeting is already recording")
+                    raise ConflictError(f"this meeting is {row[0]} and cannot be started")
         return await self.get_meeting(meeting_id)
 
     async def stop_meeting(self, meeting_id: str) -> Meeting:
-        """Stop recording: set status to 'processing' and endedAt."""
+        """Stop recording. Safe to call twice: see `stop_once`."""
+        meeting, _ = await self.stop_once(meeting_id)
+        return meeting
+
+    async def stop_once(self, meeting_id: str) -> tuple[Meeting, bool]:
+        """Move a recording meeting to 'processing' and report whether this call did it.
+
+        The change is conditional on the meeting still recording, so concurrent or repeated stops change nothing
+        the second time (the end time is not overwritten, a finished meeting does not go back to processing) and
+        only the call that really stopped it should start finalisation. A meeting that was never started is a
+        409; one already stopping or done is returned as it is."""
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         async with self.pool.connection() as conn:
-            await conn.execute(
-                "UPDATE meetings SET status = %s, ended_at = %s, updated_at = %s WHERE id = %s",
-                ("processing", now, now, meeting_id),
-            )
+            changed = await (await conn.execute(
+                "UPDATE meetings SET status = 'processing', ended_at = %s, updated_at = %s "
+                "WHERE id = %s AND status = 'recording' RETURNING id",
+                (now, now, meeting_id),
+            )).fetchone()
             await conn.commit()
-        return await self.get_meeting(meeting_id)
+        meeting = await self.get_meeting(meeting_id)  # NotFoundError for an unknown id
+        if not changed and meeting.status == "scheduled":
+            raise ConflictError("this meeting is not recording")
+        return meeting, bool(changed)
 
     async def mark_done(self, meeting_id: str) -> Meeting:
         """Publish the meeting: the transcript is final and may be edited from here on.
@@ -270,7 +304,8 @@ class MeetingStore:
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT(id) DO UPDATE SET
                     text = EXCLUDED.text,
-                    state = EXCLUDED.state""",
+                    state = EXCLUDED.state
+                WHERE transcript_segments.revision = 0""",  # a person's edit is never overwritten by a late recogniser write
                 (
                     segment.id,
                     meeting_id,
@@ -432,38 +467,44 @@ class MeetingStore:
     # ========================================================================
 
     async def put_notes(self, meeting_id: str, blocks: list[Block]) -> int:
-        """Replace all notes for a meeting, return count accepted."""
+        """Replace the shorthand notes for a meeting, return how many were accepted.
+
+        Blocks are matched by id. Unchanged blocks are left alone, changed ones are updated and their enhanced
+        note is marked pending, and only blocks that are no longer sent are deleted. Deleting everything and
+        re-inserting would cascade to every enhanced note (including ones the person edited) on each save."""
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        ids = [b.blockId for b in blocks]
+        if len(set(ids)) != len(ids):
+            raise InvalidRequestError("blocks: blockId values must be unique")
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
-            # Get existing blocks to check what changed
-            cursor = await conn.execute(
-                "SELECT block_id, text FROM notes_blocks WHERE meeting_id = %s",
-                (meeting_id,),
-            )
-            existing = await cursor.fetchall()
-            existing_map = {row["block_id"]: row["text"] for row in existing}
-
-            # Clear old blocks
-            await conn.execute("DELETE FROM notes_blocks WHERE meeting_id = %s", (meeting_id,))
-
-            # Insert new blocks
-            for block in blocks:
-                await conn.execute(
-                    """INSERT INTO notes_blocks (block_id, meeting_id, text, offset_ms, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)""",
-                    (block.blockId, meeting_id, block.text, block.offsetMs, now, now),
+            async with conn.transaction():
+                cursor = await conn.execute(
+                    "SELECT block_id, text FROM notes_blocks WHERE meeting_id = %s FOR UPDATE", (meeting_id,)
                 )
+                existing_map = {row["block_id"]: row["text"] for row in await cursor.fetchall()}
 
-                # If this block changed, mark its enhanced block as pending
-                if block.blockId in existing_map and existing_map[block.blockId] != block.text:
-                    await conn.execute(
-                        """UPDATE enhanced_blocks SET status = %s, updated_at = %s
-                        WHERE block_id = %s AND meeting_id = %s AND status != 'edited'""",
-                        ("pending", now, block.blockId, meeting_id),
+                await conn.execute(
+                    "DELETE FROM notes_blocks WHERE meeting_id = %s AND NOT (block_id = ANY(%s))", (meeting_id, ids)
+                )
+                for block in blocks:
+                    cur = await conn.execute(
+                        """INSERT INTO notes_blocks (block_id, meeting_id, text, offset_ms, created_at, updated_at)
+                           VALUES (%s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (block_id) DO UPDATE
+                               SET text = EXCLUDED.text, offset_ms = EXCLUDED.offset_ms, updated_at = EXCLUDED.updated_at
+                               WHERE notes_blocks.meeting_id = EXCLUDED.meeting_id
+                           RETURNING block_id""",
+                        (block.blockId, meeting_id, block.text, block.offsetMs, now, now),
                     )
-
-            await conn.commit()
+                    if not await cur.fetchone():
+                        raise InvalidRequestError("blocks: a blockId is already used by another meeting")
+                    if block.blockId in existing_map and existing_map[block.blockId] != block.text:
+                        await conn.execute(
+                            """UPDATE enhanced_blocks SET status = 'pending', updated_at = %s
+                               WHERE block_id = %s AND meeting_id = %s AND status != 'edited'""",
+                            (now, block.blockId, meeting_id),
+                        )
         return len(blocks)
 
     async def get_notes(self, meeting_id: str) -> list[Block]:

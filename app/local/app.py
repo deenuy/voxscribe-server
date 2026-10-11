@@ -29,6 +29,14 @@ async def lifespan(app: FastAPI):
         await app.state.ingestion_worker.start()
         print("Ingestion worker started", file=sys.stderr, flush=True)
 
+    # A crash during finalisation leaves a meeting 'processing': finish it now.
+    try:
+        from app.local.finalize import recover_unfinished
+
+        await recover_unfinished(app)
+    except Exception as exc:  # never block startup on recovery
+        print(f"Recovery of unfinished meetings failed: {exc}", file=sys.stderr, flush=True)
+
     yield
 
     # Shutdown

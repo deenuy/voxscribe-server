@@ -106,16 +106,7 @@ async def start_meeting(request: Request, meeting_id: str, body: StartMeetingReq
         raise ConsentRequiredError("consentAcknowledged must be true")
 
     store = MeetingStore(request.app.state.store.pool)
-    # Check if another meeting is recording
-    meetings, _ = await store.list_meetings(when="upcoming", limit=100)
-    for m in meetings:
-        if m.status == "recording":
-            raise ConflictError("another meeting is already recording")
-
-    meeting = await store.get_meeting(meeting_id)
-    if meeting.status == "recording":
-        raise ConflictError("this meeting is already recording")
-
+    # One atomic step: one recording at a time, and only a scheduled meeting can start (409 otherwise).
     meeting = await store.start_meeting(meeting_id)
     live_url = f"/v1/meetings/{meeting_id}/live"
     return {
@@ -128,51 +119,15 @@ async def start_meeting(request: Request, meeting_id: str, body: StartMeetingReq
 async def stop_meeting(request: Request, meeting_id: str):
     """Stop recording and begin processing.
 
-    Runs finalization (enrichment + summary) in the background.
-    Returns immediately with status 'processing'.
-    """
-    import asyncio
+    Idempotent: only the call that actually stops a recording starts finalisation (enrichment, summary,
+    publish); a repeat or concurrent stop returns the meeting as it is. A meeting that was never started is 409.
+    Returns immediately with status 'processing'."""
+    from app.local.finalize import schedule_finalize
 
     store = MeetingStore(request.app.state.store.pool)
-    meeting = await store.stop_meeting(meeting_id)
-
-    # Trigger finalization in the background
-    async def finalize():
-        try:
-            from app.local import meeting_bus
-            from app.local.enrichment import EnrichmentService
-            from app.local.summary_service import SummaryService
-
-            providers = getattr(request.app.state, "providers", {})
-            llm = providers.get("llm")
-            if llm:
-                from app.local.live_support import build_retriever
-
-                enricher = EnrichmentService(store, llm, build_retriever(request.app))
-                await enricher.finalize_meeting(meeting_id)
-
-                # Generate summary
-                summary_service = SummaryService(store, llm)
-                await summary_service.generate_summary(meeting_id)
-                await store.mark_done(meeting_id)
-                await meeting_bus.publish(meeting_id, "status", {"state": "done"})
-            else:
-                # Provider unavailable; mark done anyway
-                await store.mark_done(meeting_id)
-                await meeting_bus.publish(meeting_id, "status", {"state": "done"})
-        except Exception as e:
-            import logging
-            log = logging.getLogger(__name__)
-            log.error(f"Finalization failed for meeting {meeting_id}: {e}", exc_info=True)
-            # Still mark as done
-            try:
-                await store.mark_done(meeting_id)
-                await meeting_bus.publish(meeting_id, "status", {"state": "done"})
-            except Exception:
-                pass
-
-    asyncio.create_task(finalize())
-
+    meeting, stopped_now = await store.stop_once(meeting_id)
+    if stopped_now:
+        schedule_finalize(request.app, meeting_id)
     return meeting.model_dump(exclude_none=True)
 
 
