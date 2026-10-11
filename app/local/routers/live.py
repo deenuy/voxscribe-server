@@ -8,7 +8,8 @@ import logging
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from voxscribe.meeting.live import LiveTranscriber
 
-from app.local import meeting_bus
+from app.local import meeting_bus, tenancy
+from app.local.identity import IdentityError, tenant_for
 from app.local.enrichment import EnrichmentService
 from app.local.live_support import build_live_assist, build_retriever
 from app.local.models import Block, EnhancedBlock, Segment
@@ -19,11 +20,27 @@ log = logging.getLogger(__name__)
 
 
 @router.websocket("/{meeting_id}/live")
-async def live_meeting(websocket: WebSocket, meeting_id: str, token: str = Query(None)):
+async def live_meeting(websocket: WebSocket, meeting_id: str, token: str = Query(None), identity: str = Query(None)):
     """WebSocket endpoint for live meeting transcription.
 
-    Clients connect with token auth and send/receive PCM audio and control messages.
+    Clients connect with token auth (and, when tenant isolation is on, the account's access token as `identity`:
+    a browser cannot set headers on a WebSocket). The tenant is fixed once at connect and held for the whole
+    recording; everything the connection starts runs inside it.
     """
+    app = websocket.scope.get("app")
+    if app is not None and getattr(app.state, "identity", None) is not None:
+        try:
+            scope = await tenant_for(app, identity or websocket.headers.get("x-identity-token"))
+        except IdentityError:
+            await websocket.close(code=1008, reason="identity required")
+            return
+        with tenancy.tenant_scope(scope):
+            await _live_meeting(websocket, meeting_id, token)
+        return
+    await _live_meeting(websocket, meeting_id, token)
+
+
+async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None):
     # Extract app from scope first (before validation)
     app = websocket.scope.get("app")
     if not app:

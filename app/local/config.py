@@ -67,6 +67,17 @@ class Config:
     # Retrieval
     retrieval_top_k: int = 6
 
+    # Identity: when all three are set, every request must carry a verified person and each person's data is kept
+    # apart. With none set, one person uses the engine at a time (the local single-user mode).
+    identity_issuer: str = ""
+    identity_audience: str = ""
+    identity_jwks_url: str = ""
+    identity_jwks_file: str = ""
+
+    @property
+    def tenancy_enforced(self) -> bool:
+        return bool(self.identity_issuer and self.identity_audience and self.identity_jwks_url)
+
     # Voice (planned, accepted but unused)
     voice_enabled: bool = False
     tts_engine: str = "piper"
@@ -104,6 +115,20 @@ class Config:
         db_url = env_vars.get("VOXSCRIBE_DATABASE_URL")
         if db_url:
             config_dict["database_url"] = db_url
+
+        # Identity
+        for env_name, field in (
+            ("VOXSCRIBE_IDENTITY_ISSUER", "identity_issuer"),
+            ("VOXSCRIBE_IDENTITY_AUDIENCE", "identity_audience"),
+            ("VOXSCRIBE_IDENTITY_JWKS_URL", "identity_jwks_url"),
+            ("VOXSCRIBE_IDENTITY_JWKS_FILE", "identity_jwks_file"),
+        ):
+            value = env_vars.get(env_name, "").strip()
+            if value:
+                config_dict[field] = value
+        configured = [bool(config_dict.get(f)) for f in ("identity_issuer", "identity_audience", "identity_jwks_url")]
+        if any(configured) and not all(configured):
+            _fail("VOXSCRIBE_IDENTITY_*", "set all of ISSUER, AUDIENCE and JWKS_URL, or none of them")
 
         # Providers
         providers = env_vars.get("VOXSCRIBE_PROVIDERS", "").strip()

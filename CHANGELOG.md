@@ -1,5 +1,29 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.5.0
+
+### New Features
+- Added separation between people: with an identity service configured, the engine verifies who is calling and keeps each person's data in a schema of their own, so one person can never see or change another's scribes, sources, ideas, projects, tasks, chats or settings.
+- Added one atomic edit commit for a scribe (`POST /v1/meetings/{id}/edits`): its title, project, transcript lines, summary and tasks are changed together or not at all, each with the revision the editor saw, and a retry with the same Idempotency-Key is applied once.
+- Added a revision to the scribe, the summary and each task so a stale edit is refused instead of overwriting, and the ability to edit a summary by hand, which marks it as edited.
+- Added tasks: a to-do list for each scribe with a status (To do, In progress, Done), an owner, a due date and a project, written by hand or drafted by the AI from the transcript and the scribe's project, with a list across scribes that can be filtered by status or project.
+- Added the ability to move a scribe into a project, or out of it, from the scribe's own update.
+- Added `scripts/adopt_legacy_data.py` to copy data stored before separation into one person's own schema, and a script that puts two sample scribes and their projects into the development database.
+
+### Changed
+- Changed the live event stream, the live meeting events, the Google access token, background jobs, source ingestion and the chosen models to belong to one person each, so nothing is shared between people.
+- Changed regenerating a summary that a person edited to need an explicit confirmation.
+- Changed the delete-all-data call to cover every table, and to act only on the caller's own data.
+- Changed the fake embedder to the width the database expects, which fixes ingestion in the built-in test engine.
+
+### Fixed
+- Fixed the AI giving no answer on models that reason before replying, by allowing them room to finish.
+- Fixed ingestion and retrieval opening their own database connection that ignored any per-person setting.
+
+### Prevented
+- Prevented a database call from running with no person in scope when separation is on.
+- Prevented tokens signed with another algorithm, another issuer or audience, or a refresh token from being accepted as identity.
+
 ## What's New in VoxScribe Server 0.4.0
 
 ### New Features

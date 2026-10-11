@@ -58,6 +58,7 @@ class Meeting(BaseModel):
     publishedAt: str | None = None
     transcriptRevision: int = 0
     summaryStale: bool = False
+    revision: int = 0  # changes whenever the title, context or project changes: send it back as baseRevision to edit
     createdAt: str
     updatedAt: str
 
@@ -106,6 +107,9 @@ class UpdateMeetingRequest(BaseModel):
     reminderEnabled: bool | None = None
     enhanceStyle: Literal["standard", "concise"] | None = None
     autoStopMinutes: int | None = Field(None, ge=1, le=1440)
+    baseRevision: int | None = Field(None, ge=0)  # optional: when sent, a stale one is a 409 `revision_conflict`
+    # Send null to take the scribe out of its project; leave it out to keep it where it is.
+    projectId: str | None = Field(None, max_length=200)
 
     @field_validator("title")
     @classmethod
@@ -244,6 +248,8 @@ class Summary(BaseModel):
     overview: str | None = None
     details: list[SummaryDetail] = []
     generatedAt: str | None = None
+    revision: int = 0
+    edited: bool = False  # written or changed by a person: regenerating it needs an explicit overwrite
 
 
 # ============================================================================

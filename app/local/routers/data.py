@@ -29,6 +29,8 @@ async def delete_all_data(request: Request, x_confirm: str | None = Header(None)
     async with store.pool.connection() as conn:
         # Delete all rows from engine tables (in reverse dependency order to avoid FK issues)
         tables = [
+            "tasks",
+            "transcript_edits",
             "chat_messages",
             "chat_threads",
             "meeting_attachments",
@@ -36,12 +38,17 @@ async def delete_all_data(request: Request, x_confirm: str | None = Header(None)
             "notes_blocks",
             "transcript_segments",
             "summaries",
-            "summaries",
+            "idea_prds",
+            "idea_activity",
+            "idea_edges",
+            "ideas",
+            "features",
             "source_labels",
             "source_chunks",
             "sources",
             "labels",
             "meetings",
+            "projects",
             "calendar_events",
             "settings",
             "usage",

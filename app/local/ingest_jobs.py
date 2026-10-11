@@ -11,7 +11,7 @@ from pathlib import Path
 
 from voxscribe.knowledge import ingest_path, scan_folder
 
-from app.local import events
+from app.local import events, tenancy
 from app.local.pg_sync_index import PostgresKnowledgeIndexSync, SourceBoundIndex
 from app.local.store_sources import SourceStore
 
@@ -45,19 +45,24 @@ class IngestionWorker:
         self.executor.shutdown(wait=True)
 
     async def queue_source(self, source_id: str):
-        """Queue a source for ingestion."""
-        await self.queue.put(source_id)
+        """Queue a source for ingestion. The queue is shared by everyone, so each item remembers whose it is."""
+        await self.queue.put((tenancy.current(), source_id))
 
     async def _monitor_queue(self):
         """Monitor queue and dispatch tasks to executor."""
         while self.running:
             try:
-                source_id = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                scope, source_id = await asyncio.wait_for(self.queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
             try:
-                await self._ingest_source(source_id)
+                # This task was started at startup, with no tenant. Work on the item inside its owner's scope.
+                if scope is None:
+                    await self._ingest_source(source_id)
+                else:
+                    with tenancy.tenant_scope(scope):
+                        await self._ingest_source(source_id)
             finally:
                 self.queue.task_done()
 

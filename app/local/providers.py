@@ -154,9 +154,10 @@ def select_providers(
             "asr": FakeASRProvider(),
             "llm": FakeStreamingLLM(),
             "live_llm": FakeStreamingLLM(),
-            "embedding": FakeEmbeddingProvider(),
+            # The database column is 768 wide; a fake that was 384 wide made every ingestion in fake mode fail.
+            "embedding": FakeEmbeddingProvider(dim=768),
             "llm_provider": FakeStreamingLLM(),
-            "embedding_provider": FakeEmbeddingProvider(),
+            "embedding_provider": FakeEmbeddingProvider(dim=768),
         }
     else:
         # local mode - use models from settings

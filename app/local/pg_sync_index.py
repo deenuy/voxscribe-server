@@ -6,13 +6,16 @@ with synchronous methods suitable for use with voxscribe-core's ingest_path.
 
 import psycopg
 
+from . import tenancy
+
 
 class PostgresKnowledgeIndexSync:
     """Synchronous PostgreSQL index for ingestion."""
 
     def __init__(self, database_url: str):
         self.database_url = database_url
-        self._get_connection = lambda: psycopg.connect(database_url)
+        # A connection of its own, so it must be pointed at the tenant in scope here: the pool cannot do it for us.
+        self._get_connection = lambda: psycopg.connect(database_url, options=tenancy.search_path_option())
 
     def add_source(
         self,
