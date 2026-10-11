@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## What's New in VoxScribe Server 0.1.1
 
 ### Bug Fixes
 - Fixed every save of notes erasing the enhanced notes, including ones you had edited.
