@@ -88,11 +88,15 @@ voxscribe-engine = "app.local.engine:run"
 # ---------------------------------------------------------------------------
 # Path dependencies (uv)
 # ---------------------------------------------------------------------------
-# Production: resolve voxscribe-core from local wheels directory (see find-links below)
+# Production: resolve voxscribe-core from tracked wheel in project root.
+# The wheel is built from core repo and committed to enable zero-setup deployment.
+# find-links with project-anchored path allows extras to resolve from wheel metadata.
 # Development override: to use editable source instead of wheel, run:
-#   uv sync --no-lock --override "voxscribe-core @ {path = '../voxscribe-core', editable = true}"
+#   uv pip install --python .venv/bin/python -e ../voxscribe-core
+# To return to pinned wheel:
+#   uv sync --frozen --reinstall-package voxscribe-core
 [tool.uv]
-find-links = ["../wheels"]
+find-links = ["wheels"]
 
 # ---------------------------------------------------------------------------
 # Tool: pytest
