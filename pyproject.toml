@@ -49,7 +49,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "pyyaml>=6.0",
     "psycopg[binary,pool]>=3.1",
-    "voxscribe-core>=0.0.1",
+    "voxscribe-core[knowledge]==0.1.1",
     "httpx>=0.27",
     "faster-whisper>=1.0",
     "pyjwt>=2.15.1",
@@ -88,8 +88,11 @@ voxscribe-engine = "app.local.engine:run"
 # ---------------------------------------------------------------------------
 # Path dependencies (uv)
 # ---------------------------------------------------------------------------
-[tool.uv.sources]
-voxscribe-core = { path = "../voxscribe-core", editable = true }
+# Production: resolve voxscribe-core from local wheels directory (see find-links below)
+# Development override: to use editable source instead of wheel, run:
+#   uv sync --no-lock --override "voxscribe-core @ {path = '../voxscribe-core', editable = true}"
+[tool.uv]
+find-links = ["../wheels"]
 
 # ---------------------------------------------------------------------------
 # Tool: pytest
