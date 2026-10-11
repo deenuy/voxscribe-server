@@ -1,0 +1,111 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# ---------------------------------------------------------------------------
+# Project metadata
+# ---------------------------------------------------------------------------
+[project]
+name = "voxscribe-server"
+version = "0.1.0"
+description = "Local engine implementing the Ideascribe contract: meetings, knowledge, live transcription, enrichment"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+
+authors = [
+    { name = "Deenu", email = "deenuy@gmail.com" },
+]
+
+keywords = [
+    "ideascribe",
+    "voxscribe",
+    "engine",
+    "meeting",
+    "transcription",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# ---------------------------------------------------------------------------
+# Runtime dependencies
+# ---------------------------------------------------------------------------
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "python-multipart>=0.0.9",
+    "pyyaml>=6.0",
+    "psycopg[binary,pool]>=3.1",
+    "voxscribe-core>=0.0.1",
+    "httpx>=0.27",
+    "faster-whisper>=1.0",
+]
+
+# ---------------------------------------------------------------------------
+# Optional dependency groups
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+
+# Local Whisper ASR
+local-asr = [
+    "faster-whisper>=1.0",
+]
+
+# Development and testing
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.4",
+]
+
+# Everything
+all = [
+    "voxscribe-server[local-asr,dev]",
+]
+
+# ---------------------------------------------------------------------------
+# CLI entry points
+# ---------------------------------------------------------------------------
+[project.scripts]
+voxscribe-engine = "app.local.engine:run"
+
+# ---------------------------------------------------------------------------
+# Path dependencies (uv)
+# ---------------------------------------------------------------------------
+[tool.uv.sources]
+voxscribe-core = { path = "../voxscribe-core", editable = true }
+
+# ---------------------------------------------------------------------------
+# Tool: pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+# ---------------------------------------------------------------------------
+# Tool: ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]

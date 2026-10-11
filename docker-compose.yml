@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    container_name: voxscribe-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    # Lets the container reach Ollama running natively on the Mac host at
+    # http://host.docker.internal:11434 when EXTRACTOR=ollama.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
