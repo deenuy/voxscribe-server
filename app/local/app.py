@@ -229,12 +229,12 @@ async def create_app(
 
         # Database health
         try:
-            db_ok, schema_version, db_name = await store.health_check()
-            db_full_name = f"postgresql:{db_name}"
+            db_ok, schema_version, _ = await store.health_check()
+            db_full_name = "postgresql"  # the kind of database, never its name: a name such as a dev database must not reach a screen
         except Exception as exc:
             print(f"health: database check failed: {exc}", file=sys.stderr, flush=True)
             db_ok = False
-            db_full_name = "postgresql:unavailable"
+            db_full_name = "postgresql"
             schema_version = 0
 
         # ASR health

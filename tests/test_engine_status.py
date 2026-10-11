@@ -26,44 +26,71 @@ def by_role(s):
     return {m["role"]: m for m in s["models"]}
 
 
-def test_ready_even_when_nothing_is_in_memory():
+def test_idle_models_are_on_demand_and_the_whole_is_on_demand_not_a_fault():
     s = status(probe())
-    assert s["state"] == "ready"  # models load on first use and unload when idle; that is not a fault
-    assert all(m["loaded"] is False for m in s["models"] if m["provider"] == "ollama")
-    assert by_role(s)["main"]["installed"] is True
+    roles = by_role(s)
+    assert [roles[r]["state"] for r in ("main", "live-assist", "embedding")] == ["on-demand"] * 3
+    assert roles["transcription"]["state"] == "ready"  # speech recognition is in memory while the engine runs
+    assert s["state"] == "on-demand"  # the worst child; the app shows this as "Ready" because it is usable
 
 
-def test_models_in_memory_show_the_runtimes_own_tag_and_their_size():
+def test_models_in_memory_are_ready_with_their_size_and_the_runtimes_own_tag():
     s = status(probe(loaded=[{"name": "gemma4:12b", "size": 8 * 1024 * 1024 * 1024}, {"name": "nomic-embed-text:latest", "size": 300 * 1024 * 1024}]))
     roles = by_role(s)
-    assert roles["main"] == {"role": "main", "tag": "gemma4:12b", "provider": "ollama", "installed": True, "loaded": True, "memoryMB": 8192}
-    assert roles["embedding"]["tag"] == "nomic-embed-text:latest"  # the configured "nomic-embed-text" as ollama prints it
-    assert roles["live-assist"]["loaded"] is False
+    assert roles["main"] == {"role": "main", "tag": "gemma4:12b", "state": "ready", "memoryMB": 8192}
+    assert roles["embedding"]["tag"] == "nomic-embed-text:latest" and roles["embedding"]["state"] == "ready"
+    assert roles["live-assist"]["state"] == "on-demand"
+
+
+def test_everything_in_memory_is_ready():
+    s = status(probe(loaded=[{"name": "gemma4:12b", "size": 1}, {"name": "gemma4:e4b", "size": 1}, {"name": "nomic-embed-text:latest", "size": 1}]))
+    assert s["state"] == "ready"
 
 
 def test_tags_come_from_configuration_not_from_the_code():
     custom = dataclasses.replace(LOCAL, llm_model="qwen3:8b", live_model="qwen3:1.7b", embed_model="bge-m3", asr_model="medium.en")
     s = status(probe(have=("qwen3:8b", "qwen3:1.7b", "bge-m3:latest")), settings=custom)
     assert [m["tag"] for m in s["models"]] == ["qwen3:8b", "qwen3:1.7b", "faster-whisper:medium.en", "bge-m3:latest"]
-    assert s["state"] == "ready"
 
 
-def test_a_missing_model_is_degraded_and_says_which():
+def test_a_missing_model_is_not_downloaded_and_the_whole_is_an_error():
     s = status(probe(have=("gemma4:12b", "nomic-embed-text:latest")))
-    assert s["state"] == "degraded" and by_role(s)["live-assist"]["installed"] is False
+    assert by_role(s)["live-assist"]["state"] == "not-downloaded" and s["state"] == "error"
 
 
-def test_database_or_speech_trouble_is_degraded():
-    assert status(probe(), db_ok=False)["state"] == "degraded"
+def test_speech_recognition_or_database_trouble_is_an_error():
     s = status(probe(), asr_ok=False)
-    assert s["state"] == "degraded" and by_role(s)["transcription"]["installed"] is False
+    assert by_role(s)["transcription"]["state"] == "error" and s["state"] == "error"
+    assert status(probe(), db_ok=False)["state"] == "error"
 
 
-def test_an_unreachable_runtime_is_offline_and_a_recent_start_request_is_loading():
-    assert status(None)["state"] == "offline"
-    assert status(None, start_requested_at=990.0, now=1000.0)["state"] == "loading"
-    assert status(None, start_requested_at=100.0, now=1000.0)["state"] == "offline"  # it never came up: say so
-    assert status(None)["runtime"]["reachable"] is False
+def test_when_the_runtime_stops_the_whole_is_offline_and_every_model_that_needs_it_is_an_error():
+    s = status(None)
+    assert s["state"] == "offline"
+    roles = by_role(s)
+    assert [roles[r]["state"] for r in ("main", "live-assist", "embedding")] == ["error"] * 3
+    assert roles["transcription"]["state"] == "ready"  # not affected: it does not use the runtime
+
+
+def test_a_recent_start_request_is_loading_and_an_old_one_that_never_worked_is_offline():
+    s = status(None, start_requested_at=990.0, now=1000.0)
+    assert s["state"] == "loading" and by_role(s)["main"]["state"] == "loading"
+    assert status(None, start_requested_at=100.0, now=1000.0)["state"] == "offline"
+
+
+def test_the_overall_state_is_the_worst_child_in_a_fixed_order():
+    assert rt.worst(["ready", "on-demand"]) == "on-demand"
+    assert rt.worst(["on-demand", "loading", "ready"]) == "loading"
+    assert rt.worst(["loading", "error", "on-demand"]) == "error"
+    assert rt.worst(["error", "offline"]) == "offline"
+    assert rt.worst(["ready", "not-downloaded"]) == "error"  # a missing required model is an error
+    assert rt.worst([]) == "ready"
+
+
+def test_the_hot_status_carries_no_infrastructure():
+    s = status(probe())
+    assert set(s) == {"state", "models", "updatedAt"}
+    assert all(set(m) == {"role", "tag", "state", "memoryMB"} for m in s["models"])
 
 
 def test_fake_providers_report_ready_without_a_runtime():
@@ -72,7 +99,7 @@ def test_fake_providers_report_ready_without_a_runtime():
 
 
 @pytest.mark.asyncio
-async def test_the_endpoint_reports_the_runtime_and_the_updated_time(client, monkeypatch):
+async def test_the_endpoint_reports_per_model_state_and_the_updated_time(client, monkeypatch):
     app = client._transport.app
     app.state.settings = dataclasses.replace(app.state.settings, providers="local")
 
@@ -81,8 +108,8 @@ async def test_the_endpoint_reports_the_runtime_and_the_updated_time(client, mon
 
     monkeypatch.setattr(rt, "probe_runtime", fake_probe)
     body = (await client.get("/v1/engine/status")).json()
-    assert body["state"] in ("ready", "degraded") and body["updatedAt"].endswith("Z")
-    assert {m["role"] for m in body["models"]} == {"main", "live-assist", "transcription", "embedding"}
+    assert set(body) == {"state", "models", "updatedAt"} and body["updatedAt"].endswith("Z")
+    assert {m["role"]: m["state"] for m in body["models"]}["main"] == "ready"
 
 
 @pytest.mark.asyncio
@@ -103,14 +130,14 @@ async def test_start_runtime_spawns_once_and_is_safe_to_repeat(client, monkeypat
     first = await client.post("/v1/engine/start")
     second = await client.post("/v1/engine/start")
     assert first.status_code == 202 and first.json()["state"] == "loading"
-    assert second.status_code == 202 and len(spawned) == 1  # the second request did not start another process
+    assert second.status_code == 202 and second.json()["state"] == "loading" and len(spawned) == 1  # no second process, and a real answer
 
     async def up(host):
         return probe()
 
     monkeypatch.setattr(rt, "probe_runtime", up)
     already = await client.post("/v1/engine/start")
-    assert already.status_code == 200 and already.json()["runtime"]["reachable"] is True and len(spawned) == 1
+    assert already.status_code == 200 and already.json()["state"] == "on-demand" and len(spawned) == 1
 
 
 @pytest.mark.asyncio
@@ -128,26 +155,32 @@ async def test_start_runtime_says_so_when_it_is_not_installed(client, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_status_carries_the_engines_own_health_from_the_real_process_and_database(client):
+async def test_details_carry_version_uptime_runtime_and_database_but_never_an_environment_name(client):
     from app.local.version import engine_version
 
-    body = (await client.get("/v1/engine/status")).json()
-    eng = body["engine"]
-    assert eng["version"] == engine_version() and eng["version"] != "0.1.0"  # read from the package, not typed in
-    assert eng["database"]["ok"] is True and eng["database"]["schemaVersion"] >= 5 and eng["database"]["name"]
-    assert eng["uptimeSeconds"] >= 0 and eng["startedAt"].endswith("Z") and eng["providers"] == "fake" and eng["offline"] is True
+    body = (await client.get("/v1/engine/details")).json()
+    assert body["engine"]["version"] == engine_version() and body["engine"]["version"] != "0.1.0"
+    assert body["engine"]["uptimeSeconds"] >= 0 and body["engine"]["startedAt"].endswith("Z")
+    assert body["database"] == {"ok": True, "schemaVersion": body["database"]["schemaVersion"]} and body["database"]["schemaVersion"] >= 5
+    assert body["runtime"]["reachable"] is True and body["providers"] == "fake" and body["offline"] is True
+    # The test database is named like a development one: its name must not appear anywhere in the answer.
+    name = (await client._transport.app.state.store.health_check())[2]
+    assert name and name not in (await client.get("/v1/engine/details")).text
+    assert name not in (await client.get("/v1/engine/status")).text
+    assert name not in (await client.get("/v1/health")).text  # the health document names the kind of database, never the database
     health = (await client.get("/v1/health")).json()
-    assert health["version"] == eng["version"]  # one source for both endpoints
+    assert health["version"] == body["engine"]["version"]
 
 
 @pytest.mark.asyncio
-async def test_status_reports_a_database_that_is_down_instead_of_failing(client, monkeypatch):
+async def test_details_report_a_database_that_is_down_instead_of_failing(client, monkeypatch):
     async def broken():
         raise RuntimeError("down")
 
     monkeypatch.setattr(client._transport.app.state.store, "health_check", broken)
-    body = (await client.get("/v1/engine/status")).json()
-    assert body["engine"]["database"] == {"ok": False, "name": None, "schemaVersion": None}
+    body = (await client.get("/v1/engine/details")).json()
+    assert body["database"] == {"ok": False, "schemaVersion": None}
+    assert (await client.get("/v1/engine/status")).json()["state"] == "error"
 
 
 # ------------------------------------------------------------------ the models list reflects reality
