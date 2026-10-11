@@ -1,0 +1,39 @@
+# secrets and local environment — never commit
+.env
+
+# runtime data
+data/
+logs/
+*.log
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Docker
+.docker/
