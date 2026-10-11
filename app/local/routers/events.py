@@ -19,7 +19,13 @@ async def events_stream(request: Request):
         async with events.subscribe() as queue:
             while True:
                 try:
-                    event = await queue.get()
+                    # Idle connections get a comment line every 15 s, so proxies and the client can tell a quiet
+                    # stream from a dead one.
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        yield ": ping\n\n"
+                        continue
                     event_type = event["type"]
                     data = event["data"]
 
