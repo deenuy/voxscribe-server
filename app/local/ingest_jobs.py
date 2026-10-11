@@ -5,6 +5,7 @@ Processes queued sources asynchronously, updates status, publishes events.
 
 import asyncio
 import logging
+import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -24,7 +25,7 @@ class IngestionWorker:
     def __init__(self, store_pool, database_url: str, embedder, num_workers: int = 2):
         self.store_pool = store_pool
         self.database_url = database_url
-        self.knowledge_index = PostgresKnowledgeIndexSync(database_url)
+        self.knowledge_index = PostgresKnowledgeIndexSync(database_url, getattr(store_pool, "base_schema", None))
         self.embedder = embedder
         self.num_workers = num_workers
         self.queue: asyncio.Queue = asyncio.Queue()
@@ -89,6 +90,25 @@ class IngestionWorker:
                     self.embedder,
                     path,
                 )
+                await store.update_source_chunk_count(source_id, chunk_count)
+
+            elif source.kind == "url":
+                # A web page: fetched (with the same safety checks as everywhere: no private addresses, size and type
+                # limits), then indexed like a file. Before this a web page was accepted, marked ready and never read.
+                from app.local.url_fetcher import fetch_url
+
+                page_text = await fetch_url(source.uri)
+                if not page_text or not page_text.strip():
+                    raise ValueError("the page has no text to index")
+                with tempfile.TemporaryDirectory() as tmp:
+                    page = Path(tmp) / "page.txt"
+                    page.write_text(page_text, encoding="utf-8")
+                    _source_id, chunk_count = await asyncio.to_thread(
+                        ingest_path,
+                        SourceBoundIndex(self.knowledge_index, source_id),
+                        self.embedder,
+                        page,
+                    )
                 await store.update_source_chunk_count(source_id, chunk_count)
 
             elif source.kind == "folder":

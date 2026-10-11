@@ -408,112 +408,104 @@ async def detach_source(request: Request, meeting_id: str, source_id: str):
 
 @router.post("/import", status_code=202)
 async def import_meeting(request: Request):
-    """Import a meeting from text, file, audio or YouTube.
+    """Make a scribe from a transcript someone already has: pasted text, a transcript file (.txt, .md, .srt, .vtt) or a
+    YouTube link (its captions).
 
-    Creates a meeting and optionally extracts ideas.
-    Returns {meetingId, jobId}.
-    """
+    A transcript file is sent as `text` with its `filename` (a browser cannot give the engine a path), or as `path` from
+    the desktop app. A YouTube link needs connectors to be allowed (403 `network_disabled` otherwise). Audio files cannot
+    be transcribed here yet (501 `not_implemented`). Returns {meetingId, jobId}: the work runs in the background and a
+    `job.update` event says when it is done (`done`) or why it could not be (`error`, with the reason); a failed import
+    leaves no half-made scribe behind."""
+    from app.local import youtube_import
     from app.local.job_runner import get_runner
     from app.local.models import ImportMeetingRequest
+    from app.local.store_sources import SourceStore
+    from app.local.transcript_import import TranscriptError, parse_transcript
 
-    import_req = parse_model(ImportMeetingRequest, await json_object(request))
+    req = parse_model(ImportMeetingRequest, await json_object(request))
+    pool = request.app.state.store.pool
+    store = MeetingStore(pool)
+    title, text, lines, vid = req.title, req.text, None, None
+
     # Everything the job needs is checked now, so a bad request is a 400 and not a job that fails later.
-    if import_req.kind in ("audio", "file") and not import_req.path:
-        raise InvalidRequestError(f"path: required to import {import_req.kind}")
-    if import_req.kind == "youtube":
-        if not import_req.url:
-            raise InvalidRequestError("url: required to import a YouTube link")
-        if request.app.state.settings.privacy_mode == "offline":
-            raise NetworkDisabledError("importing a YouTube link needs the network, which is off in offline mode")
+    if req.kind == "audio":
+        raise EngineError("not_implemented", "importing an audio file is not available yet; import its transcript instead", 501)
+    if req.kind in ("text", "file"):
+        if text is None:
+            if req.kind != "file" or not req.path:
+                raise InvalidRequestError("text: required (or path, to import a file)")
+            text = _read_transcript_file(req.path)
+        try:
+            lines = parse_transcript(text, req.filename or req.path)
+        except TranscriptError as exc:
+            raise InvalidRequestError(f"text: {exc}") from None
+        title = title or _title_from_filename(req.filename or req.path) or "Imported transcript"
+    elif req.kind == "youtube":
+        try:
+            vid = youtube_import.video_id(req.url or "")
+        except youtube_import.YouTubeError as exc:
+            raise InvalidRequestError(f"url: {exc}") from None
+        if await SourceStore(pool).get_privacy_mode() != "connectors":
+            raise NetworkDisabledError("importing a YouTube link needs the network. Allow connectors in Settings, Privacy mode.")
 
-    store = MeetingStore(request.app.state.store.pool)
-
-    # Create the meeting
     meeting_id = str(uuid.uuid4())
     await store.create_meeting(
         meeting_id=meeting_id,
-        title=import_req.title or f"Imported {import_req.kind}",
+        title=title or "Imported YouTube video",
         context=None,
-        origin={"text": "text", "file": "file", "audio": "file", "youtube": "youtube"}.get(import_req.kind, "file"),
+        project_id=(req.projectId or "").strip() or None,
+        origin={"text": "text", "file": "file", "youtube": "youtube"}[req.kind],
     )
-
-    runner = get_runner()
 
     async def do_import():
-        """Import the meeting content."""
-        transcript_text = None
-
-        if import_req.kind == "text":
-            transcript_text = import_req.text or ""
-        elif import_req.kind == "audio":
-            # Transcribe audio file using ASR provider
-            if not import_req.path:
-                raise ValueError("path required for audio import")
-
-            # TODO: Load audio file and transcribe
-            # For now, create placeholder
-            transcript_text = "Transcribed audio"
-
-        elif import_req.kind == "file":
-            # Treat as text file
-            if not import_req.path:
-                raise ValueError("path required for file import")
-            # TODO: Load and read file
-            transcript_text = "Imported file content"
-
-        elif import_req.kind == "youtube":
-            # Download and transcribe YouTube
-            # Check privacy mode first
-            if request.app.state.settings.privacy_mode == "offline":
-                raise Exception("network_disabled: YouTube import not allowed in offline mode")
-
-            if not import_req.url:
-                raise ValueError("url required for youtube import")
-
-            # TODO: Download audio from YouTube and transcribe
-            transcript_text = "Transcribed YouTube video"
-
-        # Save transcript as segments
-        if transcript_text:
-            async with request.app.state.store.pool.connection() as conn:
-                segment_id = str(uuid.uuid4())
-                await conn.execute(
-                    """
-                    INSERT INTO transcript_segments (id, meeting_id, start_ms, end_ms, source, text, state)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (segment_id, meeting_id, 0, 0, "mic", transcript_text, "stable"),
-                )
-                # Update meeting to done status
-                now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-                await conn.execute(
-                    "UPDATE meetings SET status = %s, ended_at = %s, updated_at = %s WHERE id = %s",
-                    ("done", now, now, meeting_id),
-                )
-                await conn.commit()
-            await store.mark_done(meeting_id)  # publish time and word count, like a recorded meeting
-
-        # Optionally extract ideas
-        if import_req.extractIdeas:
-            # TODO: Chain extraction job
-            pass
-
-        # Publish meeting.update event
+        try:
+            imported = lines
+            if req.kind == "youtube":
+                imported = youtube_import.captions_to_lines(await youtube_import.fetch_captions(vid))
+                if not req.title:
+                    found = await youtube_import.video_title(vid)
+                    if found:
+                        await store.update_meeting(meeting_id, title=found)
+            await store.import_lines(meeting_id, imported)
+            await store.mark_done(meeting_id)
+        except Exception:
+            await store.delete_meeting(meeting_id)  # a failed import leaves nothing half-made
+            raise
         from app.local import events
-        updated_meeting = await store.get_meeting(meeting_id)
-        events.publish("meeting.update", updated_meeting.model_dump(exclude_none=True))
 
-    job_id = await runner.submit(
+        events.publish("meeting.update", (await store.get_meeting(meeting_id)).model_dump(exclude_none=True))
+
+    job_id = await get_runner().submit(
         kind="import_meeting",
         work_fn=do_import,
-        detail={
-            "meetingId": meeting_id,
-            "kind": import_req.kind,
-            "extractIdeas": import_req.extractIdeas,
-        },
+        detail={"meetingId": meeting_id, "kind": req.kind, "extractIdeas": req.extractIdeas},
     )
+    return {"meetingId": meeting_id, "jobId": job_id}
 
-    return {
-        "meetingId": meeting_id,
-        "jobId": job_id,
-    }
+
+def _title_from_filename(name: str | None) -> str | None:
+    if not name:
+        return None
+    import re
+    from pathlib import PurePath
+
+    stem = PurePath(name.replace("\\", "/")).stem
+    return re.sub(r"_+", " ", stem).strip() or None
+
+
+def _read_transcript_file(path: str) -> str:
+    """A transcript file on this computer (the desktop app sends a path), read as text."""
+    from app.local.routers.sources import _resolve_and_validate_path
+    from app.local.transcript_import import MAX_CHARS
+
+    try:
+        resolved = _resolve_and_validate_path(path, follow_symlinks=True)
+    except InvalidRequestError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise InvalidRequestError(f"path: {exc}") from None
+    if not resolved.is_file():
+        raise InvalidRequestError(f"path: not a file: {path}")
+    if resolved.stat().st_size > MAX_CHARS * 4:
+        raise InvalidRequestError("path: the file is too large to import")
+    return resolved.read_text(encoding="utf-8", errors="replace")

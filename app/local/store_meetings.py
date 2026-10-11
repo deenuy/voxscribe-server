@@ -1,6 +1,7 @@
 """Dedicated storage for meetings, notes, transcripts, and summaries."""
 
 import json
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -351,6 +352,23 @@ class MeetingStore:
     async def upsert_segment(self, meeting_id: str, segment: Segment) -> Segment:
         """Alias for append_segment."""
         return await self.append_segment(meeting_id, segment)
+
+    async def import_lines(self, meeting_id: str, lines: list[dict]) -> int:
+        """Add a whole transcript at once (an import): one connection, one transaction, every line stable.
+
+        Used for scribes that were not recorded here, so the meeting goes straight from empty to having a transcript."""
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        rows = [(f"imp_{i:06d}_{uuid.uuid4().hex[:8]}", meeting_id, l["startMs"], l["endMs"], "mic", l.get("speaker"), l["text"], "stable", now) for i, l in enumerate(lines)]
+        async with self.pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.executemany(
+                        """INSERT INTO transcript_segments (id, meeting_id, start_ms, end_ms, source, speaker, text, state, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        rows,
+                    )
+                await conn.execute("UPDATE meetings SET status = 'done', ended_at = %s, updated_at = %s WHERE id = %s", (now, now, meeting_id))
+        return len(rows)
 
     async def get_transcript(self, meeting_id: str, offset: int = 0, limit: int | None = None) -> list[Segment]:
         """Transcript segments in spoken order. `offset` and `limit` page through a long meeting."""

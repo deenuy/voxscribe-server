@@ -10,7 +10,7 @@ packages = ["app"]
 # ---------------------------------------------------------------------------
 [project]
 name = "voxscribe-server"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local engine implementing the Ideascribe contract: meetings, knowledge, live transcription, enrichment"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -54,6 +54,7 @@ dependencies = [
     "faster-whisper>=1.0",
     "pyjwt>=2.15.1",
     "cryptography>=50.0.2",
+    "youtube-transcript-api>=1.2.4",
 ]
 
 # ---------------------------------------------------------------------------
