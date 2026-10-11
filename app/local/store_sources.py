@@ -221,6 +221,18 @@ class SourceStore:
             rows = await cur.fetchall()
         return [Label(id=row["id"], name=row["name"], color=row.get("color")) for row in rows]
 
+    async def update_label(self, label_id: str, name: str | None, color: str | None) -> Label | None:
+        """Change a label's name and/or colour; None when there is no such label."""
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cur = await conn.execute(
+                "UPDATE labels SET name = COALESCE(%s, name), color = COALESCE(%s, color) WHERE id = %s RETURNING id, name, color",
+                (name, color, label_id),
+            )
+            row = await cur.fetchone()
+            await conn.commit()
+        return Label(id=row["id"], name=row["name"], color=row["color"]) if row else None
+
     async def delete_label(self, label_id: str):
         """Delete a label (cascade removes associations)."""
         async with self.pool.connection() as conn:

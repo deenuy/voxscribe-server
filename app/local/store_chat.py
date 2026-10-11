@@ -51,6 +51,12 @@ class ChatStore:
             createdAt=now,
         )
 
+    async def delete_thread(self, thread_id: str) -> None:
+        """Delete a thread; its messages go with it (ON DELETE CASCADE)."""
+        async with self.pool.connection() as conn:
+            await conn.execute("DELETE FROM chat_threads WHERE id = %s", (thread_id,))
+            await conn.commit()
+
     async def get_thread(self, thread_id: str) -> Thread | None:
         """Get a thread by ID."""
         async with self.pool.connection() as conn:

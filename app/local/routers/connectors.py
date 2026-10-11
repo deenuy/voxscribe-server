@@ -159,6 +159,7 @@ async def delete_google_connector(request: Request, removeContent: bool = False)
 
 @router.get("/google/events")
 async def list_google_auth_events(request: Request, limit: int = 50) -> dict:
+    limit = max(1, min(int(limit), 200))  # a caller cannot ask the database for a negative or enormous page
     """List recent Google auth events."""
     store = request.app.state.store
 

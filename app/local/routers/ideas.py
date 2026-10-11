@@ -4,11 +4,11 @@ import json
 import logging
 import uuid
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.local import events
-from app.local.errors import ConflictError, NotFoundError
+from app.local.errors import ConflictError, EngineError, InvalidRequestError, NotFoundError
 from app.local.job_runner import get_runner
 from app.local.models import (
     CreateFeatureRequest,
@@ -19,6 +19,7 @@ from app.local.models import (
     UpdateIdeaRequest,
     UpdateProjectRequest,
 )
+from app.local.store_meetings import MeetingStore
 from app.local.store_ideas import FeatureStore, IdeaStore, ProjectStore, _iso_datetime
 
 log = logging.getLogger(__name__)
@@ -90,6 +91,7 @@ async def list_ideas(
     cursor: str = None,
 ):
     """List ideas with filtering and pagination."""
+    limit = max(1, min(int(limit), 200))  # a page is bounded: nobody can ask for the whole table
     store = IdeaStore(request.app.state.store.pool)
     ideas, next_cursor = await store.list_ideas(
         query=query,
@@ -115,11 +117,26 @@ async def list_ideas(
     }
 
 
+async def _require_project_or_404(request: Request, project_id: str) -> None:
+    async with request.app.state.store.pool.connection() as conn:
+        if not await (await conn.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))).fetchone():
+            raise NotFoundError(f"project {project_id} not found")
+
+
+async def _require_project(request: Request, project_id: str) -> None:
+    """A reference to a project must name one that exists (400 otherwise, not a dangling pointer)."""
+    async with request.app.state.store.pool.connection() as conn:
+        if not await (await conn.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))).fetchone():
+            raise InvalidRequestError("projectId: no such project")
+
+
 @router.post("/ideas", status_code=201)
 async def create_idea(request: Request, body: CreateIdeaRequest):
     """Create a manual idea."""
     store = IdeaStore(request.app.state.store.pool)
     idea_id = f"idea_{str(uuid.uuid4())[:8]}"
+    if body.projectId:
+        await _require_project(request, body.projectId)
 
     idea = await store.create_idea(
         idea_id=idea_id,
@@ -242,7 +259,7 @@ async def update_idea(request: Request, idea_id: str, body: UpdateIdeaRequest):
         events.publish("idea.update", {"idea": idea})
         return idea
     except NotFoundError:
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "not found"})
 
 
 @router.delete("/ideas/{idea_id}", status_code=204)
@@ -252,9 +269,9 @@ async def delete_idea(request: Request, idea_id: str):
     try:
         await store.delete_idea(idea_id)
         events.publish("idea.delete", {"id": idea_id})
-        return JSONResponse(status_code=204, content={})
     except NotFoundError:
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+        pass  # already gone: a repeated DELETE still succeeds
+    return Response(status_code=204)
 
 
 @router.get("/ideas/{idea_id}/lineage")
@@ -264,7 +281,7 @@ async def get_idea_lineage(request: Request, idea_id: str):
     try:
         idea = await store.get_idea(idea_id)
     except NotFoundError:
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "not found"})
 
     nodes = [
         {"id": idea_id, "kind": "idea", "label": idea["title"]},
@@ -322,7 +339,7 @@ async def rescore_idea(request: Request, idea_id: str):
     try:
         await store.get_idea(idea_id)
     except NotFoundError:
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "not found"})
 
     runner = get_runner()
 
@@ -358,33 +375,16 @@ async def rescore_idea(request: Request, idea_id: str):
 
 @router.post("/meetings/{meeting_id}/extract-ideas", status_code=202)
 async def extract_ideas(request: Request, meeting_id: str, body: ExtractIdeasRequest):
-    """Extract ideas from a meeting transcript."""
-    runner = get_runner()
+    """Extract ideas from a meeting transcript.
 
-    async def do_extraction():
-        """Extract ideas from the meeting using the main model."""
-        # TODO: implement the full extraction logic with embedding matching
-        # For now, just create a log entry
-        async with request.app.state.store.pool.connection() as conn:
-            activity_id = str(uuid.uuid4())
-            await conn.execute(
-                """
-                INSERT INTO idea_activity (id, idea_id, kind, detail)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (activity_id, "placeholder", "extracted", json.dumps({
-                    "meetingId": meeting_id,
-                    "projectId": body.projectId,
-                })),
-            )
-            await conn.commit()
-
-    job_id = await runner.submit(
-        kind="extract_ideas",
-        work_fn=do_extraction,
-        detail={"meetingId": meeting_id, "projectId": body.projectId},
-    )
-    return {"jobId": job_id}
+    Not wired yet: the model call and the mapping into ideas, evidence and lineage are unfinished. Answering 202
+    and queueing a job that can only fail would tell the person it is working, so say so plainly instead. The
+    meeting must exist and have a transcript first, so the answer is still the right one for a bad request."""
+    store = MeetingStore(request.app.state.store.pool)
+    meeting = await store.get_meeting(meeting_id)  # 404 if there is no such meeting
+    if not meeting.hasTranscript:
+        raise ConflictError("this meeting has no transcript to extract ideas from")
+    raise EngineError("not_implemented", "idea extraction is not available in this engine build yet", 501)
 
 
 # ============================================================================
@@ -399,7 +399,7 @@ async def generate_prd(request: Request, idea_id: str):
     try:
         idea = await store.get_idea(idea_id)
     except NotFoundError:
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "not found"})
 
     # Check if idea is prd_candidate or delivery_ready
     if idea["status"] not in ["prd_candidate", "delivery_ready"]:
@@ -518,7 +518,7 @@ async def export_idea(request: Request, idea_id: str, format: str = "markdown"):
 
         return {"kind": "file", "content": "\n".join(lines)}
     except NotFoundError:
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "not found"})
 
 
 @router.post("/ideas/{idea_id}/handoff")
@@ -537,7 +537,7 @@ async def handoff_idea(request: Request, idea_id: str, body: HandoffIdeaRequest)
         content = f"# {idea['title']}\n\n{idea['summary']}"
         return {"kind": "file", "content": content}
     except NotFoundError:
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "not found"})
 
 
 @router.get("/ideas/{idea_id}/activity")
@@ -573,6 +573,7 @@ async def get_activity(request: Request, idea_id: str):
 @router.get("/projects")
 async def list_projects(request: Request, limit: int = 25, cursor: str = None):
     """List projects."""
+    limit = max(1, min(int(limit), 200))
     store = ProjectStore(request.app.state.store.pool)
     projects, next_cursor = await store.list_projects(limit=limit, cursor=cursor)
     return {
@@ -598,6 +599,16 @@ async def create_project(request: Request, body: CreateProjectRequest):
     return project
 
 
+@router.get("/projects/{project_id}")
+async def get_project(request: Request, project_id: str):
+    """One project, with its idea count."""
+    store = ProjectStore(request.app.state.store.pool)
+    try:
+        return await store.get_project(project_id)
+    except NotFoundError:
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "not found"})
+
+
 @router.patch("/projects/{project_id}")
 async def update_project(request: Request, project_id: str, body: UpdateProjectRequest):
     """Update a project."""
@@ -608,7 +619,7 @@ async def update_project(request: Request, project_id: str, body: UpdateProjectR
         events.publish("project.update", project)
         return project
     except NotFoundError:
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "not found"})
 
 
 @router.delete("/projects/{project_id}", status_code=204)
@@ -617,11 +628,11 @@ async def delete_project(request: Request, project_id: str):
     store = ProjectStore(request.app.state.store.pool)
     try:
         await store.delete_project(project_id)
-        return JSONResponse(status_code=204, content={})
+        return Response(status_code=204)
     except ConflictError as e:
         return JSONResponse(status_code=409, content={"error": "conflict", "detail": str(e)})
     except NotFoundError:
-        return JSONResponse(status_code=404, content={"error": "not_found"})
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "not found"})
 
 
 # ============================================================================
@@ -632,6 +643,7 @@ async def delete_project(request: Request, project_id: str):
 @router.get("/projects/{project_id}/features")
 async def list_features(request: Request, project_id: str):
     """List features for a project."""
+    await _require_project_or_404(request, project_id)
     store = FeatureStore(request.app.state.store.pool)
     features = await store.list_features(project_id)
     return {"items": features}
@@ -640,6 +652,7 @@ async def list_features(request: Request, project_id: str):
 @router.post("/projects/{project_id}/features", status_code=201)
 async def create_feature(request: Request, project_id: str, body: CreateFeatureRequest):
     """Create a feature."""
+    await _require_project_or_404(request, project_id)
     store = FeatureStore(request.app.state.store.pool)
     feature_id = f"feat_{str(uuid.uuid4())[:8]}"
 

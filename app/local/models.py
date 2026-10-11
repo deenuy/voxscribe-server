@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ============================================================================
 # Health and Status
@@ -67,9 +67,33 @@ class MeetingListResponse(BaseModel):
     nextCursor: str | None = None
 
 
+def _clean(value: str | None, *, blank_to: str | None = None, field: str = "text") -> str | None:
+    """Trim a text field. A blank one becomes `blank_to` (a default) or is refused when there is no default."""
+    if value is None:
+        return None
+    value = value.strip()
+    if value:
+        return value
+    if blank_to is not None:
+        return blank_to
+    raise ValueError(f"{field} must not be blank")
+
+
+IDEA_TYPE_KEYS = (
+    "new_product", "new_feature", "feature_enhancement", "ai_capability", "workflow_automation", "data_product",
+    "platform_capability", "governance_control", "experiment", "technical_enabler", "risk_compliance",
+)
+IdeaType = Literal[IDEA_TYPE_KEYS]  # type: ignore[valid-type]
+
+
 class CreateMeetingRequest(BaseModel):
-    title: str | None = "New meeting"
-    context: str | None = None
+    title: str | None = Field("New meeting", max_length=300)
+    context: str | None = Field(None, max_length=20000)
+
+    @field_validator("title")
+    @classmethod
+    def _title(cls, v):
+        return _clean(v, blank_to="New meeting")  # nothing is ever saved with an empty title
     projectId: str | None = None
     calendarEventId: str | None = None
     scheduledStart: str | None = None
@@ -77,11 +101,16 @@ class CreateMeetingRequest(BaseModel):
 
 
 class UpdateMeetingRequest(BaseModel):
-    title: str | None = None
-    context: str | None = None
+    title: str | None = Field(None, max_length=300)
+    context: str | None = Field(None, max_length=20000)
     reminderEnabled: bool | None = None
     enhanceStyle: Literal["standard", "concise"] | None = None
-    autoStopMinutes: int | None = None
+    autoStopMinutes: int | None = Field(None, ge=1, le=1440)
+
+    @field_validator("title")
+    @classmethod
+    def _title(cls, v):
+        return _clean(v, field="title")  # a rename to nothing is refused, not saved
 
 
 class StartMeetingRequest(BaseModel):
@@ -146,13 +175,13 @@ class EditSegmentRequest(BaseModel):
 
 
 class Block(BaseModel):
-    blockId: str
-    text: str
-    offsetMs: int
+    blockId: str = Field(min_length=1, max_length=200)
+    text: str = Field(max_length=50000)
+    offsetMs: int = Field(ge=0)
 
 
 class NotesRequest(BaseModel):
-    blocks: list[Block]
+    blocks: list[Block] = Field(max_length=5000)
 
 
 class NotesResponse(BaseModel):
@@ -326,7 +355,12 @@ class CreateThreadRequest(BaseModel):
 
 
 class SendMessageRequest(BaseModel):
-    text: str
+    text: str = Field(max_length=20000)
+
+    @field_validator("text")
+    @classmethod
+    def _text(cls, v):
+        return _clean(v, field="text")
 
 
 # ============================================================================
@@ -537,16 +571,16 @@ class AuthEvent(BaseModel):
 
 
 class CreateIdeaRequest(BaseModel):
-    title: str
-    summary: str | None = None
-    type: str | None = None
+    title: str = Field(max_length=300)
+    summary: str | None = Field(None, max_length=20000)
+    type: IdeaType | None = None
     projectId: str | None = None
 
 
 class UpdateIdeaRequest(BaseModel):
-    title: str | None = None
-    summary: str | None = None
-    type: str | None = None
+    title: str | None = Field(None, max_length=300)
+    summary: str | None = Field(None, max_length=20000)
+    type: IdeaType | None = None
     projectId: str | None = None
     featureId: str | None = None
     owner: str | None = None
@@ -554,18 +588,33 @@ class UpdateIdeaRequest(BaseModel):
 
 
 class CreateProjectRequest(BaseModel):
-    name: str
-    description: str | None = None
+    name: str = Field(max_length=120)
+    description: str | None = Field(None, max_length=5000)
     parentId: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v):
+        return _clean(v, field="name")
 
 
 class UpdateProjectRequest(BaseModel):
-    name: str | None = None
-    description: str | None = None
+    name: str | None = Field(None, max_length=120)
+    description: str | None = Field(None, max_length=5000)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v):
+        return _clean(v, field="name")
 
 
 class CreateFeatureRequest(BaseModel):
-    name: str
+    name: str = Field(max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v):
+        return _clean(v, field="name")
 
 
 class ExtractIdeasRequest(BaseModel):
