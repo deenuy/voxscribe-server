@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+- Added a status report of the on-device AI that lists what is installed and what is in memory right now, so the app can show whether it is ready.
+- Added a way to start the on-device AI from the app when it is not running, without ever starting a second copy.
 ## What's New in VoxScribe Server 0.2.0
 
 ### New Features
