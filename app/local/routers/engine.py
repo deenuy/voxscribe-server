@@ -1,22 +1,28 @@
 """Engine status for the app's status chip, and a way to start the AI runtime from it."""
 
 import time
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
 
 from app.local import runtime_status as rt
 from app.local.errors import EngineError
+from app.local.version import engine_version
 
 router = APIRouter(prefix="/v1/engine", tags=["engine"])
 
 
-async def _checks(request: Request) -> tuple[bool, bool]:
-    settings = request.app.state.settings
-    store = request.app.state.store
+async def _database(request: Request) -> dict:
     try:
-        db_ok, _schema, _name = await store.health_check()
+        ok, schema, name = await request.app.state.store.health_check()
+        return {"ok": bool(ok), "name": name, "schemaVersion": schema}
     except Exception:
-        db_ok = False
+        return {"ok": False, "name": None, "schemaVersion": None}
+
+
+async def _checks(request: Request, db: dict) -> tuple[bool, bool]:
+    settings = request.app.state.settings
+    db_ok = db["ok"]
     if settings.providers == "fake":
         return db_ok, True
     try:
@@ -31,11 +37,23 @@ async def _checks(request: Request) -> tuple[bool, bool]:
 async def _status(request: Request) -> dict:
     settings = request.app.state.settings
     probe = None if settings.providers == "fake" else await rt.probe_runtime(settings.ollama_host)
-    db_ok, asr_ok = await _checks(request)
-    return rt.build_status(
+    db = await _database(request)
+    db_ok, asr_ok = await _checks(request, db)
+    status = rt.build_status(
         settings=settings, probe=probe, db_ok=db_ok, asr_ok=asr_ok,
         start_requested_at=getattr(request.app.state, "runtime_start_requested_at", None),
     )
+    # The engine's own health, read from the running process and the database, not typed in anywhere.
+    started = getattr(request.app.state, "started_at", None)
+    status["engine"] = {
+        "version": engine_version(),
+        "uptimeSeconds": int(time.time() - started) if started else None,
+        "startedAt": datetime.fromtimestamp(started, UTC).isoformat().replace("+00:00", "Z") if started else None,
+        "database": db,
+        "providers": settings.providers,
+        "offline": settings.privacy_mode == "offline",
+    }
+    return status
 
 
 @router.get("/status")

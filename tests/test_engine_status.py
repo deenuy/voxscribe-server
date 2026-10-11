@@ -125,3 +125,90 @@ async def test_start_runtime_says_so_when_it_is_not_installed(client, monkeypatc
     monkeypatch.setattr(rt, "runtime_command", lambda s: None)
     res = await client.post("/v1/engine/start")
     assert res.status_code == 409 and res.json()["error"] == "runtime_not_installed"
+
+
+@pytest.mark.asyncio
+async def test_status_carries_the_engines_own_health_from_the_real_process_and_database(client):
+    from app.local.version import engine_version
+
+    body = (await client.get("/v1/engine/status")).json()
+    eng = body["engine"]
+    assert eng["version"] == engine_version() and eng["version"] != "0.1.0"  # read from the package, not typed in
+    assert eng["database"]["ok"] is True and eng["database"]["schemaVersion"] >= 5 and eng["database"]["name"]
+    assert eng["uptimeSeconds"] >= 0 and eng["startedAt"].endswith("Z") and eng["providers"] == "fake" and eng["offline"] is True
+    health = (await client.get("/v1/health")).json()
+    assert health["version"] == eng["version"]  # one source for both endpoints
+
+
+@pytest.mark.asyncio
+async def test_status_reports_a_database_that_is_down_instead_of_failing(client, monkeypatch):
+    async def broken():
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(client._transport.app.state.store, "health_check", broken)
+    body = (await client.get("/v1/engine/status")).json()
+    assert body["engine"]["database"] == {"ok": False, "name": None, "schemaVersion": None}
+
+
+# ------------------------------------------------------------------ the models list reflects reality
+
+
+def test_a_tag_without_a_version_matches_latest():
+    from app.local.model_service import tag_installed
+
+    assert tag_installed("nomic-embed-text", ["nomic-embed-text:latest", "gemma4:12b"]) is True
+    assert tag_installed("gemma4:12b", ["gemma4:12b"]) is True
+    assert tag_installed("gemma4:e2b", ["gemma4:e4b"]) is False  # a different version is a different model
+    assert tag_installed("bge-m3", ["bge-m3-large:latest"]) is False
+
+
+def test_roles_default_to_what_the_engine_is_configured_to_use_and_choices_win():
+    from app.local import model_service as ms
+
+    ms._selected_roles.clear()
+    cfg = Config(providers="local", llm_model="gemma4:12b", live_model="gemma4:e4b")
+    assert ms.roles_for("gemma4:12b", cfg) == ["main"]
+    assert ms.roles_for("gemma4:e4b", cfg) == ["live"]
+    assert ms.roles_for("gemma4:e2b", cfg) == []
+    ms.set_selected_roles("gemma4:e2b", ["live"])  # the person picked another live model
+    assert ms.roles_for("gemma4:e2b", cfg) == ["live"] and ms.roles_for("gemma4:e4b", cfg) == []
+    assert ms.roles_for("gemma4:12b", cfg) == ["main"]
+    ms._selected_roles.clear()
+
+
+@pytest.mark.asyncio
+async def test_the_models_endpoint_marks_the_models_in_use(client):
+    from app.local import model_service as ms
+
+    ms._selected_roles.clear()
+    items = {m["id"]: m for m in (await client.get("/v1/models")).json()["models"]}
+    assert items["gemma4:12b"]["selectedRoles"] == ["main"] and items["gemma4:12b"]["selected"] is True
+    assert items["gemma4:e4b"]["selectedRoles"] == ["live"]
+
+
+def test_choosing_a_model_for_a_role_takes_the_role_from_the_old_one():
+    from app.local import model_service as ms
+
+    ms._selected_roles.clear()
+    cfg = Config(providers="local")
+    ms.assign_role("main", "gemma4:12b")
+    ms.assign_role("live", "gemma4:e4b")
+    ms.assign_role("main", "gemma4:e2b")
+    assert ms.roles_for("gemma4:e2b", cfg) == ["main"] and ms.roles_for("gemma4:12b", cfg) == []
+    ms.assign_role("live", "gemma4:e2b")  # one model may hold both roles
+    assert ms.roles_for("gemma4:e2b", cfg) == ["main", "live"] and ms.roles_for("gemma4:e4b", cfg) == []
+    ms._selected_roles.clear()
+
+
+@pytest.mark.asyncio
+async def test_roles_chosen_in_an_earlier_run_come_back_after_a_restart(client):
+    from app.local import model_service as ms
+
+    pool = client._transport.app.state.store.pool
+    async with pool.connection() as conn:
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('model_role_main', '\"gemma4:e2b\"') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
+        await conn.commit()
+    ms._selected_roles.clear()
+    assert await ms.restore_selected_roles(pool) >= 1
+    assert ms.roles_for("gemma4:e2b", Config(providers="local")) == ["main"]
+    ms._selected_roles.clear()

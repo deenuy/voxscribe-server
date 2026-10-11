@@ -22,7 +22,7 @@ async def get_google_connector(request: Request) -> dict:
     token_expires_at = None
     if token_tuple:
         _, expires_at = token_tuple
-        token_expires_at = expires_at.isoformat() + "Z"
+        token_expires_at = iso_z(expires_at)
 
     connected = account_row is not None and token_tuple is not None
 
@@ -42,7 +42,7 @@ async def get_google_connector(request: Request) -> dict:
         account=account,
         scopes=scopes,
         tokenExpiresAt=token_expires_at,
-        lastSyncAt=account_row.get("last_sync_at").isoformat() + "Z" if account_row and account_row.get("last_sync_at") else None,
+        lastSyncAt=iso_z(account_row.get("last_sync_at")) if account_row and account_row.get("last_sync_at") else None,
     )
     return connector.model_dump(exclude_none=False)
 
