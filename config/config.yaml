@@ -1,0 +1,64 @@
+# VoxScribe server configuration.
+# Environment variables override any value here. The config loader reads this
+# file first and then applies env overrides, so 12-factor deployments work
+# without modification. Secrets (API keys) should live only in .env, never here.
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+# ---- queue ----
+# Submission is decoupled from processing. A worker pool drains jobs from the
+# queue into ASR and LLM extraction. backend=memory is the in-process default.
+# Implement the JobQueue protocol against kafka/temporal to scale horizontally.
+queue:
+  backend: "memory"           # memory | kafka (future) | temporal (future)
+  worker_concurrency: 2       # parallel sessions processed at once
+  max_attempts: 3             # retries before a job is dead-lettered
+  base_backoff: 2.0           # seconds; actual delay = base * 2^(attempt-1)
+  recording_ttl_seconds: 3600 # stale device claim reclaim window
+
+# ---- processing ----
+processing:
+  extractor: "simulated"  # simulated | ollama | claude
+  asr_backend: "stub"     # stub | faster_whisper | openai
+  cleanup: false          # run voxscribe-core transcript cleanup before extract
+
+# ---- models ----
+# Secrets (api_key) should be in .env, not here.
+models:
+  ollama:
+    host: "http://host.docker.internal:11434"  # Mac host from inside Docker
+    model: "gemma3:4b"                          # match your `ollama list` tag
+  claude:
+    model: "claude-sonnet-4-6"
+    api_key: ""   # set ANTHROPIC_API_KEY in .env
+  openai:
+    api_key: ""   # set OPENAI_API_KEY in .env
+    whisper_model: "base"
+
+# ---- storage ----
+storage:
+  data_dir: "./data"
+  db_path: "./data/ideascribe.db"
+  id_floor: 53   # backend ids start here to avoid colliding with client seeds
+
+# ---- auth ----
+# Defaults used in development until JWT-derived values land.
+auth:
+  default_tenant: "tnt-acme"
+  default_workspace: "ws-discovery"
+
+# ---- cors ----
+cors:
+  origins:
+    - "http://localhost:3000"   # Electron webpack dev server
+    - "http://localhost:8080"
+
+# ---- logging ----
+logging:
+  level: "INFO"             # DEBUG | INFO | WARNING | ERROR
+  format: "text"            # text (colourised, dev) | json (aggregator, prod)
+  log_file: "./logs/voxscribe.log"
+  max_bytes: 10485760       # 10 MB per file before rotation
+  backup_count: 5           # rotated files to keep

@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+
+# Optional, enable per backend (kept out of the default image to stay light):
+#   faster-whisper>=1.0     # ASR_BACKEND=faster_whisper
+pyyaml>=6.0
