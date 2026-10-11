@@ -9,7 +9,7 @@ from app.local import events
 from app.local.errors import ConflictError, InvalidRequestError, NotFoundError
 from app.local.model_service import (
     build_model_list,
-    get_selected_roles,
+    assign_role,
     set_selected_roles,
 )
 from app.local.models import Model
@@ -108,9 +108,7 @@ async def select_model(request: Request, model_id: str, body: dict) -> dict:
         await conn.commit()
 
     # Update in-memory selection
-    current_roles = set(get_selected_roles(model_id))
-    current_roles.add(role)
-    set_selected_roles(model_id, list(current_roles))
+    assign_role(role, model_id)
 
     # Return updated model
     models = await build_model_list(

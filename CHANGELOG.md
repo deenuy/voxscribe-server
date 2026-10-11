@@ -1,5 +1,19 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.3.0
+
+### New Features
+- Added the engine's own health to the status report (its version, how long it has been running, and the database), all read from the running engine.
+- Added a status report of the on-device AI that lists what is installed and what is in memory right now, so the app can show whether it is ready.
+- Added a way to start the on-device AI from the app when it is not running, without ever starting a second copy.
+
+### Bug Fixes
+- Fixed the engine reporting a made-up version number instead of its real one.
+- Fixed timestamps that apps could not read, which broke the Scribes list.
+- Fixed an installed embedding model being shown as not installed.
+- Fixed no model being shown as selected for the main and live work, and a chosen model being forgotten after a restart.
+- Prevented choosing a new main model from leaving the old one also marked as main.
+
 ## What's New in VoxScribe Server 0.2.0
 
 ### New Features

@@ -1,6 +1,7 @@
 """FastAPI application setup."""
 
 import hmac
+import time
 import os
 import sys
 import uuid
@@ -16,6 +17,7 @@ from psycopg_pool import PoolTimeout
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.local.errors import EngineError
+from app.local.version import engine_version
 from app.local.pg_index import PostgresKnowledgeIndex
 from app.local.providers import select_providers
 from app.local.store import Store
@@ -31,6 +33,14 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "ingestion_worker"):
         await app.state.ingestion_worker.start()
         print("Ingestion worker started", file=sys.stderr, flush=True)
+
+    # The models the person chose in an earlier run keep their roles.
+    try:
+        from app.local.model_service import restore_selected_roles
+
+        await restore_selected_roles(app.state.store.pool)
+    except Exception as exc:  # the defaults from configuration still apply
+        print(f"Restoring chosen models failed: {exc}", file=sys.stderr, flush=True)
 
     # A crash during finalisation leaves a meeting 'processing': finish it now.
     try:
@@ -100,7 +110,7 @@ async def create_app(
     # Create FastAPI app
     app = FastAPI(
         title="VoxScribe Engine",
-        version="0.1.0",
+        version=engine_version(),
         lifespan=lifespan,
     )
 
@@ -113,6 +123,7 @@ async def create_app(
     app.state.auth_disabled = auth_disabled
     app.state.auth_token = os.environ.get("VOXSCRIBE_TOKEN", str(uuid.uuid4()))
     app.state.settings = settings
+    app.state.started_at = time.time()
 
     # Auth middleware
     @app.middleware("http")
@@ -314,7 +325,7 @@ async def create_app(
 
         result = {
             "status": status,
-            "version": "0.1.0",
+            "version": engine_version(),
             "profile": "ideascribe",
             "capabilities": [
                 "transcribe",

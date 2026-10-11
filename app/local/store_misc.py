@@ -9,6 +9,8 @@ Tables owned by this module:
 """
 
 import json
+
+from .timefmt import iso_z
 from datetime import date, datetime
 
 from psycopg.rows import dict_row
@@ -111,8 +113,8 @@ async def get_calendar_events(conn, from_dt: str | None = None, to_dt: str | Non
             CalendarEvent(
                 id=row["id"],
                 title=row["title"],
-                start=row["start"].isoformat() + "Z" if isinstance(row["start"], datetime) else row["start"],
-                end=row["end"].isoformat() + "Z" if isinstance(row["end"], datetime) else row["end"],
+                start=iso_z(row["start"]),
+                end=iso_z(row["end"]),
                 attendees=row.get("attendees") or [],
             )
         )
@@ -196,7 +198,7 @@ async def list_auth_events(conn, limit: int = 50) -> list[AuthEvent]:
         events.append(
             AuthEvent(
                 id=row["id"],
-                at=row["at"].isoformat() + "Z" if isinstance(row["at"], datetime) else row["at"],
+                at=iso_z(row["at"]),
                 kind=row["kind"],
                 detail=detail,
             )

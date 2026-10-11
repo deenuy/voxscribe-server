@@ -8,6 +8,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
+from .timefmt import iso_z
 from .errors import ConflictError, EngineError, InvalidRequestError, NotFoundError
 from .models import Block, Citation, EnhancedBlock, Meeting, Segment
 
@@ -266,10 +267,10 @@ class MeetingStore:
             title=row["title"],
             context=row["context"],
             status=row["status"],
-            scheduledStart=row["scheduled_start"].isoformat() + "Z" if isinstance(row["scheduled_start"], datetime) else row["scheduled_start"],
-            scheduledEnd=row["scheduled_end"].isoformat() + "Z" if isinstance(row["scheduled_end"], datetime) else row["scheduled_end"],
-            startedAt=row["started_at"].isoformat() + "Z" if isinstance(row["started_at"], datetime) else row["started_at"],
-            endedAt=row["ended_at"].isoformat() + "Z" if isinstance(row["ended_at"], datetime) else row["ended_at"],
+            scheduledStart=iso_z(row["scheduled_start"]),
+            scheduledEnd=iso_z(row["scheduled_end"]),
+            startedAt=iso_z(row["started_at"]),
+            endedAt=iso_z(row["ended_at"]),
             calendarEventId=row["calendar_event_id"],
             reminderEnabled=bool(row["reminder_enabled"]),
             enhanceStyle=row["enhance_style"],
@@ -286,8 +287,8 @@ class MeetingStore:
             publishedAt=iso(row["published_at"]),
             transcriptRevision=row["transcript_revision"],
             summaryStale=bool(row["summary_stale"]),
-            createdAt=row["created_at"].isoformat() + "Z" if isinstance(row["created_at"], datetime) else row["created_at"],
-            updatedAt=row["updated_at"].isoformat() + "Z" if isinstance(row["updated_at"], datetime) else row["updated_at"],
+            createdAt=iso_z(row["created_at"]),
+            updatedAt=iso_z(row["updated_at"]),
         )
 
     # ========================================================================
@@ -542,7 +543,7 @@ class MeetingStore:
                     text=row["text"],
                     status=row["status"],
                     citations=[Citation(**c) for c in (row["citations"] or [])],
-                    updatedAt=row["updated_at"].isoformat() + "Z" if isinstance(row["updated_at"], datetime) else row["updated_at"],
+                    updatedAt=iso_z(row["updated_at"]),
                 )
                 for row in rows
             ],

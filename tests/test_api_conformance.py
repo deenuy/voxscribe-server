@@ -175,3 +175,52 @@ async def test_idea_extraction_is_honest_about_not_being_built(client):
 
 async def c_create(client):
     return (await client.post("/v1/meetings", json={})).json()["id"]
+
+
+# ----------------------------------------------------------------------------- timestamps
+
+
+UTC_Z = __import__("re").compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$")
+
+
+def _times(value, found=None, key=""):
+    """Every string that is a timestamp in a JSON answer (by field name), with where it was."""
+    found = [] if found is None else found
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _times(v, found, k)
+    elif isinstance(value, list):
+        for v in value:
+            _times(v, found, key)
+    elif isinstance(value, str) and (key.endswith("At") or key in ("start", "end", "startedAt", "scheduledStart", "scheduledEnd")):
+        found.append((key, value))
+    return found
+
+
+@pytest.mark.asyncio
+async def test_every_timestamp_the_engine_sends_is_utc_iso_with_a_z(client):
+    c = client
+    # PostgreSQL answers in the machine's zone (here, often -04:00): the old output was "...-04:00Z".
+    mid = (await c.post("/v1/meetings", json={"title": "t", "scheduledStart": "2026-10-11T10:00:00Z"})).json()["id"]
+    await c.post("/v1/projects", json={"name": "p"})
+    await c.post("/v1/ideas", json={"title": "i"})
+    await c.post("/v1/labels", json={"name": "l"})
+    await c.post("/v1/chat/threads", json={})
+    answers = [
+        (await c.get(f"/v1/meetings/{mid}")).json(), (await c.get("/v1/meetings")).json(), (await c.get("/v1/projects")).json(),
+        (await c.get("/v1/ideas")).json(), (await c.get("/v1/chat/threads")).json(), (await c.get("/v1/labels")).json(),
+    ]
+    stamps = [t for a in answers for t in _times(a)]
+    assert len(stamps) >= 6, stamps
+    assert [t for t in stamps if not UTC_Z.match(t[1])] == []
+
+
+def test_iso_z_converts_zones_instead_of_gluing_a_z_onto_an_offset():
+    from datetime import datetime, timedelta, timezone
+
+    from app.local.timefmt import iso_z
+
+    toronto = timezone(timedelta(hours=-4))
+    assert iso_z(datetime(2026, 10, 10, 23, 42, 10, tzinfo=toronto)) == "2026-10-11T03:42:10Z"
+    assert iso_z(datetime(2026, 10, 11, 3, 42, 10)) == "2026-10-11T03:42:10Z"  # naive is taken as UTC
+    assert iso_z("already text") == "already text" and iso_z(None) is None

@@ -12,14 +12,14 @@ def _iso_timestamp() -> str:
     """Return current timestamp in ISO format with Z suffix."""
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
+from .timefmt import iso_z  # noqa: E402
+
 
 def _iso_datetime(dt: "datetime | str | None") -> str | None:
     """Convert a datetime to ISO format with a Z suffix. A value that is already text passes through."""
     if dt is None:
         return None
-    if isinstance(dt, str):
-        return dt
-    return dt.isoformat().replace("+00:00", "Z")
+    return iso_z(dt)
 
 
 class IdeaStore:

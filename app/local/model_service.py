@@ -51,6 +51,52 @@ def get_selected_roles(model_id: str) -> list[str]:
     return _selected_roles.get(model_id, [])
 
 
+def assign_role(role: str, model_id: str) -> None:
+    """Give a role to exactly one model: it is taken from whichever model held it before."""
+    for other, roles in list(_selected_roles.items()):
+        if role in roles and other != model_id:
+            _selected_roles[other] = [r for r in roles if r != role]
+    held = set(_selected_roles.get(model_id, []))
+    held.add(role)
+    _selected_roles[model_id] = sorted(held)
+
+
+async def restore_selected_roles(pool) -> int:
+    """Load the roles the person chose in an earlier run (saved as settings), so a restart keeps them."""
+    import json
+
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT key, value FROM settings WHERE key IN ('model_role_main', 'model_role_live')")
+        rows = await cur.fetchall()
+    restored = 0
+    for key, value in rows:
+        model_id = value
+        if isinstance(value, str):
+            try:
+                model_id = json.loads(value)  # stored as JSON text...
+            except ValueError:
+                model_id = value  # ...or already decoded by the driver
+        if isinstance(model_id, str) and model_id:
+            assign_role(key.removeprefix("model_role_"), model_id)
+            restored += 1
+    return restored
+
+
+def roles_for(model_id: str, settings) -> list[str]:
+    """The roles a model holds right now: what the person chose, else what the engine is configured to use.
+
+    Before anything is chosen the engine already uses `llm_model` for the main role and `live_model` for the live
+    role, so those are reported as selected instead of showing nothing in use."""
+    chosen = {role: next((m for m, roles in _selected_roles.items() if role in roles), None) for role in ("main", "live")}
+    defaults = {"main": getattr(settings, "llm_model", None), "live": getattr(settings, "live_model", None)}
+    return [role for role in ("main", "live") if (chosen[role] or defaults[role]) == model_id]
+
+
+def tag_installed(tag: str, installed: list[str]) -> bool:
+    """Is a configured tag installed? A tag without a version means `:latest` (so `nomic-embed-text` matches `nomic-embed-text:latest`)."""
+    return tag in installed or (":" not in tag and f"{tag}:latest" in installed)
+
+
 def active_model(role: Literal["main", "live"]) -> str:
     """Get the model ID that is selected for a given role.
 
@@ -108,7 +154,7 @@ async def build_model_list(settings, ollama_host: str, providers_mode: str) -> l
             )
         )
         for model_id, info in GENERATIVE_MODELS_CATALOGUE.items():
-            roles = get_selected_roles(model_id)
+            roles = roles_for(model_id, settings)
             models.append(
                 Model(
                     id=model_id,
@@ -160,7 +206,7 @@ async def build_model_list(settings, ollama_host: str, providers_mode: str) -> l
                 if response.status_code == 200:
                     models_list = response.json().get("models", [])
                     model_names = [m.get("name", "") for m in models_list]
-                    embedding_ready = settings.embed_model in model_names
+                    embedding_ready = tag_installed(settings.embed_model, model_names)
         except Exception as e:
             embedding_error = str(e)
 
@@ -187,8 +233,8 @@ async def build_model_list(settings, ollama_host: str, providers_mode: str) -> l
                 available_models = [m.get("name", "") for m in models_list]
 
                 for model_id, info in GENERATIVE_MODELS_CATALOGUE.items():
-                    status = "ready" if model_id in available_models else "available"
-                    roles = get_selected_roles(model_id)
+                    status = "ready" if tag_installed(model_id, available_models) else "available"
+                    roles = roles_for(model_id, settings)
                     models.append(
                         Model(
                             id=model_id,
@@ -205,7 +251,7 @@ async def build_model_list(settings, ollama_host: str, providers_mode: str) -> l
         except Exception as e:
             # Ollama unavailable: return all models as available with error
             for model_id, info in GENERATIVE_MODELS_CATALOGUE.items():
-                roles = get_selected_roles(model_id)
+                roles = roles_for(model_id, settings)
                 models.append(
                     Model(
                         id=model_id,

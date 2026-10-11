@@ -5,6 +5,7 @@ Tables owned by this module:
 - chat_messages
 """
 
+from .timefmt import iso_z
 from datetime import datetime
 
 from psycopg.rows import dict_row
@@ -14,9 +15,7 @@ from .models import ChatScope, Citation, Message, Thread
 
 def _to_iso_string(dt):
     """Convert datetime to ISO string if needed."""
-    if isinstance(dt, datetime):
-        return dt.isoformat() + "Z" if not dt.isoformat().endswith("Z") else dt.isoformat()
-    return dt
+    return iso_z(dt)
 
 
 class ChatStore:
