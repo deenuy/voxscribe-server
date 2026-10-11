@@ -6,10 +6,11 @@ configuration and the tags shown are the runtime's own spelling.
 
 A model that is installed but not in memory is NOT a problem. Ollama loads a model on first use and unloads it after
 it has been idle, so an engine that is perfectly ready often has nothing in memory. State therefore means:
-  offline   the runtime does not answer
-  loading   the runtime is being started right now (the person asked for it, and it is not up yet)
-  degraded  it answers, but a required model is not installed, or the database or speech recognition is not ok
-  ready     everything needed is installed and reachable (models may still be idle)
+  offline    the runtime does not answer (each model that depends on it is an error)
+  error      it answers, but a model is missing or unusable, or the database is not ok
+  loading    the runtime is being started right now (the person asked for it, and it is not up yet)
+  on-demand  everything is installed and reachable and at least one model is idle: ready for use
+  ready      everything is installed and in memory
 """
 
 import asyncio
@@ -50,53 +51,86 @@ def _mb(entry: dict) -> int | None:
     return round(size / (1024 * 1024)) if size else None
 
 
+# Per-model states: a controlled vocabulary the app renders as Ready, On demand, Not downloaded, Error.
+#   ready           in memory now
+#   on-demand       installed, loads when it is first needed (the normal idle state, not a fault)
+#   not-downloaded  required but not installed
+#   error           cannot be used (its runtime is unreachable, or speech recognition is unavailable)
+#   loading         its runtime is being started right now
+READY, ON_DEMAND, NOT_DOWNLOADED, ERROR, LOADING = "ready", "on-demand", "not-downloaded", "error", "loading"
+
+# The overall state is the worst of the parts, in this order. A missing required model counts as an error.
+_SEVERITY = {"offline": 5, ERROR: 4, NOT_DOWNLOADED: 4, LOADING: 3, ON_DEMAND: 2, READY: 1}
+
+
+def worst(states: list[str]) -> str:
+    """offline > error > loading > on-demand > ready (a model that is not downloaded counts as error)."""
+    top = max(states, key=lambda s: _SEVERITY.get(s, 0), default=READY)
+    return ERROR if top == NOT_DOWNLOADED else top
+
+
 def build_status(*, settings, probe: dict | None, db_ok: bool, asr_ok: bool, start_requested_at: float | None, now: float | None = None) -> dict:
-    """The status document. `probe` is None when the runtime did not answer."""
+    """The hot-path status: an overall state and one row per model role, each with its own state.
+
+    `probe` is None when the runtime did not answer. Nothing about versions, uptime, the runtime's name or the
+    database is in here (see `build_details`): this document is polled every few seconds and stays small."""
     now = time.time() if now is None else now
     stamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     if settings.providers == "fake":
-        models = [{"role": r, "tag": "fake:deterministic", "provider": "fake", "installed": True, "loaded": True, "memoryMB": None}
+        models = [{"role": r, "tag": "fake:deterministic", "state": READY, "memoryMB": None}
                   for r in ("main", "live-assist", "transcription", "embedding")]
-        return {"state": "ready", "runtime": {"name": "fake", "reachable": True}, "models": models, "updatedAt": stamp}
+        overall = worst([m["state"] for m in models])
+        return {"state": overall if db_ok else ERROR, "models": models, "updatedAt": stamp}
 
     wanted = [("main", settings.llm_model), ("live-assist", settings.live_model), ("embedding", settings.embed_model)]
     models = []
-    degraded = not db_ok
-    if probe is None:
-        starting = start_requested_at is not None and now - start_requested_at < START_GRACE_S
-        for role, tag in wanted:
-            models.append({"role": role, "tag": tag, "provider": "ollama", "installed": False, "loaded": False, "memoryMB": None})
-        models.insert(2, _asr(settings, asr_ok))
-        return {"state": "loading" if starting else "offline", "runtime": {"name": "ollama", "reachable": False}, "models": models, "updatedAt": stamp}
-
-    loaded = {m.get("name") or m.get("model"): m for m in probe["loaded"]}
-    installed = [m.get("name") for m in probe["installed"]]
+    runtime_down = probe is None
+    starting = runtime_down and start_requested_at is not None and now - start_requested_at < START_GRACE_S
+    loaded = {} if runtime_down else {m.get("name") or m.get("model"): m for m in probe["loaded"]}
+    installed = [] if runtime_down else [m.get("name") for m in probe["installed"]]
     for role, tag in wanted:
+        if runtime_down:
+            models.append({"role": role, "tag": tag, "state": LOADING if starting else ERROR, "memoryMB": None})
+            continue
         spelled = _match(tag, installed)
         in_memory = _match(tag, list(loaded))
         entry = loaded.get(in_memory) if in_memory else None
-        if spelled is None:
-            degraded = True
-        models.append({
-            "role": role,
-            "tag": in_memory or spelled or tag,  # exactly what `ollama ps` / `ollama list` print
-            "provider": "ollama",
-            "installed": spelled is not None,
-            "loaded": entry is not None,
-            "memoryMB": _mb(entry) if entry else None,
-        })
-    asr = _asr(settings, asr_ok)
-    models.insert(2, asr)
-    if not asr["installed"]:
-        degraded = True
-    return {"state": "degraded" if degraded else "ready", "runtime": {"name": "ollama", "reachable": True}, "models": models, "updatedAt": stamp}
+        state = NOT_DOWNLOADED if spelled is None else READY if entry is not None else ON_DEMAND
+        models.append({"role": role, "tag": in_memory or spelled or tag,  # exactly what `ollama ps` / `ollama list` print
+                       "state": state, "memoryMB": _mb(entry) if entry else None})
+    models.insert(2, _asr(settings, asr_ok))
+    overall = worst([m["state"] for m in models])
+    if runtime_down and not starting:
+        overall = "offline"  # the AI runtime does not answer; every model that depends on it shows an error
+    elif not db_ok:
+        overall = ERROR
+    return {"state": overall, "models": models, "updatedAt": stamp}
+
+
+def build_details(*, settings, runtime_reachable: bool, db: dict, version: str, started_at: float | None, now: float | None = None) -> dict:
+    """Technical facts for the Settings page, kept apart from the hot status path.
+
+    No environment name leaves the engine: the database is reported as connected or not, with its schema version,
+    never by name (a name such as a development database would otherwise reach a screen)."""
+    now = time.time() if now is None else now
+    return {
+        "engine": {
+            "version": version,
+            "uptimeSeconds": int(now - started_at) if started_at else None,
+            "startedAt": datetime.fromtimestamp(started_at, UTC).isoformat().replace("+00:00", "Z") if started_at else None,
+        },
+        "runtime": {"name": "ollama" if settings.providers != "fake" else "fake", "reachable": runtime_reachable},
+        "database": {"ok": bool(db.get("ok")), "schemaVersion": db.get("schemaVersion")},
+        "providers": settings.providers,
+        "offline": settings.privacy_mode == "offline",
+        "updatedAt": datetime.fromtimestamp(now, UTC).isoformat().replace("+00:00", "Z"),
+    }
 
 
 def _asr(settings, asr_ok: bool) -> dict:
-    # Speech recognition is not an Ollama model: it is in memory while the engine runs.
-    return {"role": "transcription", "tag": f"faster-whisper:{settings.asr_model}", "provider": "faster-whisper",
-            "installed": bool(asr_ok), "loaded": bool(asr_ok), "memoryMB": None}
+    # Speech recognition is not an Ollama model: it is in memory while the engine runs, and it does not depend on the runtime.
+    return {"role": "transcription", "tag": f"faster-whisper:{settings.asr_model}", "state": READY if asr_ok else ERROR, "memoryMB": None}
 
 
 def runtime_command(settings) -> list[str] | None:

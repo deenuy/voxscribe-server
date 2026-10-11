@@ -1,5 +1,23 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.4.0
+
+### New Features
+- Added a details report for the engine (version, running time, AI runtime, database connection and schema version) on its own address, so the frequently polled status stays small.
+
+- Added a script that puts two sample scribes and their projects into the development database, and removes them again.
+
+### Changed
+- Changed the status report so each model has its own state (ready, on demand, not downloaded, error, starting), and the whole is the worst of them.
+- Changed the status report to say "error" instead of "degraded", and to stop sending the engine version, running time, runtime and database.
+- Changed the health report to name the kind of database instead of the database itself.
+
+### Fixed
+- Fixed the status report not showing an error when the database was down while using the built-in test engine.
+
+### Prevented
+- Prevented any database or environment name from leaving the engine in the status, details or health reports.
+
 ## What's New in VoxScribe Server 0.3.0
 
 ### New Features

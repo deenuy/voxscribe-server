@@ -34,32 +34,40 @@ async def _checks(request: Request, db: dict) -> tuple[bool, bool]:
     return db_ok, asr_ok
 
 
+async def _probe(request: Request):
+    settings = request.app.state.settings
+    return None if settings.providers == "fake" else await rt.probe_runtime(settings.ollama_host)
+
+
 async def _status(request: Request) -> dict:
     settings = request.app.state.settings
-    probe = None if settings.providers == "fake" else await rt.probe_runtime(settings.ollama_host)
+    probe = await _probe(request)
     db = await _database(request)
     db_ok, asr_ok = await _checks(request, db)
-    status = rt.build_status(
+    return rt.build_status(
         settings=settings, probe=probe, db_ok=db_ok, asr_ok=asr_ok,
         start_requested_at=getattr(request.app.state, "runtime_start_requested_at", None),
     )
-    # The engine's own health, read from the running process and the database, not typed in anywhere.
-    started = getattr(request.app.state, "started_at", None)
-    status["engine"] = {
-        "version": engine_version(),
-        "uptimeSeconds": int(time.time() - started) if started else None,
-        "startedAt": datetime.fromtimestamp(started, UTC).isoformat().replace("+00:00", "Z") if started else None,
-        "database": db,
-        "providers": settings.providers,
-        "offline": settings.privacy_mode == "offline",
-    }
-    return status
 
 
 @router.get("/status")
 async def engine_status(request: Request) -> dict:
-    """State (ready, loading, degraded, offline) and one row per model role, from what the runtime reports."""
+    """The overall state and one row per model role with its own state, from what the runtime reports.
+
+    Small on purpose: the app polls it every few seconds. Technical facts are in `/engine/details`."""
     return await _status(request)
+
+
+@router.get("/details")
+async def engine_details(request: Request) -> dict:
+    """Technical details for Settings: engine version and uptime, the AI runtime, the database (without its name)."""
+    settings = request.app.state.settings
+    probe = await _probe(request)
+    db = await _database(request)
+    return rt.build_details(
+        settings=settings, runtime_reachable=settings.providers == "fake" or probe is not None, db=db,
+        version=engine_version(), started_at=getattr(request.app.state, "started_at", None),
+    )
 
 
 @router.post("/start")
@@ -70,9 +78,9 @@ async def start_runtime(request: Request):
     `runtime_not_installed` when there is nothing to start on this machine."""
     from fastapi.responses import JSONResponse
 
-    status = await _status(request)
-    if status["runtime"]["reachable"]:
-        return status
+    settings = request.app.state.settings
+    if settings.providers == "fake" or await _probe(request) is not None:
+        return await _status(request)
     now = time.time()
     requested = getattr(request.app.state, "runtime_start_requested_at", None)
     if requested is None or now - requested >= rt.START_COOLDOWN_S:
@@ -81,5 +89,4 @@ async def start_runtime(request: Request):
             raise EngineError("runtime_not_installed", "the AI runtime is not installed on this computer", 409)
         await rt.spawn_runtime(cmd)
         request.app.state.runtime_start_requested_at = now
-        status = await _status(request)
-    return JSONResponse(status_code=202, content=status)
+    return JSONResponse(status_code=202, content=await _status(request))
