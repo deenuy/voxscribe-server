@@ -48,6 +48,35 @@ device, and a stale claim past `RECORDING_TTL_SECONDS` is reclaimed so a crashed
 client never blocks a device permanently. The one-shot upload path does not
 claim a device, since the recording already finished client-side.
 
+## voxscribe-core dependency
+
+This server depends on voxscribe-core, the shared intelligence kernel. The
+wheel is built from the core repo, tracked here at `wheels/voxscribe_core-0.1.1-py3-none-any.whl`,
+and pinned in uv.lock to ensure every checkout builds identically.
+
+The wheel includes the knowledge extra (pypdf, openpyxl) for PDF and spreadsheet
+support. To rebuild it from source (after a core update):
+
+```bash
+make core-wheel          # build from ../core-pkg tag v0.1.1
+git add wheels/ && git commit && uv lock
+```
+
+### Development: switch between pinned wheel and editable source
+
+To work on voxscribe-core while running this server:
+
+```bash
+make core-dev            # use editable ../core-pkg
+uv sync                  # pick up any new core dependencies
+# ... make changes to ../core-pkg ...
+# when done:
+make core-pinned         # back to the pinned wheel
+```
+
+The editable install works seamlessly: changes to ../core-pkg are picked up on
+the next import, no rebuild needed.
+
 ## Run it
 
 ```bash
