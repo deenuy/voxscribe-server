@@ -11,6 +11,9 @@ from .store_meetings import MeetingStore
 
 log = logging.getLogger(__name__)
 
+# The summary of a recording in which nothing was transcribed. No model is asked to summarise nothing.
+NO_SPEECH_OVERVIEW = "No speech was captured in this recording."
+
 
 class SummaryService:
     """Service for generating meeting summaries."""
@@ -58,15 +61,36 @@ class SummaryService:
                 for b in enhanced_resp["blocks"]
             ]
 
-            # Call core's summarize function (may be slow; run off event loop)
-            summary = await asyncio.to_thread(
-                summarize_meeting,
-                self.llm,
-                segments,
-                notes,
-                enhanced if enhanced else None,
-                False,  # allow_extractive
-            )
+            if not any((s["text"] or "").strip() for s in segments) and not any(
+                (n["text"] or "").strip() for n in notes
+            ):
+                await self.store.set_summary(
+                    meeting_id=meeting_id,
+                    overview=NO_SPEECH_OVERVIEW,
+                    details=[],
+                    generated_at=datetime.utcnow().isoformat() + "Z",
+                )
+                await meeting_bus.publish(meeting_id, "summary.ready", {})
+                log.info(f"No speech in meeting {meeting_id}; summary not generated")
+                return
+
+            # Call core's summarize function (may be slow; run off event loop). A model that answers with
+            # nothing usable (an empty reply while it is still loading, for example) gets one more try.
+            for attempt in (1, 2):
+                try:
+                    summary = await asyncio.to_thread(
+                        summarize_meeting,
+                        self.llm,
+                        segments,
+                        notes,
+                        enhanced if enhanced else None,
+                        False,  # allow_extractive
+                    )
+                    break
+                except ValueError as e:
+                    if attempt == 2:
+                        raise
+                    log.warning(f"Summary for meeting {meeting_id} was not usable, trying once more: {e}")
 
             # Convert details to list of dicts
             details = [

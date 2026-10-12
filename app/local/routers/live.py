@@ -85,7 +85,14 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
             await websocket.close(code=1011, reason="provider unavailable")
             return
 
-        transcriber = LiveTranscriber(asr_provider, session_id=meeting_id)
+        settings = getattr(app.state, "settings", None)
+        transcriber = LiveTranscriber(
+            asr_provider,
+            session_id=meeting_id,
+            vad_mode=getattr(settings, "live_vad_mode", "adaptive"),
+            max_segment_ms=getattr(settings, "live_max_segment_ms", 15000) or None,
+        )
+        speaking = False  # last speech state told to the client
 
         # Track state for live transcription
         auto_stop_enabled = meeting.autoStopMinutes and meeting.autoStopMinutes > 0
@@ -204,8 +211,13 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                         log.error(f"Transcription error: {e}")
                         continue
 
-                    # Send partial segments
-                    partials = transcriber.get_pending_partials()
+                    # Tell the client when speech starts and stops (clients that do not know "vad" ignore it).
+                    if transcriber.in_speech != speaking:
+                        speaking = transcriber.in_speech
+                        await websocket.send_json({"type": "vad", "speech": speaking})
+
+                    # Send partial segments, each once per change of its text
+                    partials = transcriber.pop_partials()
                     for seg in partials:
                         await websocket.send_json({
                             "type": "transcript.partial",
@@ -221,36 +233,7 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                         })
 
                     # Send and persist stable segments
-                    for seg in new_stable:
-                        db_segment = Segment(
-                            id=seg.id,
-                            startMs=seg.start_ms,
-                            endMs=seg.end_ms,
-                            source=seg.source,
-                            speaker=seg.speaker,
-                            text=seg.text,
-                            state=seg.state,
-                        )
-
-                        # Persist segment
-                        try:
-                            await store.upsert_segment(meeting_id, db_segment)
-                        except Exception as e:
-                            log.warning(f"Failed to persist segment: {e}")
-
-                        # Send to client
-                        await websocket.send_json({
-                            "type": "transcript.stable",
-                            "segment": {
-                                "id": db_segment.id,
-                                "startMs": db_segment.startMs,
-                                "endMs": db_segment.endMs,
-                                "source": db_segment.source,
-                                "speaker": db_segment.speaker,
-                                "text": db_segment.text,
-                                "state": db_segment.state,
-                            }
-                        })
+                    await _publish_stable(websocket, store, meeting_id, new_stable)
 
                     if new_stable:
                         if live_assist is not None:
@@ -344,6 +327,12 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                             spawn(reenrich_pending())
 
         finally:
+            # Words still being spoken when the client left are not lost.
+            try:
+                tail = await asyncio.to_thread(transcriber.flush)
+                await _publish_stable(websocket, store, meeting_id, tail, send=False)
+            except Exception as e:
+                log.warning(f"Could not keep the last words of {meeting_id}: {e}")
             for task in list(background):
                 task.cancel()
             event_task.cancel()
@@ -358,6 +347,38 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
             await websocket.send_json({"type": "error", "code": "internal_error", "detail": str(e)})
         except Exception:
             pass
+
+
+async def _publish_stable(websocket: WebSocket, store: MeetingStore, meeting_id: str, segments, send: bool = True) -> None:
+    """Persist stable segments and send them to the client."""
+    for seg in segments:
+        db_segment = Segment(
+            id=seg.id,
+            startMs=seg.start_ms,
+            endMs=seg.end_ms,
+            source=seg.source,
+            speaker=seg.speaker,
+            text=seg.text,
+            state=seg.state,
+        )
+        try:
+            await store.upsert_segment(meeting_id, db_segment)
+        except Exception as e:
+            log.warning(f"Failed to persist segment: {e}")
+        if not send:
+            continue
+        await websocket.send_json({
+            "type": "transcript.stable",
+            "segment": {
+                "id": db_segment.id,
+                "startMs": db_segment.startMs,
+                "endMs": db_segment.endMs,
+                "source": db_segment.source,
+                "speaker": db_segment.speaker,
+                "text": db_segment.text,
+                "state": db_segment.state,
+            }
+        })
 
 
 def _to_frame(event: dict) -> dict | None:
