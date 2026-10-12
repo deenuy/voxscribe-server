@@ -43,6 +43,7 @@ class _Store:
         pass
 
 
+
 async def test_no_speech_skips_the_model(monkeypatch, caplog):
     calls = []
     monkeypatch.setattr(summary_service, "summarize_meeting", lambda *a: calls.append(a))
