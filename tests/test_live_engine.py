@@ -34,8 +34,8 @@ def silence(seconds: float, rate: int = 16000) -> bytes:
     return b"\x00\x00" * int(seconds * rate)
 
 
-@pytest.fixture(scope="module")
-def engine():
+def _run_engine(**extra_env):
+    """Start an engine with fake providers on a throwaway schema; yields its base URLs, then stops it."""
     from app.local.migrations import run_migrations
     import asyncio
 
@@ -44,7 +44,7 @@ def engine():
         c.execute(f"CREATE SCHEMA {schema}")
     asyncio.run(run_migrations(BASE_DB, schema=schema))
     url = f"{BASE_DB}?options=-c%20search_path%3D{schema},public"
-    env = dict(os.environ, VOXSCRIBE_TOKEN=TOKEN)
+    env = dict(os.environ, VOXSCRIBE_TOKEN=TOKEN, **extra_env)
     proc = subprocess.Popen(
         ["uv", "run", "voxscribe-engine", "--port", "0", "--providers", "fake", "--database-url", url],
         stdout=subprocess.PIPE,
@@ -65,6 +65,17 @@ def engine():
             os.killpg(proc.pid, signal.SIGKILL)
         with psycopg.connect(BASE_DB, autocommit=True) as c:
             c.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+@pytest.fixture(scope="module")
+def engine():
+    yield from _run_engine()
+
+
+@pytest.fixture(scope="module")
+def engine_heuristic():
+    """The same engine with the live path segmenting through core's heuristic speech detector."""
+    yield from _run_engine(VOXSCRIBE_LIVE_VAD_MODE="heuristic")
 
 
 @pytest.fixture
@@ -199,3 +210,98 @@ def test_stopping_over_http_finishes_the_meeting_with_a_summary(engine, http):
         time.sleep(1)
     assert status == "done"
     assert http.get(f"/meetings/{meeting_id}/summary").json()["status"] in ("ready", "none")
+
+
+# ---- speech activity on the socket (ADR 0001, phase S2) ------------------------------------------------------------
+
+
+def test_vad_messages_carry_time_probability_and_detector_in_the_default_mode(engine, http):
+    """The default gate is still adaptive: it has no probability, so p is null and the detector is "energy"."""
+    meeting_id = new_meeting(http)
+    with connect(f"{engine['ws']}/meetings/{meeting_id}/live?token={TOKEN}") as ws:
+        speak(ws)
+        events = drain(ws, 3)
+    vad = [e for e in events if e["type"] == "vad"]
+    assert [e["speech"] for e in vad] == [True, False]
+    for e in vad:
+        assert set(e) == {"type", "speech", "at_ms", "p", "detector"}
+        assert isinstance(e["at_ms"], int) and e["p"] is None and e["detector"] == "energy"
+    assert vad[0]["at_ms"] < vad[1]["at_ms"]
+    assert not [e for e in events if e["type"] == "vad.level"]  # not asked for, and the energy gate has no level
+    assert http.get("/health").json()["speech_activity"]["live_mode"] == "adaptive"
+
+
+def _samantha_pcm() -> bytes:
+    """Core's packaged golden clip: 5.9 s of a quiet room, speech from 0.9 s to 3.8 s, then quiet."""
+    import numpy as np
+    from voxscribe.speech.evaluate import vectors_dir
+    from voxscribe.speech.wav import read_wav
+
+    samples, rate = read_wav(vectors_dir() / "speech_samantha_clean.wav")
+    assert rate == 16000
+    return np.round(samples * 32767.0).astype("<i2").tobytes()
+
+
+def _reference_events():
+    from voxscribe.speech import SEGMENTATION, create_detector
+    from voxscribe.speech.evaluate import run_item, vectors_dir
+    from voxscribe.speech.wav import read_wav
+
+    samples, rate = read_wav(vectors_dir() / "speech_samantha_clean.wav")
+    run = run_item(samples, rate, create_detector("heuristic"), SEGMENTATION)
+    return [(e.kind == "started", e.at_ms) for e, _ in run["events"]]
+
+
+def _send_clip(ws, pcm: bytes, frame_ms: int = 100):
+    step = 16000 * frame_ms // 1000 * 2
+    for i in range(0, len(pcm), step):
+        ws.send(b"\x00" + pcm[i : i + step])
+        time.sleep(0.01)
+
+
+def test_heuristic_mode_sends_detector_events_and_opt_in_levels(engine_heuristic, http):
+    base = engine_heuristic
+    with httpx.Client(base_url=base["http"], headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30) as h:
+        assert h.get("/health").json()["speech_activity"]["live_mode"] == "heuristic"
+        meeting_id = h.post("/meetings", json={"title": "heuristic"}).json()["id"]
+        assert h.post(f"/meetings/{meeting_id}/start", json={"consentAcknowledged": True}).status_code == 200
+        try:
+            pcm = _samantha_pcm()
+            with connect(f"{base['ws']}/meetings/{meeting_id}/live?token={TOKEN}&levels=1") as ws:
+                _send_clip(ws, pcm)
+                events = drain(ws, 3)
+        finally:
+            h.post(f"/meetings/{meeting_id}/stop")
+            time.sleep(0.5)
+
+    vad = [e for e in events if e["type"] == "vad"]
+    # The socket reproduces the reference tracker exactly: same transitions at the same session times.
+    assert [(e["speech"], e["at_ms"]) for e in vad] == _reference_events()
+    for e in vad:
+        assert e["detector"] == "heuristic" and isinstance(e["p"], float) and 0.0 <= e["p"] <= 1.0
+    assert vad[0]["p"] >= 0.4 and vad[1]["p"] < 0.25  # the deciding frames of the segmentation policy
+
+    levels = [e for e in events if e["type"] == "vad.level"]
+    assert levels, "levels=1 asked for vad.level messages"
+    assert all(set(e) == {"type", "at_ms", "p"} and 0.0 <= e["p"] <= 1.0 for e in levels)
+    gaps = [b["at_ms"] - a["at_ms"] for a, b in zip(levels, levels[1:])]
+    assert gaps and min(gaps) >= 100  # at most 10 per second of audio
+    assert any(e["p"] >= 0.4 for e in levels) and any(e["p"] < 0.25 for e in levels)
+    assert [e for e in events if e["type"] == "transcript.stable"], "the utterance reached the recognizer"
+    assert [e["type"] for e in events][0] == "status"
+
+
+def test_heuristic_mode_sends_no_levels_unless_asked(engine_heuristic):
+    base = engine_heuristic
+    with httpx.Client(base_url=base["http"], headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30) as h:
+        meeting_id = h.post("/meetings", json={"title": "heuristic quiet"}).json()["id"]
+        assert h.post(f"/meetings/{meeting_id}/start", json={"consentAcknowledged": True}).status_code == 200
+        try:
+            with connect(f"{base['ws']}/meetings/{meeting_id}/live?token={TOKEN}") as ws:
+                _send_clip(ws, _samantha_pcm())
+                events = drain(ws, 2)
+        finally:
+            h.post(f"/meetings/{meeting_id}/stop")
+            time.sleep(0.5)
+    assert [e["speech"] for e in events if e["type"] == "vad"] == [True, False]
+    assert not [e for e in events if e["type"] == "vad.level"]
