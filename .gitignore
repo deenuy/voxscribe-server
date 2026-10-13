@@ -41,3 +41,5 @@ build/
 claude-session.md
 references/
 docs/*.txt
+# Generated evaluation inputs (scripts/eval_live_vad.py), about 80 MB of WAV
+results/eval-live-vad-inputs/
