@@ -39,6 +39,11 @@ async def main():
         action="store_true",
         help="Disable authentication (dev only)",
     )
+    parser.add_argument(
+        "--wake",
+        action="store_true",
+        help="Start the always-on wake word listener (requires wakeword extras in voxscribe-core)",
+    )
 
     args = parser.parse_args()
 
@@ -61,6 +66,7 @@ async def main():
         app = await create_app(
             settings=settings,
             auth_disabled=args.no_auth,
+            wake=args.wake,
         )
     except Exception as e:
         print(f"Failed to create app: {e}", file=sys.stderr)
