@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+- Added two live turn detection modes, `VOXSCRIBE_LIVE_VAD_MODE=silero` and `heuristic`, which segment speech with core's shared speech activity capability (ADR 0001) under its segmentation policy. The default stays `adaptive` until the evaluation in `docs/eval-live-vad.md` wins a change; `silero` refuses to start, with the reason, when its model or runtime is missing.
+- Added `at_ms`, `p` and `detector` to the live socket's `vad` message (old clients keep reading `type` and `speech`), and an opt-in `vad.level` message (`levels=1` on the live URL, at most 10 per second of audio) carrying the latest speech probability.
+- Added `speech_activity` to `/v1/health`: the detectors this machine can run, the configured live mode and the spec version, next to `"speech_activity"` in the capabilities list.
+- Added `scripts/eval_live_vad.py`, which scores every live mode on the baseline fixture, with fan noise at 20 dB and 10 dB and on a noise-only clip, and writes `results/eval-live-vad.json`.
+
+### Changed
+- Changed the live connection to log one summary per recording (seconds of audio and of speech, utterances, recognizer time, mode and detector) instead of nothing.
+
 ## What's New in VoxScribe Server 0.6.0
 
 ### New Features

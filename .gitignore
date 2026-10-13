@@ -37,3 +37,5 @@ build/
 
 # Docker
 .docker/
+# Generated evaluation inputs (scripts/eval_live_vad.py), about 80 MB of WAV
+results/eval-live-vad-inputs/
