@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 
 from voxscribe.meeting.summary import summarize_meeting
@@ -10,6 +11,25 @@ from . import meeting_bus
 from .store_meetings import MeetingStore
 
 log = logging.getLogger(__name__)
+
+# Recordings shorter than this many words skip the LLM entirely.
+MIN_WORDS_FOR_SUMMARY = int(os.getenv("VOXSCRIBE_SUMMARY_MIN_WORDS", "20"))
+# Wall-clock cap on the LLM call (per attempt). Prevents a hung model from blocking finalization.
+SUMMARY_TIMEOUT_S = int(os.getenv("VOXSCRIBE_SUMMARY_TIMEOUT_S", "120"))
+# Set to "1" in test environments that start without an LLM to exercise the unavailable UI path.
+SUMMARY_DISABLED = os.getenv("VOXSCRIBE_DISABLE_SUMMARY") == "1"
+
+# The summary written when no speech was captured.
+NO_SPEECH_OVERVIEW = "No speech was captured in this recording."
+
+
+def _word_count(segments: list[dict], notes: list[dict]) -> int:
+    text = " ".join(
+        (s.get("text") or "") for s in segments
+    ) + " " + " ".join(
+        (n.get("text") or "") for n in notes
+    )
+    return len(text.split())
 
 
 class SummaryService:
@@ -22,20 +42,22 @@ class SummaryService:
     async def generate_summary(self, meeting_id: str) -> None:
         """Generate a summary for a meeting.
 
-        If the provider is unavailable, leaves the summary in pending state
-        and logs the error but does not raise.
+        Status path:
+          pending (set by caller before scheduling) ->
+          running (set here before the LLM call) ->
+          ready | skipped | unavailable | failed
+
+        Never raises; whatever goes wrong the meeting still transitions to done.
         """
         try:
-            # Check if LLM provider is available
-            if not self.llm:
-                log.error(f"LLM provider unavailable for summary of {meeting_id}")
+            if SUMMARY_DISABLED or not self.llm:
+                log.info("Summary disabled or LLM unavailable for meeting %s", meeting_id)
+                await self.store.set_summary_status(meeting_id, "unavailable")
                 return
 
-            # Get transcript and notes
             segments_models = await self.store.get_transcript(meeting_id)
             notes_models = await self.store.get_notes(meeting_id)
 
-            # Convert to dicts for core
             segments = [
                 {
                     "id": s.id,
@@ -51,30 +73,77 @@ class SummaryService:
                 for n in notes_models
             ]
 
-            # Get enhanced notes if available
+            no_speech = not any((s["text"] or "").strip() for s in segments) and not any(
+                (n["text"] or "").strip() for n in notes
+            )
+            if no_speech:
+                await self.store.set_summary(
+                    meeting_id=meeting_id,
+                    overview=NO_SPEECH_OVERVIEW,
+                    details=[],
+                    generated_at=datetime.utcnow().isoformat() + "Z",
+                )
+                await meeting_bus.publish(meeting_id, "summary.ready", {})
+                log.info("No speech in meeting %s; summary skipped", meeting_id)
+                return
+
+            if _word_count(segments, notes) < MIN_WORDS_FOR_SUMMARY:
+                await self.store.set_summary_status(meeting_id, "skipped")
+                log.info(
+                    "Meeting %s has fewer than %d words; summary skipped",
+                    meeting_id, MIN_WORDS_FOR_SUMMARY,
+                )
+                return
+
             enhanced_resp = await self.store.get_enhanced(meeting_id)
             enhanced = [
                 {"blockId": b.blockId, "text": b.text}
                 for b in enhanced_resp["blocks"]
             ]
 
-            # Call core's summarize function (may be slow; run off event loop)
-            summary = await asyncio.to_thread(
-                summarize_meeting,
-                self.llm,
-                segments,
-                notes,
-                enhanced if enhanced else None,
-                False,  # allow_extractive
-            )
+            await self.store.set_summary_status(meeting_id, "running")
 
-            # Convert details to list of dicts
+            # Call core's summarize function off the event loop with a hard timeout.
+            # A model that returns nothing usable (still loading) gets one retry.
+            summary = None
+            for attempt in (1, 2):
+                try:
+                    summary = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            summarize_meeting,
+                            self.llm,
+                            segments,
+                            notes,
+                            enhanced if enhanced else None,
+                            False,  # allow_extractive
+                        ),
+                        timeout=SUMMARY_TIMEOUT_S,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    log.error(
+                        "Summary for meeting %s timed out after %ds (attempt %d)",
+                        meeting_id, SUMMARY_TIMEOUT_S, attempt,
+                    )
+                    if attempt == 2:
+                        await self.store.set_summary_status(meeting_id, "failed")
+                        return
+                except ValueError as e:
+                    if attempt == 2:
+                        raise
+                    log.warning(
+                        "Summary for meeting %s was not usable, retrying: %s",
+                        meeting_id, e,
+                    )
+
+            if summary is None:
+                await self.store.set_summary_status(meeting_id, "failed")
+                return
+
             details = [
                 {"title": d.title, "body": d.body}
                 for d in summary.details
             ]
-
-            # Save summary
             now = datetime.utcnow().isoformat() + "Z"
             await self.store.set_summary(
                 meeting_id=meeting_id,
@@ -82,10 +151,12 @@ class SummaryService:
                 details=details,
                 generated_at=now,
             )
-
-            # Publish event
             await meeting_bus.publish(meeting_id, "summary.ready", {})
-            log.info(f"Summary generated for meeting {meeting_id}")
+            log.info("Summary generated for meeting %s", meeting_id)
+
         except Exception as e:
-            log.error(f"Summary generation error for meeting {meeting_id}: {e}", exc_info=True)
-            # Leave summary in pending state on error, don't raise
+            log.error("Summary generation error for meeting %s: %s", meeting_id, e, exc_info=True)
+            try:
+                await self.store.set_summary_status(meeting_id, "failed")
+            except Exception:
+                pass

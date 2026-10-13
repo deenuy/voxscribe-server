@@ -30,14 +30,14 @@ class HealthResponse(BaseModel):
 
 
 class MeetingStatus(BaseModel):
-    status: Literal["scheduled", "recording", "processing", "done"]
+    status: Literal["scheduled", "recording", "processing", "done", "interrupted"]
 
 
 class Meeting(BaseModel):
     id: str
     title: str
     context: str | None = None
-    status: Literal["scheduled", "recording", "processing", "done"]
+    status: Literal["scheduled", "recording", "processing", "done", "interrupted"]
     scheduledStart: str | None = None
     scheduledEnd: str | None = None
     startedAt: str | None = None
@@ -246,7 +246,14 @@ class SummaryDetail(BaseModel):
 
 
 class Summary(BaseModel):
-    status: Literal["none", "pending", "ready"]
+    # none     no summary record exists yet
+    # pending  finalization is queued; status will move to running then ready/skipped/unavailable/failed
+    # running  LLM call is in progress
+    # ready    summary is available
+    # skipped  transcript was too short (< MIN_WORDS_FOR_SUMMARY words)
+    # unavailable  LLM provider was not reachable at the time of finalization
+    # failed   LLM timed out or raised an unrecoverable error
+    status: Literal["none", "pending", "running", "ready", "skipped", "unavailable", "failed"]
     overview: str | None = None
     details: list[SummaryDetail] = []
     generatedAt: str | None = None
