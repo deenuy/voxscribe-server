@@ -10,6 +10,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+# Turn detectors the live path can run: the two energy gates in core's LiveTranscriber, and the two real detectors
+# of core's speech capability. Order is the order a person reads in an error message.
+LIVE_VAD_MODES = ("adaptive", "fixed", "silero", "heuristic")
+
+
+def live_vad_mode_unavailable(mode: str) -> str | None:
+    """Why `mode` cannot run on this machine, or None when it can.
+
+    The energy gates always run. "heuristic" needs numpy; "silero" also needs onnxruntime and the model that
+    faster-whisper ships. The check is the detector's own (`SileroDetector.unavailable_reason`), so the message
+    names the missing piece.
+    """
+    if mode in ("adaptive", "fixed"):
+        return None
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        return "numpy is not installed (uv sync)"
+    if mode == "silero":
+        from voxscribe.speech.silero import SileroDetector
+
+        return SileroDetector.unavailable_reason()
+    return None
+
 
 @dataclass
 class Config:
@@ -63,9 +87,11 @@ class Config:
 
     # VAD (voice activity detection)
     vad_endpoint_ms: int = 700
-    # Live transcription turn detection: "adaptive" follows the room's noise floor so quiet or far-field audio is
-    # still heard; "fixed" is the original absolute RMS gate. Long continuous speech is cut into a stable line
-    # every live_max_segment_ms (0 turns the cut off).
+    # Live transcription turn detection (VOXSCRIBE_LIVE_VAD_MODE): "adaptive" follows the room's noise floor so
+    # quiet or far-field audio is still heard; "fixed" is the original absolute RMS gate; "silero" and "heuristic"
+    # segment with core's shared speech capability (voxscribe.speech, ADR 0001) under the SEGMENTATION policy.
+    # The default stays "adaptive" until the evaluation (docs/eval-live-vad.md) wins a change. Long continuous
+    # speech is cut into a stable line every live_max_segment_ms (0 turns the cut off).
     live_vad_mode: str = "adaptive"
     live_max_segment_ms: int = 15000
 
@@ -232,8 +258,12 @@ class Config:
         config_dict["vad_endpoint_ms"] = _parse_int(env_vars, "VOXSCRIBE_VAD_ENDPOINT_MS", 700)
         live_vad_mode = env_vars.get("VOXSCRIBE_LIVE_VAD_MODE", "").strip().lower()
         if live_vad_mode:
-            if live_vad_mode not in ("adaptive", "fixed"):
-                _fail("VOXSCRIBE_LIVE_VAD_MODE", f"must be 'adaptive' or 'fixed', got {live_vad_mode!r}")
+            if live_vad_mode not in LIVE_VAD_MODES:
+                _fail("VOXSCRIBE_LIVE_VAD_MODE", f"must be one of {', '.join(LIVE_VAD_MODES)}, got {live_vad_mode!r}")
+            reason = live_vad_mode_unavailable(live_vad_mode)
+            if reason:
+                # No silent fallback: a detector that cannot run is a startup error, not a quiet switch to energy.
+                _fail("VOXSCRIBE_LIVE_VAD_MODE", f"{live_vad_mode!r} is not available here: {reason}")
             config_dict["live_vad_mode"] = live_vad_mode
         config_dict["live_max_segment_ms"] = _parse_int(env_vars, "VOXSCRIBE_LIVE_MAX_SEGMENT_MS", 15000)
 

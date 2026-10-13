@@ -364,10 +364,14 @@ async def create_app(
 
         status = "ok" if (db_ok and asr_ok and llm_ok and embedding_ok) else "degraded"
 
+        from app.local.live_support import speech_activity_capability
+
         result = {
             "status": status,
             "version": engine_version(),
             "profile": "ideascribe",
+            # The list is what clients test with `includes`; the detail of a capability sits beside it under its own
+            # name (the app reads `capabilities` as a list, so it cannot become an object).
             "capabilities": [
                 "transcribe",
                 "enhance",
@@ -380,7 +384,9 @@ async def create_app(
                 "calendar",
                 "google",
                 "ideas",
+                "speech_activity",
             ],
+            "speech_activity": speech_activity_capability(settings),
             "offline": True,
             "database": {
                 "ok": db_ok,
