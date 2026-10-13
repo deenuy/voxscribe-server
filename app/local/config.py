@@ -63,6 +63,11 @@ class Config:
 
     # VAD (voice activity detection)
     vad_endpoint_ms: int = 700
+    # Live transcription turn detection: "adaptive" follows the room's noise floor so quiet or far-field audio is
+    # still heard; "fixed" is the original absolute RMS gate. Long continuous speech is cut into a stable line
+    # every live_max_segment_ms (0 turns the cut off).
+    live_vad_mode: str = "adaptive"
+    live_max_segment_ms: int = 15000
 
     # Retrieval
     retrieval_top_k: int = 6
@@ -225,6 +230,12 @@ class Config:
 
         # VAD
         config_dict["vad_endpoint_ms"] = _parse_int(env_vars, "VOXSCRIBE_VAD_ENDPOINT_MS", 700)
+        live_vad_mode = env_vars.get("VOXSCRIBE_LIVE_VAD_MODE", "").strip().lower()
+        if live_vad_mode:
+            if live_vad_mode not in ("adaptive", "fixed"):
+                _fail("VOXSCRIBE_LIVE_VAD_MODE", f"must be 'adaptive' or 'fixed', got {live_vad_mode!r}")
+            config_dict["live_vad_mode"] = live_vad_mode
+        config_dict["live_max_segment_ms"] = _parse_int(env_vars, "VOXSCRIBE_LIVE_MAX_SEGMENT_MS", 15000)
 
         # Retrieval
         config_dict["retrieval_top_k"] = _parse_int(env_vars, "VOXSCRIBE_RETRIEVAL_TOP_K", 6)
