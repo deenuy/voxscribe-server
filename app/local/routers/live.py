@@ -356,6 +356,16 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                         if live_enhance_enabled:
                             spawn(reenrich_pending())
 
+                    elif msg_type == "audio.end":
+                        # Producer is done; close ring now so consumer drains without waiting
+                        # for WS disconnect. Client waits for ack before closing.
+                        ring.close()
+                        try:
+                            await websocket.send_json({"type": "audio.end.ack"})
+                        except Exception:
+                            pass
+                        break
+
         finally:
             # Close ring and drain consumer before flush so no frames are lost.
             ring.close()
@@ -374,7 +384,7 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
             except Exception as e:
                 log.warning("Consumer task failed during ring drain for %s: %s", meeting_id, e)
 
-            log.info(
+            log.warning(
                 "session %s: pushed_ms=%.0f dropped_ms=%.0f overflows=%d peak_fill_ms=%.0f",
                 meeting_id,
                 ring.stats.pushed_ms,
