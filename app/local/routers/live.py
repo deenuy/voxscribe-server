@@ -219,18 +219,18 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                     # Send partial segments, each once per change of its text
                     partials = transcriber.pop_partials()
                     for seg in partials:
-                        await websocket.send_json({
-                            "type": "transcript.partial",
-                            "segment": {
-                                "id": seg.id,
-                                "startMs": seg.start_ms,
-                                "endMs": seg.end_ms,
-                                "source": seg.source,
-                                "speaker": seg.speaker,
-                                "text": seg.text,
-                                "state": seg.state,
-                            }
-                        })
+                        partial_frame = {
+                            "id": seg.id,
+                            "startMs": seg.start_ms,
+                            "endMs": seg.end_ms,
+                            "source": seg.source,
+                            "speaker": seg.speaker,
+                            "text": seg.text,
+                            "state": seg.state,
+                        }
+                        # Fan out partials to watchers via the bus
+                        await meeting_bus.publish(meeting_id, "transcript.partial", partial_frame)
+                        await websocket.send_json({"type": "transcript.partial", "segment": partial_frame})
 
                     # Send and persist stable segments
                     await _publish_stable(websocket, store, meeting_id, new_stable)
@@ -350,7 +350,7 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
 
 
 async def _publish_stable(websocket: WebSocket, store: MeetingStore, meeting_id: str, segments, send: bool = True) -> None:
-    """Persist stable segments and send them to the client."""
+    """Persist stable segments, send to the originating socket, and fan out to all watchers via the bus."""
     for seg in segments:
         db_segment = Segment(
             id=seg.id,
@@ -365,26 +365,31 @@ async def _publish_stable(websocket: WebSocket, store: MeetingStore, meeting_id:
             await store.upsert_segment(meeting_id, db_segment)
         except Exception as e:
             log.warning(f"Failed to persist segment: {e}")
+
+        frame = {
+            "id": db_segment.id,
+            "startMs": db_segment.startMs,
+            "endMs": db_segment.endMs,
+            "source": db_segment.source,
+            "speaker": db_segment.speaker,
+            "text": db_segment.text,
+            "state": db_segment.state,
+        }
+        # Fan out to all connected clients (browser watchers, second sockets, etc.)
+        await meeting_bus.publish(meeting_id, "transcript.stable", frame)
+
         if not send:
             continue
-        await websocket.send_json({
-            "type": "transcript.stable",
-            "segment": {
-                "id": db_segment.id,
-                "startMs": db_segment.startMs,
-                "endMs": db_segment.endMs,
-                "source": db_segment.source,
-                "speaker": db_segment.speaker,
-                "text": db_segment.text,
-                "state": db_segment.state,
-            }
-        })
+        await websocket.send_json({"type": "transcript.stable", "segment": frame})
 
 
 def _to_frame(event: dict) -> dict | None:
     """Turn an internal bus event into the contract's WebSocket frame."""
     kind = event.get("type")
     data = event.get("data") or {}
+    if kind in ("transcript.stable", "transcript.partial"):
+        # data is the segment dict; wrap it the same way the direct send does
+        return {"type": kind, "segment": data}
     if kind == "enhanced.update":
         return {"type": kind, "block": data}
     if kind == "assist.suggestion":
