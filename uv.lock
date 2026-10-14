@@ -2392,22 +2392,17 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "faster-whisper", marker = "extra == 'listen'", specifier = ">=1.0" },
-    { name = "faster-whisper", marker = "extra == 'wakeword'", specifier = ">=1.0" },
     { name = "numpy", marker = "extra == 'listen'", specifier = ">=1.24" },
-    { name = "numpy", marker = "extra == 'wakeword'", specifier = ">=1.24" },
-    { name = "onnxruntime", marker = "extra == 'wakeword'", specifier = ">=1.17" },
     { name = "openpyxl", marker = "extra == 'knowledge'", specifier = ">=3.0" },
-    { name = "openwakeword", marker = "extra == 'wakeword'", specifier = ">=0.6" },
     { name = "pyobjc-framework-cocoa", marker = "extra == 'mac'", specifier = ">=10" },
     { name = "pypdf", marker = "extra == 'knowledge'", specifier = ">=4.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "sounddevice", marker = "extra == 'listen'", specifier = ">=0.4" },
-    { name = "sounddevice", marker = "extra == 'wakeword'", specifier = ">=0.4" },
     { name = "tzdata", specifier = ">=2026.2" },
 ]
-provides-extras = ["dev", "mac", "listen", "wakeword", "knowledge", "meeting"]
+provides-extras = ["dev", "mac", "listen", "knowledge", "meeting"]
 
 [[package]]
 name = "voxscribe-server"
