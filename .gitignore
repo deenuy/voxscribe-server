@@ -37,3 +37,7 @@ build/
 
 # Docker
 .docker/
+# Session scratchpad files (moved to scratch folder, never commit)
+claude-session.md
+references/
+docs/*.txt

@@ -261,6 +261,26 @@ class MeetingStore:
                 )
         return await self.get_meeting(meeting_id)
 
+    async def mark_interrupted(self, meeting_id: str) -> None:
+        """Mark a recording-stuck meeting as interrupted.
+
+        Called at server startup for any meeting left in the 'recording' state by a prior crash.
+        The transcript (if any) is preserved and segments are settled.
+        """
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        async with self.pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE transcript_segments SET state = 'stable' WHERE meeting_id = %s AND state = 'provisional'",
+                    (meeting_id,),
+                )
+                await conn.execute(
+                    f"""UPDATE meetings SET status = 'interrupted', updated_at = %s,
+                        word_count = (SELECT {_WORDS_SQL} FROM transcript_segments WHERE meeting_id = %s)
+                        WHERE id = %s AND status = 'recording'""",
+                    (now, meeting_id, meeting_id),
+                )
+
     async def delete_meeting(self, meeting_id: str):
         """Delete a meeting (cascade handles notes, transcript, summary, attachments)."""
         async with self.pool.connection() as conn:
@@ -694,6 +714,14 @@ class MeetingStore:
 
     async def set_summary_pending(self, meeting_id: str):
         """Mark summary as pending (during processing)."""
+        await self.set_summary_status(meeting_id, "pending")
+
+    async def set_summary_status(self, meeting_id: str, status: str):
+        """Set the summary status without changing the content.
+
+        Inserts a row if none exists. Used to advance from pending through
+        running to ready/skipped/unavailable/failed.
+        """
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         async with self.pool.connection() as conn:
             await conn.execute(
@@ -701,9 +729,9 @@ class MeetingStore:
                 (meeting_id, status, created_at, updated_at)
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT(meeting_id) DO UPDATE SET
-                    status = 'pending',
+                    status = EXCLUDED.status,
                     updated_at = EXCLUDED.updated_at""",
-                (meeting_id, "pending", now, now),
+                (meeting_id, status, now, now),
             )
             await conn.commit()
 
