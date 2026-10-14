@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from voxscribe.meeting.live import LiveTranscriber
 
 from app.local import meeting_bus, tenancy
+from app.local.audio_ring import AudioRing
 from app.local.identity import IdentityError, tenant_for
 from app.local.enrichment import EnrichmentService
 from app.local.live_support import build_live_assist, build_retriever
@@ -94,9 +95,11 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
         )
         speaking = False  # last speech state told to the client
 
+        # Ring buffer: decouples WS receive from push_audio (Fix 1 / S5-A)
+        ring = AudioRing(capacity_ms=60_000.0)
+
         # Track state for live transcription
         auto_stop_enabled = meeting.autoStopMinutes and meeting.autoStopMinutes > 0
-        auto_stop_silence_start_ms = None
         live_enhance_enabled = True  # contract: live enhancement is on until the client turns it off
         enhance_style = meeting.enhanceStyle or "standard"
         live_assist = None
@@ -169,6 +172,80 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
         # Start event reader in background
         event_task = asyncio.create_task(event_reader())
 
+        # Consumer: drains the ring and calls push_audio off the event loop
+        async def audio_consumer():
+            nonlocal speaking
+            _auto_stop_silence_start_ms = None
+
+            while True:
+                frame = await ring.pop()
+                if frame is None:
+                    break
+
+                source_tag = frame[0]
+                audio_frame = frame[1:]
+
+                try:
+                    new_stable = await asyncio.to_thread(transcriber.push_audio, source_tag, audio_frame)
+                except Exception as e:
+                    log.error(f"Transcription error: {e}")
+                    continue
+
+                if transcriber.in_speech != speaking:
+                    speaking = transcriber.in_speech
+                    try:
+                        await websocket.send_json({"type": "vad", "speech": speaking})
+                    except Exception:
+                        pass
+
+                partials = transcriber.pop_partials()
+                for seg in partials:
+                    partial_frame = {
+                        "id": seg.id,
+                        "startMs": seg.start_ms,
+                        "endMs": seg.end_ms,
+                        "source": seg.source,
+                        "speaker": seg.speaker,
+                        "text": seg.text,
+                        "state": seg.state,
+                    }
+                    await meeting_bus.publish(meeting_id, "transcript.partial", partial_frame)
+                    try:
+                        await websocket.send_json({"type": "transcript.partial", "segment": partial_frame})
+                    except Exception:
+                        pass
+
+                await _publish_stable(websocket, store, meeting_id, new_stable)
+
+                if new_stable:
+                    if live_assist is not None:
+                        for seg in new_stable:
+                            spawn(run_assist(seg))
+                    spawn(reenrich_pending())
+
+                if auto_stop_enabled:
+                    if new_stable:
+                        _auto_stop_silence_start_ms = None
+                    elif _auto_stop_silence_start_ms is None:
+                        _auto_stop_silence_start_ms = transcriber.elapsed_ms
+
+                    if _auto_stop_silence_start_ms is not None:
+                        silence_ms = transcriber.elapsed_ms - _auto_stop_silence_start_ms
+                        silence_threshold_ms = meeting.autoStopMinutes * 60 * 1000
+                        if silence_ms >= silence_threshold_ms:
+                            log.info(f"Auto-stopping meeting {meeting_id} due to silence")
+                            _, stopped_now = await store.stop_once(meeting_id)
+                            if stopped_now:
+                                from app.local.finalize import schedule_finalize
+                                schedule_finalize(websocket.app, meeting_id)
+                            try:
+                                await websocket.send_json({"type": "status", "state": "processing"})
+                            except Exception:
+                                pass
+                            break
+
+        consumer_task = asyncio.create_task(audio_consumer())
+
         # Send initial status
         await websocket.send_json({"type": "status", "state": "recording"})
 
@@ -194,72 +271,20 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                     log.info(f"Client disconnected (disconnect message) from live session {meeting_id}")
                     break
 
-                # Handle binary audio frames
+                # Handle binary audio frames: enqueue to ring (non-blocking)
                 if "bytes" in data:
                     frame = data["bytes"]
                     if len(frame) < 1:
                         continue
 
-                    # Extract source tag (0=mic, 1=system)
-                    source_tag = frame[0]
-                    audio_frame = frame[1:]
-
-                    # Push to transcriber (may block if ASR is slow; run off event loop)
-                    try:
-                        new_stable = await asyncio.to_thread(transcriber.push_audio, source_tag, audio_frame)
-                    except Exception as e:
-                        log.error(f"Transcription error: {e}")
-                        continue
-
-                    # Tell the client when speech starts and stops (clients that do not know "vad" ignore it).
-                    if transcriber.in_speech != speaking:
-                        speaking = transcriber.in_speech
-                        await websocket.send_json({"type": "vad", "speech": speaking})
-
-                    # Send partial segments, each once per change of its text
-                    partials = transcriber.pop_partials()
-                    for seg in partials:
-                        partial_frame = {
-                            "id": seg.id,
-                            "startMs": seg.start_ms,
-                            "endMs": seg.end_ms,
-                            "source": seg.source,
-                            "speaker": seg.speaker,
-                            "text": seg.text,
-                            "state": seg.state,
-                        }
-                        # Fan out partials to watchers via the bus
-                        await meeting_bus.publish(meeting_id, "transcript.partial", partial_frame)
-                        await websocket.send_json({"type": "transcript.partial", "segment": partial_frame})
-
-                    # Send and persist stable segments
-                    await _publish_stable(websocket, store, meeting_id, new_stable)
-
-                    if new_stable:
-                        if live_assist is not None:
-                            for seg in new_stable:
-                                spawn(run_assist(seg))
-                        spawn(reenrich_pending())
-
-                    # Check auto-stop
-                    if auto_stop_enabled:
-                        if new_stable:
-                            auto_stop_silence_start_ms = None
-                        elif auto_stop_silence_start_ms is None:
-                            auto_stop_silence_start_ms = transcriber.elapsed_ms
-
-                        if auto_stop_silence_start_ms is not None:
-                            silence_ms = transcriber.elapsed_ms - auto_stop_silence_start_ms
-                            silence_threshold_ms = meeting.autoStopMinutes * 60 * 1000
-                            if silence_ms >= silence_threshold_ms:
-                                log.info(f"Auto-stopping meeting {meeting_id} due to silence")
-                                _, stopped_now = await store.stop_once(meeting_id)
-                                if stopped_now:
-                                    from app.local.finalize import schedule_finalize
-
-                                    schedule_finalize(websocket.app, meeting_id)  # auto-stop must finish the meeting too
-                                await websocket.send_json({"type": "status", "state": "processing"})
-                                break
+                    evicted_ms = ring.push(frame)
+                    if evicted_ms > 0:
+                        warn_frame = {"type": "audio.warning", "droppedMs": round(evicted_ms, 1)}
+                        await meeting_bus.publish(meeting_id, "audio.warning", warn_frame)
+                        try:
+                            await websocket.send_json(warn_frame)
+                        except Exception:
+                            pass
 
                 # Handle text control messages
                 elif "text" in data:
@@ -327,7 +352,31 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                             spawn(reenrich_pending())
 
         finally:
-            # Words still being spoken when the client left are not lost.
+            # Close ring and drain consumer before flush so no frames are lost.
+            ring.close()
+            try:
+                await asyncio.wait_for(consumer_task, timeout=120.0)
+            except asyncio.TimeoutError:
+                consumer_task.cancel()
+                log.warning(
+                    "Audio consumer drain timeout for %s: %.0f ms remaining",
+                    meeting_id, ring.fill_ms,
+                )
+                try:
+                    await consumer_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            log.info(
+                "session %s: pushed_ms=%.0f dropped_ms=%.0f overflows=%d peak_fill_ms=%.0f",
+                meeting_id,
+                ring.stats.pushed_ms,
+                ring.stats.dropped_ms,
+                ring.stats.overflow_count,
+                ring.stats.peak_fill_ms,
+            )
+
+            # Flush any words still in the ASR buffer after consumer drained.
             try:
                 tail = await asyncio.to_thread(transcriber.flush)
                 await _publish_stable(websocket, store, meeting_id, tail, send=False)
