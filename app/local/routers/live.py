@@ -94,6 +94,9 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
             max_segment_ms=getattr(settings, "live_max_segment_ms", 15000) or None,
         )
         speaking = False  # last speech state told to the client
+        # Set to True when schedule_finalize is called from inside the session (auto-stop
+        # path) so the finally block does not schedule a second finalization.
+        finalize_scheduled = False
 
         # Ring buffer: decouples WS receive from push_audio (Fix 1 / S5-A).
         # wait_for_space applies TCP backpressure instead of dropping oldest frames.
@@ -239,6 +242,7 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                             if stopped_now:
                                 from app.local.finalize import schedule_finalize
                                 schedule_finalize(websocket.app, meeting_id)
+                                finalize_scheduled = True
                             try:
                                 await websocket.send_json({"type": "status", "state": "processing"})
                             except Exception:
@@ -385,6 +389,12 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                 await _publish_stable(websocket, store, meeting_id, tail, send=False)
             except Exception as e:
                 log.warning(f"Could not keep the last words of {meeting_id}: {e}")
+
+            # Schedule finalization now that all segments are in the DB.
+            # Skipped when auto-stop already scheduled it from inside audio_consumer.
+            if not finalize_scheduled:
+                from app.local.finalize import schedule_finalize
+                schedule_finalize(websocket.app, meeting_id)
             for task in list(background):
                 task.cancel()
             event_task.cancel()
@@ -434,7 +444,7 @@ async def _publish_stable(websocket: WebSocket, store: MeetingStore, meeting_id:
             continue
         try:
             await websocket.send_json({"type": "transcript.stable", "segment": frame})
-        except Exception:
+        except (RuntimeError, WebSocketDisconnect):
             pass
 
 
