@@ -1,5 +1,6 @@
 """FastAPI application setup."""
 
+import asyncio
 import hmac
 import time
 import os
@@ -30,6 +31,13 @@ async def lifespan(app: FastAPI):
     """FastAPI lifespan context manager."""
     # Startup
     print("Starting up engine...", file=sys.stderr, flush=True)
+
+    # Start wake word listener if enabled
+    wake_task = None
+    if getattr(app.state, "wake_enabled", False):
+        from app.local.wake_loop import run_wake_loop
+        wake_task = asyncio.create_task(run_wake_loop(app), name="wake-loop")
+        print("Wake word listener started", file=sys.stderr, flush=True)
 
     # Start ingestion worker if available
     if hasattr(app.state, "ingestion_worker"):
@@ -62,6 +70,13 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     print("Shutting down engine...", file=sys.stderr, flush=True)
+    if wake_task is not None and not wake_task.done():
+        wake_task.cancel()
+        try:
+            await wake_task
+        except asyncio.CancelledError:
+            pass
+        print("Wake word listener stopped", file=sys.stderr, flush=True)
     if hasattr(app.state, "ingestion_worker"):
         await app.state.ingestion_worker.stop()
         print("Ingestion worker stopped", file=sys.stderr, flush=True)
@@ -73,6 +88,7 @@ async def create_app(
     settings,
     auth_disabled: bool = False,
     schema: str | None = None,
+    wake: bool = False,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -132,6 +148,7 @@ async def create_app(
     app.state.auth_token = os.environ.get("VOXSCRIBE_TOKEN", str(uuid.uuid4()))
     app.state.settings = settings
     app.state.started_at = time.time()
+    app.state.wake_enabled = wake
     # Tenant isolation: with an identity service configured, every request names a person and each person's data is
     # kept in a schema of their own. Without one, nothing changes (one person at a time).
     app.state.identity = None

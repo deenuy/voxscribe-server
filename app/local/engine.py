@@ -11,6 +11,7 @@ import uvicorn
 from app.local.app import create_app
 from app.local.config import Config
 from app.local.db import redact_password
+from app.local.log_redaction import install as redact_secrets_in_logs
 from app.local.migrations import run_migrations
 
 VERSION = "0.1.0"
@@ -38,6 +39,11 @@ async def main():
         action="store_true",
         help="Disable authentication (dev only)",
     )
+    parser.add_argument(
+        "--wake",
+        action="store_true",
+        help="Start the always-on wake word listener (requires wakeword extras in voxscribe-core)",
+    )
 
     args = parser.parse_args()
 
@@ -60,6 +66,7 @@ async def main():
         app = await create_app(
             settings=settings,
             auth_disabled=args.no_auth,
+            wake=args.wake,
         )
     except Exception as e:
         print(f"Failed to create app: {e}", file=sys.stderr)
@@ -76,6 +83,8 @@ async def main():
         access_log=False,
         log_level=settings.log_level.lower(),
     )
+    # uvicorn sets up its loggers in Config; the live socket's address carries tokens, so redact them in log lines.
+    redact_secrets_in_logs()
 
     class ReadyServer(uvicorn.Server):
         async def startup(self, sockets=None):

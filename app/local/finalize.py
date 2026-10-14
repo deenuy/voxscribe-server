@@ -21,6 +21,8 @@ _running: set[asyncio.Task] = set()
 async def finalize_meeting(app, meeting_id: str) -> None:
     store = MeetingStore(app.state.store.pool)
     try:
+        # Immediately mark summary as pending so the client sees a defined status.
+        await store.set_summary_pending(meeting_id)
         providers = getattr(app.state, "providers", {})
         llm = providers.get("llm")
         if llm:
@@ -30,6 +32,8 @@ async def finalize_meeting(app, meeting_id: str) -> None:
 
             await EnrichmentService(store, llm, build_retriever(app)).finalize_meeting(meeting_id)
             await SummaryService(store, llm).generate_summary(meeting_id)
+        else:
+            await store.set_summary_status(meeting_id, "unavailable")
     except Exception:
         log.error("Finalization failed for meeting %s", meeting_id, exc_info=True)
     try:
@@ -47,20 +51,41 @@ def schedule_finalize(app, meeting_id: str) -> asyncio.Task:
 
 
 async def recover_unfinished(app) -> int:
-    """At startup, finish meetings a crash left in 'processing'. Returns how many were scheduled.
+    """At startup, recover meetings a crash left in mid-flight states.
 
-    With tenant isolation on, every tenant's schema is checked and each meeting is finished inside its own tenant's
-    scope (the tasks it starts inherit that scope). With it off there is one shared scope."""
+    'recording' sessions are marked 'interrupted' (their socket is gone; they can never be completed).
+    'processing' sessions are scheduled for finalization (enrichment + summary) as normal.
+
+    With tenant isolation on, every tenant's schema is checked and each meeting is handled inside its own
+    tenant's scope. With it off there is one shared scope.
+
+    Returns the total number of sessions recovered.
+    """
     pool = app.state.store.pool
+    store = MeetingStore(pool)
     enforced = getattr(pool, "enforced", False)
-    total = 0
+    total_interrupted = 0
+    total_processing = 0
     for scope in (await pool.provisioner.known_tenants()) if enforced else [None]:
         with tenancy.tenant_scope(scope) if scope else nullcontext():
             async with pool.connection() as conn:
-                rows = await (await conn.execute("SELECT id FROM meetings WHERE status = 'processing'")).fetchall()
-            for (meeting_id,) in rows:
+                recording_rows = await (
+                    await conn.execute("SELECT id FROM meetings WHERE status = 'recording'")
+                ).fetchall()
+                processing_rows = await (
+                    await conn.execute("SELECT id FROM meetings WHERE status = 'processing'")
+                ).fetchall()
+            for (meeting_id,) in recording_rows:
+                try:
+                    await store.mark_interrupted(meeting_id)
+                except Exception:
+                    log.error("Could not mark recording meeting %s as interrupted", meeting_id, exc_info=True)
+            for (meeting_id,) in processing_rows:
                 schedule_finalize(app, meeting_id)
-            total += len(rows)
-    if total:
-        log.info("Recovering %d meeting(s) left processing by a restart", total)
-    return total
+            total_interrupted += len(recording_rows)
+            total_processing += len(processing_rows)
+    if total_interrupted:
+        log.info("Marked %d recording session(s) as interrupted (server restart)", total_interrupted)
+    if total_processing:
+        log.info("Recovering %d meeting(s) left processing by a restart", total_processing)
+    return total_interrupted + total_processing

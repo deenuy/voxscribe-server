@@ -67,6 +67,15 @@ local-asr = [
     "faster-whisper>=1.0",
 ]
 
+# Always-on wake word listener (--wake flag). Needs mic access on the host.
+# Install with: uv sync --extra wake
+wake = [
+    "openwakeword>=0.6",
+    "onnxruntime>=1.17",
+    "sounddevice>=0.4",
+    "numpy>=1.24",
+]
+
 # Development and testing
 dev = [
     "pytest>=8",
@@ -77,7 +86,7 @@ dev = [
 
 # Everything
 all = [
-    "voxscribe-server[local-asr,dev]",
+    "voxscribe-server[local-asr,wake,dev]",
 ]
 
 # ---------------------------------------------------------------------------
