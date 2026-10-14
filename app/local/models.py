@@ -253,6 +253,7 @@ class Summary(BaseModel):
     generatedAt: str | None = None
     revision: int = 0
     edited: bool = False  # written or changed by a person: regenerating it needs an explicit overwrite
+    promptVersion: str | None = None
 
 
 # ============================================================================

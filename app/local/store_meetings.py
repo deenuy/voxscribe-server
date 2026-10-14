@@ -688,8 +688,9 @@ class MeetingStore:
                 "generatedAt": generated_at,
                 "revision": row["revision"],
                 "edited": bool(row["edited"]),
+                "promptVersion": row.get("prompt_version"),
             }
-        return {"status": "none", "overview": None, "details": [], "generatedAt": None, "revision": 0, "edited": False}
+        return {"status": "none", "overview": None, "details": [], "generatedAt": None, "revision": 0, "edited": False, "promptVersion": None}
 
     async def set_summary_pending(self, meeting_id: str):
         """Mark summary as pending (during processing)."""
