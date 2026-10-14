@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime
 
-from voxscribe.meeting.summary import PROMPT_VERSION, summarize_meeting
+from voxscribe.meeting.summary import PROMPT_VERSION, generate_meeting_title, summarize_meeting
 
 from . import meeting_bus
 from .store_meetings import MeetingStore
@@ -158,6 +158,19 @@ class SummaryService:
                 generated_at=now,
                 prompt_version=PROMPT_VERSION,
             )
+
+            # AI title: best-effort; never blocks or raises
+            try:
+                ai_title = await asyncio.wait_for(
+                    asyncio.to_thread(generate_meeting_title, self.llm, segments, notes),
+                    timeout=30.0,
+                )
+                if ai_title:
+                    await self.store.update_meeting(meeting_id, title=ai_title)
+                    log.info("AI title set for meeting %s: %r", meeting_id, ai_title)
+            except Exception as title_err:
+                log.warning("AI title generation failed for meeting %s: %s", meeting_id, title_err)
+
             await meeting_bus.publish(meeting_id, "summary.ready", {})
             log.info("Summary generated for meeting %s", meeting_id)
 
