@@ -95,8 +95,9 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
         )
         speaking = False  # last speech state told to the client
 
-        # Ring buffer: decouples WS receive from push_audio (Fix 1 / S5-A)
-        ring = AudioRing(capacity_ms=60_000.0)
+        # Ring buffer: decouples WS receive from push_audio (Fix 1 / S5-A).
+        # wait_for_space applies TCP backpressure instead of dropping oldest frames.
+        ring = AudioRing(capacity_ms=60_000.0, policy="wait_for_space")
 
         # Track state for live transcription
         auto_stop_enabled = meeting.autoStopMinutes and meeting.autoStopMinutes > 0
@@ -277,7 +278,7 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                     if len(frame) < 1:
                         continue
 
-                    evicted_ms = ring.push(frame)
+                    evicted_ms = await ring.push_wait(frame)
                     if evicted_ms > 0:
                         warn_frame = {"type": "audio.warning", "droppedMs": round(evicted_ms, 1)}
                         await meeting_bus.publish(meeting_id, "audio.warning", warn_frame)

@@ -1,18 +1,19 @@
 """Per-session bounded audio ring: decouples WS receive from push_audio.
 
-The WS receive coroutine pushes frames to the ring without blocking on ASR.
-A separate asyncio Task drains the ring and calls push_audio. If the ring
-overflows (consumer too slow), the OLDEST frames are dropped and reported
-so the caller can warn the client and increment dropped_audio_ms.
+Two policies:
+  "drop_oldest"   -- sync push(), evicts oldest frames on overflow (mic/wake path).
+  "wait_for_space" -- async push_wait(), waits for the consumer to pop before adding;
+                      falls back to drop-oldest only on timeout (WS path).
 
-Design mirrors the CaptureRing in voxscribe-core parked/s5-capture, ported
-to the server live path so voxscribe-core's listen path stays frozen.
+Design mirrors the CaptureRing in voxscribe-core parked/s5-capture, ported to the
+server live path so voxscribe-core's listen path stays frozen.
 """
 from __future__ import annotations
 
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Literal
 
 SAMPLE_RATE = 16_000
 BYTES_PER_SAMPLE = 2
@@ -35,29 +36,47 @@ class RingStats:
 class AudioRing:
     """Bounded FIFO of raw PCM16 audio frames for one session.
 
-    Push is non-blocking and never raises. When a new frame would exceed
-    capacity, the OLDEST unread frames are evicted first and their duration
-    is added to stats.dropped_ms. The caller receives the evicted ms so it
-    can emit a warning immediately.
+    Policy "drop_oldest" (mic/wake path):
+      push() is sync and never blocks. When a new frame would exceed capacity,
+      the oldest unread frames are evicted. The caller receives the evicted ms
+      so it can emit a warning immediately.
 
-    Pop is an awaitable that returns None only after close() is called and
-    the ring is empty.
+    Policy "wait_for_space" (WS path):
+      push_wait() is async. When the ring is full, it awaits the consumer to
+      pop at least one frame (up to full_timeout_s), then inserts. If the
+      timeout expires, it falls back to drop-oldest. This applies TCP
+      backpressure to the WebSocket client and avoids discarding dictation.
+
+    pop() is awaitable and returns None only after close() is called and the
+    ring is empty.
     """
 
-    def __init__(self, capacity_ms: float = 60_000.0):
+    def __init__(
+        self,
+        capacity_ms: float = 60_000.0,
+        policy: Literal["drop_oldest", "wait_for_space"] = "drop_oldest",
+        full_timeout_s: float = 5.0,
+    ):
         self._capacity_ms = capacity_ms
+        self._policy = policy
+        self._full_timeout_s = full_timeout_s
         self._frames: deque[bytes] = deque()
         self._fill_ms: float = 0.0
         self.stats = RingStats()
         self._closed = False
         self._not_empty = asyncio.Event()
+        self._not_full = asyncio.Event()
+        self._not_full.set()  # ring starts with space
 
     # ------------------------------------------------------------------
-    # Producer side (called from asyncio coroutine)
+    # Producer side
     # ------------------------------------------------------------------
 
     def push(self, frame: bytes) -> float:
-        """Enqueue a PCM16 frame. Returns evicted ms (0 when no overflow)."""
+        """Sync push, drop-oldest policy. Returns evicted ms (0 = no overflow).
+
+        Use for mic/wake path. For WS path, call push_wait() instead.
+        """
         ms = frame_ms(frame)
         self.stats.pushed_ms += ms
 
@@ -77,12 +96,38 @@ class AudioRing:
         if self._fill_ms > self.stats.peak_fill_ms:
             self.stats.peak_fill_ms = self._fill_ms
         self._not_empty.set()
+        if self._fill_ms < self._capacity_ms:
+            self._not_full.set()
         return evicted_ms
+
+    async def push_wait(self, frame: bytes, timeout: float | None = None) -> float:
+        """Async push, wait-for-space policy. Returns evicted ms (0 = no drop).
+
+        Waits up to `timeout` seconds (default: full_timeout_s) for the consumer
+        to pop a frame before inserting. Falls back to drop-oldest on timeout.
+        Use for the WebSocket path.
+        """
+        ms = frame_ms(frame)
+        if self._fill_ms + ms > self._capacity_ms:
+            t = timeout if timeout is not None else self._full_timeout_s
+            try:
+                await asyncio.wait_for(self._wait_for_space(ms), timeout=t)
+            except asyncio.TimeoutError:
+                pass  # fall through to drop-oldest
+        return self.push(frame)
+
+    async def _wait_for_space(self, ms: float) -> None:
+        while self._fill_ms + ms > self._capacity_ms and not self._closed:
+            self._not_full.clear()
+            # Double-check after clearing to avoid a race with pop()
+            if self._fill_ms + ms > self._capacity_ms and not self._closed:
+                await self._not_full.wait()
 
     def close(self) -> None:
         """Signal that no more frames will be pushed. Wakes a waiting pop."""
         self._closed = True
         self._not_empty.set()
+        self._not_full.set()  # unblock any waiting push_wait so it can exit
 
     # ------------------------------------------------------------------
     # Consumer side (awaited by a single asyncio Task)
@@ -96,6 +141,8 @@ class AudioRing:
                 self._fill_ms -= frame_ms(frame)
                 if not self._frames:
                     self._not_empty.clear()
+                # Signal that space is available for a waiting push_wait()
+                self._not_full.set()
                 return frame
             if self._closed:
                 return None

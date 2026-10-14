@@ -160,6 +160,8 @@ async def stop_meeting(request: Request, meeting_id: str):
     store = MeetingStore(request.app.state.store.pool)
     meeting, stopped_now = await store.stop_once(meeting_id)
     if stopped_now:
+        from app.local import meeting_bus as _bus
+        await _bus.publish(meeting_id, "status", {"state": "processing"})
         schedule_finalize(request.app, meeting_id)
     return meeting.model_dump(exclude_none=True)
 
