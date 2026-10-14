@@ -148,7 +148,7 @@ async def create_app(
     # Auth middleware
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        if request.url.path == "/health":
+        if request.url.path in ("/health", "/v1/health", "/v1/ready"):
             return await call_next(request)
 
         if not app.state.auth_disabled:
