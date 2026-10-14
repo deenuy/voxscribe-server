@@ -34,7 +34,16 @@ router = APIRouter(prefix="/v1/meetings", tags=["meetings"])
 @router.post("", status_code=201)
 async def create_meeting(request: Request, body: CreateMeetingRequest):
     """Create a new meeting."""
+    from fastapi.responses import JSONResponse
+
     store = MeetingStore(request.app.state.store.pool)
+
+    # P4: idempotent creation — same clientRequestId returns the original meeting
+    if body.clientRequestId:
+        existing = await store.find_by_client_request_id(body.clientRequestId)
+        if existing:
+            return JSONResponse(content=existing.model_dump(exclude_none=True), status_code=200)
+
     meeting_id = str(uuid.uuid4())
     meeting = await store.create_meeting(
         meeting_id=meeting_id,
@@ -44,6 +53,7 @@ async def create_meeting(request: Request, body: CreateMeetingRequest):
         scheduled_start=body.scheduledStart,
         scheduled_end=body.scheduledEnd,
         project_id=body.projectId,
+        client_request_id=body.clientRequestId,
     )
     return meeting.model_dump(exclude_none=True)
 

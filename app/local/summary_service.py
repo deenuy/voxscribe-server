@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from voxscribe.meeting.summary import summarize_meeting
+from voxscribe.meeting.summary import PROMPT_VERSION, summarize_meeting
 
 from . import meeting_bus
 from .store_meetings import MeetingStore
@@ -74,6 +74,11 @@ class SummaryService:
                 for d in summary.details
             ]
 
+            # L4: flag suspiciously long summaries before storing
+            word_count = len(summary.overview.split()) + sum(len(d["body"].split()) for d in details)
+            if word_count > 400:
+                log.warning("Summary for %s is %d words (>400); flagging", meeting_id, word_count)
+
             # Save summary
             now = datetime.utcnow().isoformat() + "Z"
             await self.store.set_summary(
@@ -81,6 +86,7 @@ class SummaryService:
                 overview=summary.overview,
                 details=details,
                 generated_at=now,
+                prompt_version=PROMPT_VERSION,
             )
 
             # Publish event

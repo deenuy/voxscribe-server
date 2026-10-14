@@ -99,6 +99,7 @@ class CreateMeetingRequest(BaseModel):
     calendarEventId: str | None = None
     scheduledStart: str | None = None
     scheduledEnd: str | None = None
+    clientRequestId: str | None = Field(None, max_length=200)
 
 
 class UpdateMeetingRequest(BaseModel):

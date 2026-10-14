@@ -223,7 +223,7 @@ async def create_app(
         first = exc.errors()[0] if exc.errors() else {}
         where = ".".join(str(p) for p in first.get("loc", ()) if p != "body")
         return JSONResponse(
-            status_code=400,
+            status_code=422,
             content={"error": "invalid_request", "detail": f"{where}: {first.get('msg', 'invalid value')}".strip(": ")},
         )
 

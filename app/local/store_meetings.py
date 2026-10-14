@@ -47,6 +47,7 @@ class MeetingStore:
         scheduled_end: str | None = None,
         project_id: str | None = None,
         origin: str = "recorded",
+        client_request_id: str | None = None,
     ) -> Meeting:
         """Create a new meeting with status 'scheduled'."""
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -55,15 +56,27 @@ class MeetingStore:
                 await conn.execute(
                     """INSERT INTO meetings
                     (id, title, context, calendar_event_id, scheduled_start, scheduled_end, status,
-                     project_id, origin, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                     project_id, origin, client_request_id, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     (meeting_id, title, context, calendar_event_id, scheduled_start, scheduled_end, "scheduled",
-                     project_id, origin, now, now),
+                     project_id, origin, client_request_id, now, now),
                 )
                 await conn.commit()
         except psycopg.errors.ForeignKeyViolation:
             raise InvalidRequestError("projectId: no such project") from None
         return await self.get_meeting(meeting_id)
+
+    async def find_by_client_request_id(self, client_request_id: str) -> "Meeting | None":
+        """Return an existing meeting created with this clientRequestId, or None."""
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            cursor = await conn.execute(
+                "SELECT * FROM meetings WHERE client_request_id = %s", (client_request_id,)
+            )
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        return await self._row_to_meeting(row)
 
     async def get_meeting(self, meeting_id: str) -> Meeting:
         """Get a meeting by ID with computed fields."""
@@ -694,25 +707,31 @@ class MeetingStore:
             await conn.commit()
 
     async def set_summary(
-        self, meeting_id: str, overview: str, details: list[dict], generated_at: str
+        self,
+        meeting_id: str,
+        overview: str,
+        details: list[dict],
+        generated_at: str,
+        prompt_version: str | None = None,
     ):
         """Set summary for a meeting as ready."""
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         async with self.pool.connection() as conn:
             await conn.execute(
                 """INSERT INTO summaries
-                (meeting_id, status, overview, details, generated_at, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (meeting_id, status, overview, details, generated_at, prompt_version, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT(meeting_id) DO UPDATE SET
                     status = 'ready',
                     overview = EXCLUDED.overview,
                     details = EXCLUDED.details,
                     generated_at = EXCLUDED.generated_at,
+                    prompt_version = EXCLUDED.prompt_version,
                     revision = summaries.revision + 1,
                     edited = false,
                     edited_at = NULL,
                     updated_at = EXCLUDED.updated_at""",
-                (meeting_id, "ready", overview, json.dumps(details), generated_at, now, now),
+                (meeting_id, "ready", overview, json.dumps(details), generated_at, prompt_version, now, now),
             )
             await conn.execute("UPDATE meetings SET summary_stale = false WHERE id = %s", (meeting_id,))
             await conn.commit()
