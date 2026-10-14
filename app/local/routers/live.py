@@ -367,6 +367,8 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                     await consumer_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            except Exception as e:
+                log.warning("Consumer task failed during ring drain for %s: %s", meeting_id, e)
 
             log.info(
                 "session %s: pushed_ms=%.0f dropped_ms=%.0f overflows=%d peak_fill_ms=%.0f",
@@ -430,7 +432,10 @@ async def _publish_stable(websocket: WebSocket, store: MeetingStore, meeting_id:
 
         if not send:
             continue
-        await websocket.send_json({"type": "transcript.stable", "segment": frame})
+        try:
+            await websocket.send_json({"type": "transcript.stable", "segment": frame})
+        except Exception:
+            pass
 
 
 def _to_frame(event: dict) -> dict | None:
