@@ -5,8 +5,8 @@ Called as a background task after turn close in wake_loop._run_session.
 Pipeline per turn:
   1. Call LLM (Ollama streaming) with the user's transcript text.
   2. Collect the full reply (gate needs the complete text before playback).
-  3. Gate check (v0 stub: always pass unless empty; G1 satisfied by writing gate_decisions row).
-  4. Write rows: turns, replies, gate_decisions, latency_ledger.
+  3. Gate check (gate.check): mode-aware, injection-resistant regex. G1-G5 satisfied.
+  4. Write rows: turns, replies, gate_decisions, latency_ledger. Behaviour log (G6).
   5. TTS and play via tts_engine.synthesize_and_play.
   6. Publish reply event over meeting_bus.
 
@@ -20,7 +20,6 @@ LIMITS:
 - Streaming TTS (first clause while LLM generates rest) deferred to P4.
   R6 collects the full reply before synthesizing.
 - Playback reference for echo cancellation wired in R7 / P4.
-- Gate v0 always passes; full gate policy wired in R9 (C9).
 """
 
 from __future__ import annotations
@@ -32,19 +31,11 @@ from datetime import UTC, datetime
 
 log = logging.getLogger("app.local.reply_chain")
 
-_FALLBACK_PHRASE = "I didn't catch that. Could you say it again?"
 _OLLAMA_TIMEOUT_S = 10.0
 
 
 def _now_z() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
-
-def _gate_v0(text: str) -> tuple[str, str]:
-    """Gate v0 stub. Returns (decision, category). Always passes non-empty text."""
-    if not text.strip():
-        return "refuse", "empty"
-    return "pass", "ok"
 
 
 async def run_reply(
@@ -53,6 +44,7 @@ async def run_reply(
     user_text: str,
     turn_end_ms: int,
     turn_n: int = 1,
+    mode: str = "default",
 ) -> None:
     """Background task: generate and play spoken reply for one wake turn.
 
@@ -62,13 +54,15 @@ async def run_reply(
     """
     from app.local.llm_adapter import collect_reply
     from app.local.tts_engine import synthesize_and_play
-    from app.local import meeting_bus
+    from app.local import meeting_bus, gate
     from app.local.audio_engine import monotonic_ms
 
     pool = app.state.store.pool
     settings = getattr(app.state, "settings", None)
     audio_engine = getattr(app.state, "audio_engine", None)
     model = getattr(settings, "voice_reply_model", "llama3.2")
+    if mode == "default":
+        mode = getattr(settings, "voice_mode", "default")
 
     turn_id   = str(uuid.uuid4())
     reply_id  = str(uuid.uuid4())
@@ -105,17 +99,18 @@ async def run_reply(
     else:
         log.info("reply_chain: empty user_text, using fallback meeting_id=%s", meeting_id)
 
-    # ── 3. Gate ──────────────────────────────────────────────────────────────
-    decision, category = _gate_v0(reply_text)
+    # ── 3. Gate (G2-G5) ──────────────────────────────────────────────────────
+    decision, category = gate.check(user_text or "", reply_text, mode=mode)
     if decision != "pass":
-        log.info("reply_chain: gate refused category=%s meeting_id=%s", category, meeting_id)
-        reply_text = _FALLBACK_PHRASE
+        log.info("reply_chain: gate refused category=%s mode=%s meeting_id=%s",
+                 category, mode, meeting_id)
+        reply_text = gate.refusal_phrase(category, mode)
         decision = "refuse"
 
-    gate_category = category if decision == "pass" else decision
+    gate_category = category
     decided_z = _now_z()
 
-    # ── 4. Write replies + gate_decisions rows ───────────────────────────────
+    # ── 4. Write replies + gate_decisions rows + behaviour log (G1, G6) ───────
     try:
         async with pool.connection() as conn:
             await conn.execute(
@@ -127,12 +122,20 @@ async def run_reply(
                 "INSERT INTO gate_decisions"
                 " (id, reply_id, meeting_id, mode, input_text, decision, category, decided_at)"
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (gate_id, reply_id, meeting_id, "default",
+                (gate_id, reply_id, meeting_id, mode,
                  (user_text or "")[:1000], decision, category, decided_z),
             )
             await conn.commit()
     except Exception:
         log.exception("reply_chain: failed to write reply/gate rows meeting_id=%s", meeting_id)
+
+    gate.write_behaviour_log(
+        meeting_id=meeting_id,
+        turn_n=turn_n,
+        mode=mode,
+        decision=decision,
+        category=category,
+    )
 
     # ── 5. TTS + playback ────────────────────────────────────────────────────
     tts_first_audio_ms: int | None = None
