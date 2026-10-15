@@ -129,6 +129,24 @@ async def run_reply(
         except Exception:
             log.debug("reply_chain: thinking cue failed (non-critical)")
 
+    # ── 1c. Write preliminary gate_decisions row before any playback (SC-G3) ──
+    # SC-G3 requires a gate_decisions row to exist BEFORE playback starts.
+    # Write 'pending' now; UPDATE to the real decision after the LLM loop.
+    gate_pre_written = False
+    try:
+        async with pool.connection() as conn:
+            await conn.execute(
+                "INSERT INTO gate_decisions"
+                " (id, reply_id, meeting_id, mode, input_text, decision, category, decided_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (gate_id, reply_id, meeting_id, mode,
+                 (user_text or "")[:1000], "pending", "pending", started_z),
+            )
+            await conn.commit()
+        gate_pre_written = True
+    except Exception:
+        log.exception("reply_chain: failed to pre-write gate_decisions meeting_id=%s", meeting_id)
+
     # ── 2-5. LLM stream → gate per sentence → Kokoro → play ─────────────────
     # Gate each sentence as it arrives. First audio starts before LLM finishes
     # generating (V1-P01 clause-level streaming). If any sentence is refused,
@@ -211,7 +229,7 @@ async def run_reply(
     log.info("reply_chain: reply_len=%d decision=%s meeting_id=%s",
              len(reply_text), decision, meeting_id)
 
-    # ── 4. Write replies + gate_decisions rows + behaviour log (G1, G6) ───────
+    # ── 4. Write replies row; UPDATE gate_decisions with final decision ──────
     try:
         async with pool.connection() as conn:
             await conn.execute(
@@ -219,13 +237,20 @@ async def run_reply(
                 " VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (reply_id, meeting_id, turn_n, reply_text, model, gate_category, decided_z),
             )
-            await conn.execute(
-                "INSERT INTO gate_decisions"
-                " (id, reply_id, meeting_id, mode, input_text, decision, category, decided_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (gate_id, reply_id, meeting_id, mode,
-                 (user_text or "")[:1000], decision, gate_category, decided_z),
-            )
+            if gate_pre_written:
+                await conn.execute(
+                    "UPDATE gate_decisions"
+                    " SET decision=%s, category=%s, decided_at=%s WHERE id=%s",
+                    (decision, gate_category, decided_z, gate_id),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO gate_decisions"
+                    " (id, reply_id, meeting_id, mode, input_text, decision, category, decided_at)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (gate_id, reply_id, meeting_id, mode,
+                     (user_text or "")[:1000], decision, gate_category, decided_z),
+                )
             await conn.commit()
     except Exception:
         log.exception("reply_chain: failed to write reply/gate rows meeting_id=%s", meeting_id)

@@ -68,10 +68,9 @@ def _load_kokoro_sync():
         return _kokoro_instance
     try:
         from kokoro_onnx import Kokoro
-        import numpy as np
         k = Kokoro(str(_KOKORO_MODEL), str(_KOKORO_VOICES))
         _kokoro_instance = k
-        log.info("tts_engine: Kokoro loaded model=%s", _KOKORO_MODEL.name)
+        log.info("tts_engine: Kokoro loaded model=%s provider=CPU", _KOKORO_MODEL.name)
         return k
     except Exception:
         log.exception("tts_engine: Kokoro load failed")

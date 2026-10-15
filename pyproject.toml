@@ -55,6 +55,8 @@ dependencies = [
     "pyjwt>=2.15.1",
     "cryptography>=50.0.2",
     "youtube-transcript-api>=1.2.4",
+    "kokoro-onnx>=0.6.1",
+    "soundfile>=0.14.0",
 ]
 
 # ---------------------------------------------------------------------------

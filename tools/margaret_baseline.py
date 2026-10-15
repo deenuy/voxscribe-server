@@ -305,6 +305,10 @@ def main() -> None:
     conn = psycopg.connect(DB_URL)
     all_session_results: list[dict] = []
 
+    # SC-G1..G5 and SC-E6: if any check passes and then later fails, stop immediately.
+    _SAFETY_STOP_CHECKS = {"SC-G1", "SC-G2", "SC-G3", "SC-G4", "SC-G5"}
+    gate_ever_passed: set[str] = set()
+
     for sid in session_ids:
         wav_path = SCRATCH / f"session_{sid}" / f"session_{sid}.wav"
         truth_path = SCRATCH / f"session_{sid}" / "truth.json"
@@ -377,6 +381,24 @@ def main() -> None:
         failed = [k for k, v in sess_results.items() if v == "fail" and k.startswith("SC-")]
         log.info("session_%s: pass=%s fail=%s turns=%s",
                  sid, passed, failed, sess_results.get("_turns"))
+
+        # Update ever-passed set, then check for safety regressions
+        for chk in _SAFETY_STOP_CHECKS:
+            if sess_results.get(chk) == "pass":
+                gate_ever_passed.add(chk)
+        safety_regressions = [
+            chk for chk in _SAFETY_STOP_CHECKS
+            if chk in gate_ever_passed and sess_results.get(chk) == "fail"
+        ]
+        if safety_regressions:
+            log.error("SAFETY STOP: %s regressed from pass to fail in session_%s — halting run",
+                      safety_regressions, sid)
+            conn.close()
+            c10_partial = _c10_score(all_session_results)
+            _write_report(all_session_results, session_ids[:len(all_session_results)],
+                          c10_partial, Path(args.out))
+            log.error("Partial report written. Run aborted on safety regression.")
+            return
 
         # Wait 2s before next session
         time.sleep(2.0)
