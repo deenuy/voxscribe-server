@@ -46,6 +46,13 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             log.warning("audio-engine: could not start -- wake loop will use direct stream: %s", exc)
 
+        try:
+            from app.local.reply_chain import warm_phrase_cache
+            await warm_phrase_cache()
+            log.info("reply-chain: phrase cache warmed")
+        except Exception as exc:
+            log.warning("reply-chain: phrase cache warm failed: %s", exc)
+
         from app.local.wake_loop import run_wake_loop
         log.info("wake-word-listener: initializing -- model=hey_jarvis")
         wake_task = asyncio.create_task(run_wake_loop(app), name="wake-loop")

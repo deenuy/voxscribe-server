@@ -34,6 +34,18 @@ log = logging.getLogger("app.local.reply_chain")
 _OLLAMA_TIMEOUT_S = 10.0
 
 
+async def warm_phrase_cache() -> None:
+    """Pre-render all fixed gate phrases at startup for zero-latency refusals (V1-P03)."""
+    from app.local.tts_engine import prerender_phrase
+    from app.local.gate import (
+        DEFAULT_REFUSAL_PHRASE,
+        CLASSROOM_REFUSAL_PHRASE,
+        SENIORCARE_ESCALATION_PHRASE,
+    )
+    for phrase in (DEFAULT_REFUSAL_PHRASE, CLASSROOM_REFUSAL_PHRASE, SENIORCARE_ESCALATION_PHRASE):
+        await prerender_phrase(phrase)
+
+
 def _now_z() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
@@ -53,7 +65,7 @@ async def run_reply(
     Errors are logged and suppressed; the wake loop does not depend on this completing.
     """
     from app.local.llm_adapter import collect_reply
-    from app.local.tts_engine import synthesize_and_play
+    from app.local.tts_engine import synthesize_and_play, play_prerendered, prerender_phrase
     from app.local import meeting_bus, gate
     from app.local.audio_engine import monotonic_ms
 
@@ -137,7 +149,7 @@ async def run_reply(
         category=category,
     )
 
-    # ── 5. TTS + playback ────────────────────────────────────────────────────
+    # ── 5. TTS + playback (pre-rendered for gate refusals) ──────────────────
     tts_first_audio_ms: int | None = None
     playback_end_ms: int | None = None
 
@@ -145,7 +157,15 @@ async def run_reply(
         try:
             tts_start_ms = monotonic_ms()
             tts_first_audio_ms = tts_start_ms
-            duration_s = await synthesize_and_play(reply_text, audio_engine)
+            if decision == "refuse":
+                # Use pre-rendered WAV: zero synthesis time for fixed phrases (V1-P03)
+                phrase_path = await prerender_phrase(reply_text)
+                if phrase_path is not None:
+                    duration_s = await play_prerendered(phrase_path, audio_engine)
+                else:
+                    duration_s = await synthesize_and_play(reply_text, audio_engine)
+            else:
+                duration_s = await synthesize_and_play(reply_text, audio_engine)
             playback_end_ms = monotonic_ms()
             log.info("reply_chain: played duration=%.2f s meeting_id=%s", duration_s, meeting_id)
         except Exception:

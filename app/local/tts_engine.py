@@ -20,17 +20,21 @@ Default: Samantha (English, natural rate).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import subprocess
 import tempfile
 import wave
+from pathlib import Path
 
 log = logging.getLogger("app.local.tts_engine")
 
 _DEFAULT_VOICE    = os.environ.get("SAY_VOICE", "Samantha")
 _PLAYBACK_RATE_HZ = 24_000
 _SAY_TIMEOUT_S    = 15.0
+_PHRASES_DIR      = Path(os.environ.get("VOXSCRIBE_PHRASES_DIR",
+                         Path.home() / ".voxscribe" / "phrases"))
 
 
 async def synthesize_and_play(
@@ -87,7 +91,7 @@ def _say_to_wav(text: str, path: str, *, voice: str) -> None:
         [
             "say", "-v", voice,
             "--file-format", "WAVE",
-            "--data-format", f"LEF16@{_PLAYBACK_RATE_HZ}",
+            "--data-format", f"LEI16@{_PLAYBACK_RATE_HZ}",
             "-o", path,
             text,
         ],
@@ -102,3 +106,51 @@ def _read_wav_float32(path: str, np) -> object:
         raw = wf.readframes(n_frames)
     samples_i16 = np.frombuffer(raw, dtype="<i2")
     return samples_i16.astype("float32") / 32768.0
+
+
+def _phrase_cache_path(text: str, voice: str) -> Path:
+    key = hashlib.sha1(f"{voice}:{text}".encode()).hexdigest()[:16]
+    return _PHRASES_DIR / f"{key}.wav"
+
+
+async def prerender_phrase(text: str, *, voice: str = _DEFAULT_VOICE) -> Path | None:
+    """Pre-render a fixed phrase to a cached WAV file. Returns the path or None on error.
+
+    Idempotent: returns the cached path if the file already exists.
+    Used for gate refusal phrases so playback incurs zero synthesis time.
+    """
+    path = _phrase_cache_path(text, voice)
+    if path.exists():
+        return path
+    try:
+        _PHRASES_DIR.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(_say_to_wav, text, str(path), voice=voice)
+        log.info("tts_engine: pre-rendered phrase len=%d -> %s", len(text), path.name)
+        return path
+    except Exception:
+        log.exception("tts_engine: prerender failed text=%r", text[:60])
+        return None
+
+
+async def play_prerendered(phrase_path: Path, audio_engine) -> float:
+    """Play a pre-rendered WAV file through AudioEngine. Returns duration seconds.
+
+    Falls back silently if the file is missing or playback fails.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return 0.0
+    try:
+        samples = await asyncio.to_thread(_read_wav_float32, str(phrase_path), np)
+    except Exception:
+        log.exception("tts_engine: failed to read prerendered %s", phrase_path)
+        return 0.0
+    if samples is None or len(samples) == 0:
+        return 0.0
+    duration_s = len(samples) / _PLAYBACK_RATE_HZ
+    try:
+        await audio_engine.play(samples, block=True)
+    except Exception:
+        log.exception("tts_engine: prerendered playback failed")
+    return duration_s
