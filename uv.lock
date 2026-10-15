@@ -2382,7 +2382,7 @@ wheels = [
 
 [[package]]
 name = "voxscribe-core"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "../voxscribe-core" }
 dependencies = [
     { name = "pyyaml" },
@@ -2392,7 +2392,10 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "faster-whisper", marker = "extra == 'listen'", specifier = ">=1.0" },
+    { name = "faster-whisper", marker = "extra == 'speech'", specifier = ">=1.0" },
     { name = "numpy", marker = "extra == 'listen'", specifier = ">=1.24" },
+    { name = "numpy", marker = "extra == 'speech'", specifier = ">=1.24" },
+    { name = "onnxruntime", marker = "extra == 'speech'", specifier = ">=1.16" },
     { name = "openpyxl", marker = "extra == 'knowledge'", specifier = ">=3.0" },
     { name = "pyobjc-framework-cocoa", marker = "extra == 'mac'", specifier = ">=10" },
     { name = "pypdf", marker = "extra == 'knowledge'", specifier = ">=4.0" },
@@ -2402,11 +2405,11 @@ requires-dist = [
     { name = "sounddevice", marker = "extra == 'listen'", specifier = ">=0.4" },
     { name = "tzdata", specifier = ">=2026.2" },
 ]
-provides-extras = ["dev", "mac", "listen", "knowledge", "meeting"]
+provides-extras = ["dev", "mac", "listen", "speech", "knowledge", "meeting"]
 
 [[package]]
 name = "voxscribe-server"
-version = "0.6.0"
+version = "0.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

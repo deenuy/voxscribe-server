@@ -143,7 +143,7 @@ async def _inner(app) -> None:
                 above = 0
                 continue
 
-            scores = oww.predict(chunk)
+            scores = await asyncio.to_thread(oww.predict, chunk)
             best = max(scores.values()) if scores else 0.0
 
             above = above + 1 if best >= _THRESHOLD else 0
@@ -160,7 +160,7 @@ async def _inner(app) -> None:
                 log.info("wake-word-listener: already LISTENING -- ignored (B4.7)")
                 continue
 
-            _play_chime(_CHIME_ACK)
+            await _play_chime_async(_CHIME_ACK)
             chime_done_ms = int(time.monotonic() * 1000)
             log.info("wake-word-listener: chime latency=%d ms", chime_done_ms - triggered_ms)
             await asyncio.sleep(0.2)
@@ -172,7 +172,7 @@ async def _inner(app) -> None:
                 await _run_session(app, audio_q, best, np)
             except Exception:
                 log.exception("wake-word-listener: session failed")
-                _play_chime(_CHIME_ERR)
+                await _play_chime_async(_CHIME_ERR)
             finally:
                 set_state(WakeState.ARMED)
                 _publish_wake_state(WakeState.ARMED)
@@ -292,68 +292,74 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
 
     from app.local.audio_engine import monotonic_ms as _mono_ms
 
+    # Any exception after start_meeting must still call stop_once so the meeting
+    # does not stay stuck in "recording" status forever (CK6 fix).
     try:
-        while True:
-            chunk = await asyncio.wait_for(audio_q.get(), timeout=_SILENCE_S + 2.0)
-            now_ms = _mono_ms()
-
-            # float32 → PCM16, prepend source_tag byte (0 = mic)
-            pcm16       = (chunk * 32767).clip(-32768, 32767).astype("int16")
-            pcm16_bytes = pcm16.tobytes()
-            frame_bytes = bytes([0]) + pcm16_bytes
-            ring.push(frame_bytes)
-            total_frames += 1
-
-            if use_turn_detector:
-                decision = turn_detector.push_pcm16(pcm16_bytes, now_ms)
-                # Poll adapter every 5 frames for silence decisions
-                if total_frames % 5 == 0:
-                    decision = turn_detector.tick(now_ms) or decision
-                if decision is not None and decision.closes_turn:
-                    log.info("wake-word-listener: turn closed action=%s silence_ms=%d frames=%d",
-                             decision.action, decision.silence_ms, total_frames)
-                    break
-            else:
-                rms = float((chunk ** 2).mean() ** 0.5)
-                silence_run = silence_run + 1 if rms < _RMS_FLOOR else 0
-                if silence_run >= silence_needed:
-                    log.info("wake-word-listener: end-of-turn silence frames=%d", total_frames)
-                    break
-
-            if total_frames >= cap_frames:
-                log.info("wake-word-listener: hard cap reached frames=%d", total_frames)
-                break
-
-    except asyncio.TimeoutError:
-        log.info("wake-word-listener: audio timeout -- ending session")
-
-    _play_chime(_CHIME_END)
-
-    # drain consumer
-    ring.close()
-    try:
-        await asyncio.wait_for(consumer, timeout=120.0)
-    except asyncio.TimeoutError:
-        consumer.cancel()
-        log.warning("wake: consumer drain timeout meeting_id=%s", meeting_id)
-
-    # flush tail words still in ASR buffer
-    if transcriber is not None:
         try:
-            tail = await asyncio.to_thread(transcriber.flush)
-            await _publish_stable(tail)
-        except Exception:
-            log.warning("wake: flush failed meeting_id=%s", meeting_id)
+            while True:
+                chunk = await asyncio.wait_for(audio_q.get(), timeout=_SILENCE_S + 2.0)
+                now_ms = _mono_ms()
 
-    # ── stop meeting (shared stop) ────────────────────────────────────────────
-    meeting, stopped_now = await store.stop_once(meeting_id)  # ← shared stop
-    if stopped_now:
-        await meeting_bus.publish(meeting_id, "status", {"state": "processing"})
-        schedule_finalize(app, meeting_id)
-        log.info("wake-word-listener: finalize scheduled meeting_id=%s pushed_ms=%.0f dropped_ms=%.0f",
-                 meeting_id, ring.stats.pushed_ms, ring.stats.dropped_ms)
-    else:
-        log.info("wake-word-listener: session already stopped meeting_id=%s", meeting_id)
+                # float32 → PCM16, prepend source_tag byte (0 = mic)
+                pcm16       = (chunk * 32767).clip(-32768, 32767).astype("int16")
+                pcm16_bytes = pcm16.tobytes()
+                frame_bytes = bytes([0]) + pcm16_bytes
+                ring.push(frame_bytes)
+                total_frames += 1
+
+                if use_turn_detector:
+                    decision = turn_detector.push_pcm16(pcm16_bytes, now_ms)
+                    if total_frames % 5 == 0:
+                        decision = turn_detector.tick(now_ms) or decision
+                    if decision is not None and decision.closes_turn:
+                        log.info("wake-word-listener: turn closed action=%s silence_ms=%d frames=%d",
+                                 decision.action, decision.silence_ms, total_frames)
+                        break
+                else:
+                    rms = float((chunk ** 2).mean() ** 0.5)
+                    silence_run = silence_run + 1 if rms < _RMS_FLOOR else 0
+                    if silence_run >= silence_needed:
+                        log.info("wake-word-listener: end-of-turn silence frames=%d", total_frames)
+                        break
+
+                if total_frames >= cap_frames:
+                    log.info("wake-word-listener: hard cap reached frames=%d", total_frames)
+                    break
+
+        except asyncio.TimeoutError:
+            log.info("wake-word-listener: audio timeout -- ending session")
+
+        await _play_chime_async(_CHIME_END)
+
+        # drain consumer
+        ring.close()
+        try:
+            await asyncio.wait_for(consumer, timeout=120.0)
+        except asyncio.TimeoutError:
+            consumer.cancel()
+            log.warning("wake: consumer drain timeout meeting_id=%s", meeting_id)
+
+        # flush tail words still in ASR buffer
+        if transcriber is not None:
+            try:
+                tail = await asyncio.to_thread(transcriber.flush)
+                await _publish_stable(tail)
+            except Exception:
+                log.warning("wake: flush failed meeting_id=%s", meeting_id)
+
+    finally:
+        # ── stop meeting (shared stop) — always runs after start_meeting ─────
+        try:
+            meeting, stopped_now = await store.stop_once(meeting_id)  # ← shared stop
+        except Exception:
+            log.exception("wake: stop_once failed meeting_id=%s", meeting_id)
+            stopped_now = False
+        if stopped_now:
+            await meeting_bus.publish(meeting_id, "status", {"state": "processing"})
+            schedule_finalize(app, meeting_id)
+            log.info("wake-word-listener: finalize scheduled meeting_id=%s", meeting_id)
+        else:
+            log.info("wake-word-listener: session already stopped meeting_id=%s", meeting_id)
 
 
 def _publish_wake_state(state: WakeState) -> None:
@@ -369,6 +375,13 @@ def _publish_wake_state(state: WakeState) -> None:
 def _play_chime(path: str) -> None:
     try:
         subprocess.run(["afplay", path], check=False, timeout=3)
+    except Exception:
+        pass
+
+
+async def _play_chime_async(path: str) -> None:
+    try:
+        await asyncio.to_thread(subprocess.run, ["afplay", path], check=False, timeout=3)
     except Exception:
         pass
 
