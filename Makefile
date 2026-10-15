@@ -5,9 +5,14 @@ BASE := http://localhost:8000
 TENANT := tnt-acme
 WORKSPACE := ws-discovery
 
-ENGINE_PORT ?= 65364
-ENGINE_DB   ?= postgresql://localhost:5432/ideascribe_dev
-ENGINE_LOG  ?= /tmp/engine.log
+ENGINE_PORT          ?= 65364
+ENGINE_DB            ?= postgresql://localhost:5432/ideascribe_dev
+ENGINE_LOG           ?= /tmp/engine.log
+ENGINE_READY_TIMEOUT ?= 30
+
+# Load .env if present so VOXSCRIBE_TOKEN does not need to be passed manually.
+-include .env
+export
 
 .DEFAULT_GOAL := help
 
@@ -60,32 +65,45 @@ smoke: ## End to end check: upload a transcript and follow progress
 	  curl -fsS -N "$(BASE)/v1/sessions/$$SID/progress" \
 	  -H "X-Tenant-Id: $(TENANT)" -H "X-Workspace-Id: $(WORKSPACE)"
 
+CONSOLE := scripts/engine-console.sh
+
 .PHONY: engine
-engine: ## Start the local engine in the background (logs → ENGINE_LOG)
-	@-lsof -ti :$(ENGINE_PORT) | xargs kill -9 2>/dev/null; true
-	@test -n "$(VOXSCRIBE_TOKEN)" || (echo "Set VOXSCRIBE_TOKEN before running"; exit 1)
-	VOXSCRIBE_TOKEN=$(VOXSCRIBE_TOKEN) \
-	  uv run python3 -m app.local.engine \
-	    --port $(ENGINE_PORT) \
-	    --database-url $(ENGINE_DB) \
-	  > $(ENGINE_LOG) 2>&1 &
-	@echo "Engine started on :$(ENGINE_PORT) — logs at $(ENGINE_LOG)"
-	@echo "Tail with: make engine-logs"
+engine: ## Start the engine; waits for health then tails the log
+	@chmod +x $(CONSOLE)
+	@ENGINE_PORT=$(ENGINE_PORT) ENGINE_DB=$(ENGINE_DB) ENGINE_LOG=$(ENGINE_LOG) \
+	  ENGINE_READY_TIMEOUT=$(ENGINE_READY_TIMEOUT) \
+	  bash $(CONSOLE) start
 
 .PHONY: engine-restart
-engine-restart: ## Kill and restart the local engine
-	@-lsof -ti :$(ENGINE_PORT) | xargs kill -9 2>/dev/null; true
-	@sleep 1
-	$(MAKE) engine
+engine-restart: ## Kill, restart the engine, then tail the log
+	@chmod +x $(CONSOLE)
+	@ENGINE_PORT=$(ENGINE_PORT) ENGINE_DB=$(ENGINE_DB) ENGINE_LOG=$(ENGINE_LOG) \
+	  ENGINE_READY_TIMEOUT=$(ENGINE_READY_TIMEOUT) \
+	  bash $(CONSOLE) restart
 
 .PHONY: engine-stop
 engine-stop: ## Stop the local engine
-	@-lsof -ti :$(ENGINE_PORT) | xargs kill -9 2>/dev/null; true
-	@echo "Engine on :$(ENGINE_PORT) stopped"
+	@chmod +x $(CONSOLE)
+	@ENGINE_PORT=$(ENGINE_PORT) ENGINE_DB=$(ENGINE_DB) ENGINE_LOG=$(ENGINE_LOG) \
+	  bash $(CONSOLE) stop
+
+.PHONY: engine-status
+engine-status: ## Show engine running state and health summary
+	@chmod +x $(CONSOLE)
+	@ENGINE_PORT=$(ENGINE_PORT) ENGINE_DB=$(ENGINE_DB) ENGINE_LOG=$(ENGINE_LOG) \
+	  bash $(CONSOLE) status
+
+.PHONY: engine-health
+engine-health: ## GET /v1/health and render the result
+	@chmod +x $(CONSOLE)
+	@ENGINE_PORT=$(ENGINE_PORT) ENGINE_DB=$(ENGINE_DB) ENGINE_LOG=$(ENGINE_LOG) \
+	  bash $(CONSOLE) health
 
 .PHONY: engine-logs
-engine-logs: ## Tail the local engine log
-	@tail -f $(ENGINE_LOG)
+engine-logs: ## Tail the engine log
+	@chmod +x $(CONSOLE)
+	@ENGINE_PORT=$(ENGINE_PORT) ENGINE_LOG=$(ENGINE_LOG) \
+	  bash $(CONSOLE) logs
 
 .PHONY: local
 local: ## Run the local engine with voxscribe-engine

@@ -2,6 +2,7 @@
 
 import asyncio
 import hmac
+import logging
 import time
 import os
 import sys
@@ -25,24 +26,26 @@ from app.local.pg_index import PostgresKnowledgeIndex
 from app.local.providers import select_providers
 from app.local.store import Store
 
+log = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan context manager."""
-    # Startup
-    print("Starting up engine...", file=sys.stderr, flush=True)
+    log.info("engine startup: initializing components")
 
     # Start wake word listener if enabled
     wake_task = None
     if getattr(app.state, "wake_enabled", False):
         from app.local.wake_loop import run_wake_loop
+        log.info("wake-word-listener: initializing -- model=hey_jarvis")
         wake_task = asyncio.create_task(run_wake_loop(app), name="wake-loop")
-        print("Wake word listener started", file=sys.stderr, flush=True)
+        log.info("wake-word-listener: task created, awaiting mic open")
 
     # Start ingestion worker if available
     if hasattr(app.state, "ingestion_worker"):
         await app.state.ingestion_worker.start()
-        print("Ingestion worker started", file=sys.stderr, flush=True)
+        log.info("ingestion-worker: started")
 
     # The models the person chose in an earlier run keep their roles.
     try:
@@ -55,33 +58,36 @@ async def lifespan(app: FastAPI):
                     await restore_selected_roles(pool)
         else:
             await restore_selected_roles(pool)
-    except Exception as exc:  # the defaults from configuration still apply
-        print(f"Restoring chosen models failed: {exc}", file=sys.stderr, flush=True)
+    except Exception as exc:
+        log.warning("model-roles: restore failed, defaults apply: %s", exc)
 
     # A crash during finalisation leaves a meeting 'processing': finish it now.
     try:
         from app.local.finalize import recover_unfinished
 
         await recover_unfinished(app)
-    except Exception as exc:  # never block startup on recovery
-        print(f"Recovery of unfinished meetings failed: {exc}", file=sys.stderr, flush=True)
+    except Exception as exc:
+        log.warning("recovery: unfinished meetings could not be recovered: %s", exc)
 
+    log.info("engine startup: ready")
     yield
 
     # Shutdown
-    print("Shutting down engine...", file=sys.stderr, flush=True)
+    log.info("engine shutdown: stopping components")
     if wake_task is not None and not wake_task.done():
+        log.info("wake-word-listener: cancelling")
         wake_task.cancel()
         try:
             await wake_task
         except asyncio.CancelledError:
             pass
-        print("Wake word listener stopped", file=sys.stderr, flush=True)
+        log.info("wake-word-listener: stopped")
     if hasattr(app.state, "ingestion_worker"):
         await app.state.ingestion_worker.stop()
-        print("Ingestion worker stopped", file=sys.stderr, flush=True)
+        log.info("ingestion-worker: stopped")
     if hasattr(app.state, "store"):
         await app.state.store.close()
+    log.info("engine shutdown: complete")
 
 
 async def create_app(
