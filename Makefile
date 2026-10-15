@@ -5,6 +5,10 @@ BASE := http://localhost:8000
 TENANT := tnt-acme
 WORKSPACE := ws-discovery
 
+ENGINE_PORT ?= 65364
+ENGINE_DB   ?= postgresql://localhost:5432/ideascribe_dev
+ENGINE_LOG  ?= /tmp/engine.log
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -55,6 +59,33 @@ smoke: ## End to end check: upload a transcript and follow progress
 	  echo "session $$SID"; \
 	  curl -fsS -N "$(BASE)/v1/sessions/$$SID/progress" \
 	  -H "X-Tenant-Id: $(TENANT)" -H "X-Workspace-Id: $(WORKSPACE)"
+
+.PHONY: engine
+engine: ## Start the local engine in the background (logs → ENGINE_LOG)
+	@-lsof -ti :$(ENGINE_PORT) | xargs kill -9 2>/dev/null; true
+	@test -n "$(VOXSCRIBE_TOKEN)" || (echo "Set VOXSCRIBE_TOKEN before running"; exit 1)
+	VOXSCRIBE_TOKEN=$(VOXSCRIBE_TOKEN) \
+	  uv run python3 -m app.local.engine \
+	    --port $(ENGINE_PORT) \
+	    --database-url $(ENGINE_DB) \
+	  > $(ENGINE_LOG) 2>&1 &
+	@echo "Engine started on :$(ENGINE_PORT) — logs at $(ENGINE_LOG)"
+	@echo "Tail with: make engine-logs"
+
+.PHONY: engine-restart
+engine-restart: ## Kill and restart the local engine
+	@-lsof -ti :$(ENGINE_PORT) | xargs kill -9 2>/dev/null; true
+	@sleep 1
+	$(MAKE) engine
+
+.PHONY: engine-stop
+engine-stop: ## Stop the local engine
+	@-lsof -ti :$(ENGINE_PORT) | xargs kill -9 2>/dev/null; true
+	@echo "Engine on :$(ENGINE_PORT) stopped"
+
+.PHONY: engine-logs
+engine-logs: ## Tail the local engine log
+	@tail -f $(ENGINE_LOG)
 
 .PHONY: local
 local: ## Run the local engine with voxscribe-engine
