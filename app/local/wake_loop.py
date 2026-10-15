@@ -179,6 +179,12 @@ async def _mic_loop(app, audio_q: asyncio.Queue, oww, np, *, engine) -> None:
             above = 0
             continue
 
+        # Suppress wake detection while speaker is playing (prevents self-trigger).
+        # This is the P1 near-field guard; real AEC comes in P4.
+        if engine is not None and engine.is_playing:
+            above = 0
+            continue
+
         scores = await asyncio.to_thread(oww.predict, chunk)
         best = max(scores.values()) if scores else 0.0
 
