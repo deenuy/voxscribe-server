@@ -50,14 +50,19 @@ class _State(Enum):
 
 async def run_wake_loop(app) -> None:
     """Outer wrapper: any unhandled exception resets to IDLE after 1 s."""
-    while True:
-        try:
-            await _inner(app)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("wake loop crashed — resetting to IDLE in 1 s")
-            await asyncio.sleep(1)
+    log.info("wake-word-listener: starting")
+    try:
+        while True:
+            try:
+                await _inner(app)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("wake-word-listener: crashed -- resetting to IDLE in 1s")
+                await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        log.info("wake-word-listener: stopped (cancelled)")
+        raise
 
 
 async def _inner(app) -> None:
@@ -80,12 +85,14 @@ async def _inner(app) -> None:
 
     # Ensure models are on disk (first-run download; no-op if already present).
     from openwakeword.utils import download_models
-    log.info("wake loop: verifying openWakeWord model files")
+    log.info("wake-word-listener: verifying openWakeWord model files on disk")
     download_models()
 
     # Load models once — they live for the lifetime of this coroutine.
-    log.info("wake loop: loading stand-in model '%s'", _WAKE_MODEL_NAME)
+    log.info("wake-word-listener: loading model model=%s threshold=%.2f patience=%d",
+             _WAKE_MODEL_NAME, _WAKE_THRESHOLD, _WAKE_PATIENCE)
     oww = OWWModel(wakeword_models=[_WAKE_MODEL_NAME], inference_framework="onnx")
+    log.info("wake-word-listener: model loaded ok")
 
     # Use the engine's ASR provider — same WhisperASRProvider as the rest of the engine.
     asr = getattr(getattr(app, "state", None), "providers", {}).get("asr")
@@ -113,7 +120,7 @@ async def _inner(app) -> None:
         blocksize=_CHUNK_FRAMES,
         callback=_audio_cb,
     ):
-        log.info("wake loop: mic open — listening for wake phrase (model: hey_jarvis stand-in)")
+        log.info("wake-word-listener: mic open -- state=IDLE listening for wake phrase")
         state = _State.IDLE
         above_run = 0
         capture_chunks: list = []
@@ -145,7 +152,7 @@ async def _inner(app) -> None:
 
                 # ── WAKE ─────────────────────────────────────────────────────
                 above_run = 0
-                log.info("wake phrase detected (score=%.2f)", best)
+                log.info("wake-word-listener: DETECTED score=%.2f model=%s", best, _WAKE_MODEL_NAME)
 
                 # Chime fires on-device BEFORE any network call.
                 # Scoring pauses for the chime + 200 ms so the mini cannot
@@ -163,7 +170,7 @@ async def _inner(app) -> None:
                 state = _State.CAPTURE
                 capture_chunks = []
                 silence_run = 0
-                log.info("wake loop: → CAPTURE (max %ds)", _CAPTURE_MAX_S)
+                log.info("wake-word-listener: state=IDLE->CAPTURE max_duration=%.0fs", _CAPTURE_MAX_S)
 
             # ── CAPTURE: accumulate until silence or hard cap ─────────────────
             elif state is _State.CAPTURE:
@@ -181,8 +188,9 @@ async def _inner(app) -> None:
                     continue
 
                 # ── DELIVER ───────────────────────────────────────────────────
-                reason = "silence" if silence_hit else "hard cap"
-                log.info("wake loop: → DELIVER (%s, %d chunks)", reason, len(capture_chunks))
+                reason = "silence" if silence_hit else "hard_cap"
+                log.info("wake-word-listener: state=CAPTURE->DELIVER reason=%s chunks=%d",
+                         reason, len(capture_chunks))
 
                 # Lower-tone end chime marks close of capture.
                 _play_chime(_CHIME_END)
@@ -191,12 +199,13 @@ async def _inner(app) -> None:
                 transcript = await loop.run_in_executor(
                     None, _transcribe, asr, samples
                 )
-                log.info("wake transcript: %r", transcript)
+                log.info("wake-word-listener: transcript=%r", transcript)
 
                 from app.local import events
                 events.publish("wake_transcript", {"text": transcript}, broadcast=True)
 
                 # ── → IDLE ────────────────────────────────────────────────────
+                log.info("wake-word-listener: state=DELIVER->IDLE ready for next phrase")
                 state = _State.IDLE
                 capture_chunks = []
                 silence_run = 0
