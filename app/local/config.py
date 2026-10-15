@@ -92,6 +92,7 @@ class Config:
     voice_max_reply_seconds: int = 20
     voice_mode: str = "default"          # default | classroom | seniorcare
     voice_reply_model: str = "llama3.2"  # 3B-4B class for spoken replies
+    voice_use_turn_detector: bool = True  # False skips HeuristicDetector; use for synthetic TTS baselines
 
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "Config":
@@ -276,6 +277,10 @@ class Config:
         voice_reply_model = env_vars.get("VOXSCRIBE_VOICE_REPLY_MODEL", "").strip()
         if voice_reply_model:
             config_dict["voice_reply_model"] = voice_reply_model
+
+        voice_use_turn_detector = env_vars.get("VOXSCRIBE_VOICE_USE_TURN_DETECTOR", "").strip().lower()
+        if voice_use_turn_detector:
+            config_dict["voice_use_turn_detector"] = voice_use_turn_detector not in ("false", "0", "no")
 
         return cls(**config_dict)
 

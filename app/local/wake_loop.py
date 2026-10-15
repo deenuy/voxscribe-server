@@ -328,14 +328,17 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
     # ── push mic frames into ring until turn ends or hard cap ────────────────
     # TurnDetector (parked S4 policy) replaces the fixed 6-second silence counter.
     # Falls back to the silence counter if the speech stack is not importable.
+    use_td_pref = getattr(settings, "voice_use_turn_detector", True)
     try:
+        if not use_td_pref:
+            raise RuntimeError("turn detector disabled by VOXSCRIBE_VOICE_USE_TURN_DETECTOR=false")
         turn_detector = TurnDetector()
         turn_detector.reset()
         use_turn_detector = True
         log.info("wake-word-listener: using S4 turn detector")
-    except RuntimeError:
+    except RuntimeError as _td_err:
         use_turn_detector = False
-        log.info("wake-word-listener: S4 turn detector unavailable, falling back to silence counter")
+        log.info("wake-word-listener: S4 turn detector off (%s), using RMS silence counter", _td_err)
 
     silence_run    = 0
     silence_needed = int(_SILENCE_S * _SAMPLE_RATE / _CHUNK_FRAMES)
@@ -383,6 +386,8 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
             log.info("wake-word-listener: audio timeout -- ending session")
 
         _turn_end_ms = _mono_ms()
+        log.info("wake: ring fill at turn close: %.0f ms (peak %.0f ms)",
+                 ring._fill_ms, ring.stats.peak_fill_ms)
         await _play_chime_async(_CHIME_END)
 
         # drain consumer
