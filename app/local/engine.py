@@ -3,8 +3,10 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
+import time
 
 import uvicorn
 
@@ -15,6 +17,37 @@ from app.local.log_redaction import install as redact_secrets_in_logs
 from app.local.migrations import run_migrations
 
 VERSION = "0.1.0"
+
+_MONOTONIC_START = time.monotonic()
+
+
+class _MonotonicHandler(logging.StreamHandler):
+    """StreamHandler subclass used as a marker for the already-installed guard."""
+
+
+def _install_app_local_handler(log_level: str) -> None:
+    """Add a handler to app.local.* that prefixes every line with monotonic ms.
+
+    Monotonic offsets let wake and session log lines sort correctly even when
+    the wall clock jumps (NTP resync, sleep/wake). Detection latency is the
+    diff between two monotonic values printed on the same log line.
+    Already-installed guard prevents double-add on uvicorn hot-reload.
+    """
+    logger = logging.getLogger("app.local")
+    if any(isinstance(h, _MonotonicHandler) for h in logger.handlers):
+        return
+
+    class _Fmt(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            record.monotonic_ms = int((time.monotonic() - _MONOTONIC_START) * 1000)
+            return super().format(record)
+
+    handler = _MonotonicHandler()
+    handler.setFormatter(_Fmt(fmt="[%(monotonic_ms)8d ms] %(name)s %(levelname)s %(message)s"))
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    handler.setLevel(level)
+    logger.setLevel(level)
+    logger.addHandler(handler)
 
 
 async def main():
@@ -89,6 +122,10 @@ async def main():
         ws_ping_interval=None,
         ws_ping_timeout=None,
     )
+    # app.local.* handler: writes wake + session lines with monotonic offset so they are sortable
+    # even when the wall clock jumps (NTP, sleep). Handler is added once here before the server starts.
+    _install_app_local_handler(settings.log_level)
+
     # uvicorn sets up its loggers in Config; the live socket's address carries tokens, so redact them in log lines.
     redact_secrets_in_logs()
 
