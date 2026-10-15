@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 log = logging.getLogger("app.local.llm_adapter")
 
 _OLLAMA_URL   = "http://localhost:11434/api/generate"
-_DEFAULT_MODEL = "llama3.2"
+_DEFAULT_MODEL = "gemma4:12b"
 _REQUEST_TIMEOUT = 30.0
 
 _SYSTEM_PROMPT = """You are a helpful voice assistant. Reply in 1-2 short sentences only.

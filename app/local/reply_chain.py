@@ -96,7 +96,7 @@ async def run_reply(
     pool = app.state.store.pool
     settings = getattr(app.state, "settings", None)
     audio_engine = getattr(app.state, "audio_engine", None)
-    model = getattr(settings, "voice_reply_model", "llama3.2")
+    model = getattr(settings, "voice_reply_model", "gemma4:12b")
     if mode == "default":
         mode = getattr(settings, "voice_mode", "default")
 
