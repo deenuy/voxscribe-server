@@ -118,6 +118,11 @@ async def _inner(app) -> None:
 
     _publish_wake_state(WakeState.ARMED)
 
+    # Pre-warm the reply model so the first wake turn doesn't pay a cold-load penalty.
+    settings = getattr(app.state, "settings", None)
+    reply_model = getattr(settings, "voice_reply_model", "llama3.2")
+    asyncio.create_task(_prewarm_llm(reply_model), name="llm-prewarm")
+
     # Use AudioEngine.subscribe() if available (single mic stream per process).
     # Fall back to direct sd.InputStream when AudioEngine is not started.
     engine = getattr(app.state, "audio_engine", None)
@@ -447,6 +452,22 @@ async def _run_reply_safe(app, meeting_id: str, turn_text: str, turn_end_ms: int
         await run_reply(app, meeting_id, turn_text, turn_end_ms)
     except Exception:
         log.exception("wake: reply chain failed meeting_id=%s", meeting_id)
+
+
+async def _prewarm_llm(model: str) -> None:
+    """Send a one-token request so Ollama loads the reply model into Metal GPU memory.
+
+    Runs once at arm time. keep_alive in llm_adapter keeps it resident between turns.
+    Non-critical: failure is logged and ignored.
+    """
+    from app.local.llm_adapter import stream_reply
+    try:
+        log.info("wake: pre-warming reply model=%s", model)
+        async for _ in stream_reply("hi", model=model):
+            break  # first token is enough; model is now resident
+        log.info("wake: reply model warmed model=%s", model)
+    except Exception:
+        log.debug("wake: prewarm failed (non-critical) model=%s", model)
 
 
 def _drain(q: asyncio.Queue) -> None:

@@ -25,8 +25,10 @@ if TYPE_CHECKING:
 log = logging.getLogger("app.local.llm_adapter")
 
 _OLLAMA_URL   = "http://localhost:11434/api/generate"
-_DEFAULT_MODEL = "gemma4:12b"
-_REQUEST_TIMEOUT = 90.0   # gemma4:12b first-token ~11-35s; outer reply_chain timeout governs
+_DEFAULT_REPLY_MODEL = "llama3.2"   # 3B class; fast spoken replies
+_DEFAULT_MODEL = _DEFAULT_REPLY_MODEL  # backward-compat alias
+_REQUEST_TIMEOUT = 30.0   # llama3.2 first-token <3s warm; 30s covers cold load
+_KEEP_ALIVE = "10m"       # keep model in VRAM between turns (no reload penalty)
 
 _SYSTEM_PROMPT = """You are a helpful voice assistant. Reply in 1-2 short sentences only.
 Be direct and conversational. No markdown, no lists, no headers.
@@ -36,7 +38,7 @@ Keep replies under 30 words."""
 async def stream_reply(
     user_text: str,
     *,
-    model: str = _DEFAULT_MODEL,
+    model: str = _DEFAULT_REPLY_MODEL,
     system_prompt: str = _SYSTEM_PROMPT,
 ) -> AsyncIterator[str]:
     """Stream reply tokens from Ollama.
@@ -51,6 +53,7 @@ async def stream_reply(
         "prompt": user_text,
         "system": system_prompt,
         "stream": True,
+        "keep_alive": _KEEP_ALIVE,
     }
 
     try:

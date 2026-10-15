@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 
 log = logging.getLogger("app.local.reply_chain")
 
-_OLLAMA_TIMEOUT_S  = 60.0   # gemma4:12b first-token ~11-35s on MacBook Pro under load (no GPU)
+_OLLAMA_TIMEOUT_S  = 30.0   # llama3.2 first-token <3s warm, ~8s cold; 30s covers first-time load
 _FALLBACK_PHRASE   = "I'm sorry, I didn't catch that. Could you say it again?"
 _THINKING_PHRASE   = "hm"
 _SENTENCE_RE       = re.compile(r'[.!?]["\')\]]*\s+')
@@ -97,7 +97,7 @@ async def run_reply(
     pool = app.state.store.pool
     settings = getattr(app.state, "settings", None)
     audio_engine = getattr(app.state, "audio_engine", None)
-    model = getattr(settings, "voice_reply_model", "gemma4:12b")
+    model = getattr(settings, "voice_reply_model", "llama3.2")
     if mode == "default":
         mode = getattr(settings, "voice_mode", "default")
 
