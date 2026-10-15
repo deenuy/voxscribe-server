@@ -1,5 +1,11 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.6.1
+
+### Bug Fixes
+- Fixed audio frames sent during the final seconds of a recording being silently dropped by adding an end-of-audio handshake that holds the connection open until the engine confirms all frames are queued.
+- Fixed per-session ring statistics being invisible in logs by promoting the end-of-session stat line to warning level.
+
 ## What's New in VoxScribe Server 0.6.0
 
 ### New Features

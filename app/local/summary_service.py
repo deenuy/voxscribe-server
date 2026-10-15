@@ -5,10 +5,12 @@ import logging
 import os
 from datetime import datetime
 
-from voxscribe.meeting.summary import PROMPT_VERSION, summarize_meeting
+from voxscribe.meeting.summary import PROMPT_VERSION, generate_meeting_title, summarize_meeting
 
 from . import meeting_bus
 from .store_meetings import MeetingStore
+from .store_tasks import TaskStore
+from .task_service import draft_tasks
 
 log = logging.getLogger(__name__)
 
@@ -158,8 +160,51 @@ class SummaryService:
                 generated_at=now,
                 prompt_version=PROMPT_VERSION,
             )
+
+            # AI title: best-effort; never blocks or raises
+            try:
+                ai_title = await asyncio.wait_for(
+                    asyncio.to_thread(generate_meeting_title, self.llm, segments, notes),
+                    timeout=30.0,
+                )
+                if ai_title:
+                    await self.store.update_meeting(meeting_id, title=ai_title)
+                    log.info("AI title set for meeting %s: %r", meeting_id, ai_title)
+            except Exception as title_err:
+                log.warning("AI title generation failed for meeting %s: %s", meeting_id, title_err)
+
             await meeting_bus.publish(meeting_id, "summary.ready", {})
             log.info("Summary generated for meeting %s", meeting_id)
+
+            # SMART task auto-generation: best-effort, never blocks or raises
+            try:
+                spoken = [s for s in segments_models if s.text and s.text.strip()]
+                if spoken:
+                    lines = [s.text.strip() for s in spoken]
+                    labelled = [
+                        f"{s.speaker}: {s.text.strip()}" if s.speaker else s.text.strip()
+                        for s in spoken
+                    ]
+                    held = datetime.utcnow().strftime("%Y-%m-%d")
+                    drafts = await asyncio.wait_for(
+                        draft_tasks(
+                            self.llm,
+                            lines=lines,
+                            labelled=labelled,
+                            project=None,
+                            fake=False,
+                            held_on=held,
+                        ),
+                        timeout=45.0,
+                    )
+                    if drafts:
+                        created, skipped = await TaskStore(self.store.pool).add_generated(meeting_id, drafts)
+                        log.info(
+                            "Auto-generated %d task(s) for meeting %s (%d skipped)",
+                            len(created), meeting_id, skipped,
+                        )
+            except Exception as task_err:
+                log.warning("Auto task generation failed for meeting %s: %s", meeting_id, task_err)
 
         except Exception as e:
             log.error("Summary generation error for meeting %s: %s", meeting_id, e, exc_info=True)

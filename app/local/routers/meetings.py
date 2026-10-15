@@ -155,12 +155,15 @@ async def stop_meeting(request: Request, meeting_id: str):
     Idempotent: only the call that actually stops a recording starts finalisation (enrichment, summary,
     publish); a repeat or concurrent stop returns the meeting as it is. A meeting that was never started is 409.
     Returns immediately with status 'processing'."""
-    from app.local.finalize import schedule_finalize
-
     store = MeetingStore(request.app.state.store.pool)
     meeting, stopped_now = await store.stop_once(meeting_id)
     if stopped_now:
-        schedule_finalize(request.app, meeting_id)
+        from app.local import meeting_bus as _bus
+        await _bus.publish(meeting_id, "status", {"state": "processing"})
+        # schedule_finalize is NOT called here. The live WS session's finally block
+        # calls it after the ring drains and the flush is written, ensuring the full
+        # transcript is in the DB before finalization starts. Meetings that stop
+        # without a live session are recovered by recover_unfinished at next startup.
     return meeting.model_dump(exclude_none=True)
 
 

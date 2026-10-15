@@ -82,6 +82,12 @@ async def main():
         lifespan="on",
         access_log=False,
         log_level=settings.log_level.lower(),
+        # Disable server-side WS keepalive pings so audio-streaming connections
+        # are not killed by ping-timeout on long recordings (the browser responds
+        # to pings automatically, but the Python websockets client does not always
+        # respond in time when sending large audio frames).
+        ws_ping_interval=None,
+        ws_ping_timeout=None,
     )
     # uvicorn sets up its loggers in Config; the live socket's address carries tokens, so redact them in log lines.
     redact_secrets_in_logs()
