@@ -80,6 +80,9 @@ async def trigger_wake_session(request: Request):
         try:
             await _run_session(app, audio_q, confidence=1.0, np=np)
         finally:
+            # Mirror _mic_loop's finally: reset state so /trigger is not stuck
+            # in LISTENING forever (trigger path never goes through _mic_loop).
+            set_state(WakeState.ARMED)
             audio_engine.unsubscribe(audio_q)
 
     task = asyncio.create_task(_session_task(), name="trigger-session")
