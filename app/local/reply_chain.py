@@ -29,6 +29,7 @@ log = logging.getLogger("app.local.reply_chain")
 
 _OLLAMA_TIMEOUT_S  = 10.0
 _FALLBACK_PHRASE   = "I'm sorry, I didn't catch that. Could you say it again?"
+_THINKING_PHRASE   = "hm"
 _SENTENCE_RE       = re.compile(r'[.!?]["\')\]]*\s+')
 
 
@@ -67,7 +68,7 @@ async def warm_phrase_cache() -> None:
         CLASSROOM_REFUSAL_PHRASE,
         SENIORCARE_ESCALATION_PHRASE,
     )
-    for phrase in (DEFAULT_REFUSAL_PHRASE, CLASSROOM_REFUSAL_PHRASE, SENIORCARE_ESCALATION_PHRASE):
+    for phrase in (_THINKING_PHRASE, DEFAULT_REFUSAL_PHRASE, CLASSROOM_REFUSAL_PHRASE, SENIORCARE_ESCALATION_PHRASE):
         await prerender_phrase(phrase)
 
 
@@ -117,6 +118,15 @@ async def run_reply(
             await conn.commit()
     except Exception:
         log.exception("reply_chain: failed to write turn row meeting_id=%s", meeting_id)
+
+    # ── 1b. Thinking cue: play immediately so speaker isn't silent while LLM warms up ─
+    if audio_engine is not None and user_text.strip():
+        try:
+            thinking_path = await prerender_phrase(_THINKING_PHRASE)
+            if thinking_path is not None:
+                await play_prerendered(thinking_path, audio_engine)
+        except Exception:
+            log.debug("reply_chain: thinking cue failed (non-critical)")
 
     # ── 2-5. LLM stream → gate per sentence → Kokoro → play ─────────────────
     # Gate each sentence as it arrives. First audio starts before LLM finishes
