@@ -66,10 +66,16 @@ def _wait_armed(engine: str, timeout_s: float = 120.0) -> bool:
     return False
 
 
-def _play_wav(path: Path) -> None:
+_OUT_DEVICE = "MacBook Pro Speakers"   # must match engine's capture chain
+
+
+def _play_wav(path: Path, gain: float = 1.5) -> None:
     data, sr = sf.read(str(path), dtype="float32")
-    sd.play(data, samplerate=sr)
-    sd.wait()
+    # Mild gain to ensure speech clears _RMS_FLOOR=0.005 at MacBook mic.
+    data = (data * gain).clip(-1.0, 1.0)
+    rms = float((data ** 2).mean() ** 0.5)
+    log.info("_play_wav: %s gain=%.1f peak_rms=%.4f", path.name, gain, rms)
+    sd.play(data, samplerate=sr, device=_OUT_DEVICE, blocking=True)
 
 
 def _collect_meeting_data(conn, meeting_id: str) -> dict:
@@ -330,21 +336,37 @@ def main() -> None:
         _play_wav(wav_path)
         log.info("session_%s: WAV finished in %.1f s", sid, time.monotonic() - t0)
 
-        # Wait for session to end (engine returns to ARMED after silence timeout)
+        # Wait for session to end.  Hard cap is 300s from session start; WAV is
+        # ~150s, so we need ~200s post-play.  Use 360s to absorb reply chain.
         log.info("session_%s: waiting for session end (engine return to ARMED)", sid)
-        if not _wait_armed(args.engine_url, timeout_s=120.0):
-            log.warning("session_%s: engine did not return to ARMED within 120 s", sid)
+        if not _wait_armed(args.engine_url, timeout_s=360.0):
+            log.warning("session_%s: engine did not return to ARMED within 360 s", sid)
 
-        # Collect DB records: find the most recent meeting (started after t0)
+        # Collect DB records: find the most recent wake meeting.
+        # Use created_at (not started_at; started_at is null until start_meeting runs).
+        # The reply chain inserts turns as a background task after ARMED is set,
+        # so we poll until at least one turns row appears (max 120 s).
         rows = conn.execute(
-            "SELECT id FROM meetings ORDER BY started_at DESC LIMIT 1"
+            "SELECT id FROM meetings WHERE origin='wake' ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
         if not rows:
             log.warning("session_%s: no meeting found in DB", sid)
             all_session_results.append({"_session": sid, "_error": "no_meeting"})
             continue
-
         meeting_id = rows[0]
+        log.info("session_%s: meeting_id=%s polling for turns (up to 120 s)...", sid, meeting_id)
+        poll_deadline = time.monotonic() + 120.0
+        while time.monotonic() < poll_deadline:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE meeting_id=%s", (meeting_id,)
+            ).fetchone()[0]
+            if n > 0:
+                log.info("session_%s: %d turns found in DB", sid, n)
+                break
+            time.sleep(3.0)
+        else:
+            log.warning("session_%s: turns still 0 after 120 s poll", sid)
+
         data = _collect_meeting_data(conn, meeting_id)
         sess_results = _score_session(sid, data, truth)
         sess_results["_session"] = sid
