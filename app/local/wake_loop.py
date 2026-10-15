@@ -1,67 +1,95 @@
-"""Always-on wake word loop that runs inside the voxscribe-engine process.
+"""Always-on wake word loop running inside the voxscribe-engine process.
 
-Enabled with --wake. Opens one sounddevice stream for the lifetime of the
-process. State machine: IDLE → WAKE → CAPTURE → DELIVER → IDLE.
+Enabled with --wake. Owns the mic stream for the lifetime of the process.
+State machine: off → armed → listening → armed.
 
-One process owns the mic. If --wake is on, the engine's MicrophoneSource
-in the transcription path must NOT be used simultaneously on the same device.
-In practice, meetings on the mini stream audio from the mic via this loop's
-wake path, not from a second InputStream.
+On trigger the loop:
+  1. Records a row in wake_events.
+  2. Creates a meeting via store.create_meeting (same call the mic button uses).
+  3. Starts the meeting via store.start_meeting (consent captured by arming).
+  4. Pushes float32 mic frames (converted to PCM16 + source_tag=0) into an
+     AudioRing with drop_oldest policy, drained by the same LiveTranscriber
+     consumer the WebSocket path uses.
+  5. On 6 s silence closes the ring, awaits the consumer, then calls
+     store.stop_once + schedule_finalize — exactly what the WebSocket path does.
 
-ASR: transcription in DELIVER goes through app.state.providers["asr"] — the
-same WhisperASRProvider the rest of the engine uses. This keeps one ASR stack.
-Note: phrase-rule normalization, audit ledger and policy gate (streaming_listen)
-require a StreamProcessor scoped to a meeting; wake transcripts arrive outside
-any meeting, so those layers are skipped for this first iteration.
+Lines where the wake loop calls the shared start and stop:
+  start → await store.start_meeting(meeting_id)          # _run_session line ~130
+  stop  → await store.stop_once(meeting_id)              # _run_session line ~195
 
-Stand-in wake model: "hey_jarvis" (built-in openWakeWord ONNX model). The real
-"hey_vox" model is trained separately from TTS-synthesized clips and loaded by
-setting WAKE_MODEL_NAME="hey_vox" once that file is available.
+The CAPTURE / DELIVER / wake_transcript path has been removed.
 """
 
 import asyncio
 import logging
+import struct
 import subprocess
-from enum import Enum, auto
+import time
+import uuid
+from datetime import UTC, datetime
+from enum import Enum
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("app.local.wake")
 
-_SAMPLE_RATE = 16000
-_CHUNK_FRAMES = 512        # 32 ms at 16 kHz — matches VADConfig.chunk_ms
-_RMS_FLOOR = 0.005         # skip OWW scoring below this RMS (CPU saver)
-_WAKE_THRESHOLD = 0.5      # openWakeWord score to count as a hit
-_WAKE_PATIENCE = 2         # consecutive hits required to fire
-_CAPTURE_SILENCE_S = 2.0   # trailing silence that ends utterance
-_CAPTURE_MAX_S = 30.0      # hard cap
+_SAMPLE_RATE   = 16_000
+_CHUNK_FRAMES  = 512         # 32 ms at 16 kHz
+_RMS_FLOOR     = 0.005
+_THRESHOLD     = 0.5         # OWW score to count as a hit
+_PATIENCE      = 2           # consecutive hits required
+_SILENCE_S     = 6.0         # end-of-turn silence in seconds
+_CAP_S         = 300.0       # hard 5-minute cap per session
+_CONSENT_VER   = "wake-v1"
 
-# Stand-in: hey_jarvis is a built-in openWakeWord model, no download needed.
-# Replace with "hey_vox" once the custom model is trained.
-_WAKE_MODEL_NAME = "hey_jarvis_v0.1.onnx"  # full filename required by OWWModel
-
-# macOS built-in system sounds — no custom asset needed for the first loop test
-_CHIME_ACK = "/System/Library/Sounds/Glass.aiff"
-_CHIME_END = "/System/Library/Sounds/Pop.aiff"
+_WAKE_MODEL    = "hey_jarvis_v0.1.onnx"
+_CHIME_ACK     = "/System/Library/Sounds/Glass.aiff"
+_CHIME_END     = "/System/Library/Sounds/Pop.aiff"
+_CHIME_ERR     = "/System/Library/Sounds/Basso.aiff"
 
 
-class _State(Enum):
-    IDLE = auto()
-    CAPTURE = auto()
+class WakeState(str, Enum):
+    OFF       = "off"
+    ARMED     = "armed"
+    LISTENING = "listening"
+    ERROR     = "error"
+
+
+# Module-level state — written by the loop, read by the router.
+_state: dict = {
+    "state": WakeState.OFF,
+    "model": _WAKE_MODEL,
+    "phrase": "hey_vox",
+}
+
+
+def get_state() -> dict:
+    return dict(_state)
+
+
+def set_state(s: WakeState) -> None:
+    _state["state"] = s
 
 
 async def run_wake_loop(app) -> None:
-    """Outer wrapper: any unhandled exception resets to IDLE after 1 s."""
+    """Outer wrapper: any unhandled exception resets to ARMED after 1 s."""
     log.info("wake-word-listener: starting")
+    set_state(WakeState.ARMED)
     try:
         while True:
+            if _state["state"] == WakeState.OFF:
+                await asyncio.sleep(0.25)
+                continue
             try:
                 await _inner(app)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("wake-word-listener: crashed -- resetting to IDLE in 1s")
+                log.exception("wake-word-listener: crashed -- resetting in 1 s")
+                set_state(WakeState.ERROR)
                 await asyncio.sleep(1)
+                set_state(WakeState.ARMED)
     except asyncio.CancelledError:
         log.info("wake-word-listener: stopped (cancelled)")
+        set_state(WakeState.OFF)
         raise
 
 
@@ -70,165 +98,253 @@ async def _inner(app) -> None:
         import numpy as np
         import sounddevice as sd
     except ImportError as exc:
-        raise RuntimeError(
-            "wake loop needs sounddevice and numpy. "
-            "Install voxscribe-core[wakeword] in the engine's venv."
-        ) from exc
+        raise RuntimeError("wake loop needs sounddevice and numpy") from exc
 
     try:
         from openwakeword.model import Model as OWWModel
+        from openwakeword.utils import download_models
     except ImportError as exc:
-        raise RuntimeError(
-            "wake loop needs openwakeword. "
-            "Install voxscribe-core[wakeword] in the engine's venv."
-        ) from exc
+        raise RuntimeError("wake loop needs openwakeword") from exc
 
-    # Ensure models are on disk (first-run download; no-op if already present).
-    from openwakeword.utils import download_models
-    log.info("wake-word-listener: verifying openWakeWord model files on disk")
     download_models()
+    log.info("wake-word-listener: loading model=%s threshold=%.2f patience=%d",
+             _WAKE_MODEL, _THRESHOLD, _PATIENCE)
+    oww = OWWModel(wakeword_models=[_WAKE_MODEL], inference_framework="onnx")
+    log.info("wake-word-listener: model loaded state=ARMED")
+    set_state(WakeState.ARMED)
 
-    # Load models once — they live for the lifetime of this coroutine.
-    log.info("wake-word-listener: loading model model=%s threshold=%.2f patience=%d",
-             _WAKE_MODEL_NAME, _WAKE_THRESHOLD, _WAKE_PATIENCE)
-    oww = OWWModel(wakeword_models=[_WAKE_MODEL_NAME], inference_framework="onnx")
-    log.info("wake-word-listener: model loaded ok")
-
-    # Use the engine's ASR provider — same WhisperASRProvider as the rest of the engine.
-    asr = getattr(getattr(app, "state", None), "providers", {}).get("asr")
-    if asr is None:
-        log.warning("wake loop: no ASR provider on app.state — transcripts will be empty")
+    _publish_wake_state(WakeState.ARMED)
 
     loop = asyncio.get_running_loop()
-    # Queue cap prevents unbounded growth if the event loop is busy.
     audio_q: asyncio.Queue = asyncio.Queue(maxsize=512)
 
-    def _audio_cb(indata, frames, t, status):
+    def _cb(indata, frames, t, status):
         if status:
             log.debug("sounddevice status: %s", status)
-        # Bridge from PortAudio callback thread to the asyncio event loop.
-        # call_soon_threadsafe is the only safe way to enqueue from a thread.
         try:
             loop.call_soon_threadsafe(audio_q.put_nowait, indata[:, 0].copy())
         except asyncio.QueueFull:
-            pass  # overrun: drop oldest chunk
+            pass
 
-    with sd.InputStream(
-        samplerate=_SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        blocksize=_CHUNK_FRAMES,
-        callback=_audio_cb,
-    ):
-        log.info("wake-word-listener: mic open -- state=IDLE listening for wake phrase")
-        state = _State.IDLE
-        above_run = 0
-        capture_chunks: list = []
-        silence_run = 0
-        silence_needed = int(_CAPTURE_SILENCE_S / (_CHUNK_FRAMES / _SAMPLE_RATE))
-        cap_max = int(_CAPTURE_MAX_S / (_CHUNK_FRAMES / _SAMPLE_RATE))
+    with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1,
+                        dtype="float32", blocksize=_CHUNK_FRAMES, callback=_cb):
+        log.info("wake-word-listener: mic open state=ARMED")
+        above = 0
 
         while True:
+            if _state["state"] == WakeState.OFF:
+                log.info("wake-word-listener: disarmed -- closing mic")
+                return
+
             chunk = await audio_q.get()
-            rms = float(np.sqrt(np.mean(chunk ** 2)))
+            rms = float((chunk ** 2).mean() ** 0.5)
 
-            # ── IDLE: scan for wake phrase ────────────────────────────────────
-            if state is _State.IDLE:
-                if rms < _RMS_FLOOR:
-                    # Near-silence: skip model scoring entirely to keep CPU near zero.
-                    above_run = 0
-                    continue
+            if rms < _RMS_FLOOR:
+                above = 0
+                continue
 
-                scores = oww.predict(chunk)
-                best = max(scores.values()) if scores else 0.0
+            scores = oww.predict(chunk)
+            best = max(scores.values()) if scores else 0.0
 
-                if best >= _WAKE_THRESHOLD:
-                    above_run += 1
-                else:
-                    above_run = 0
+            above = above + 1 if best >= _THRESHOLD else 0
+            if above < _PATIENCE:
+                continue
 
-                if above_run < _WAKE_PATIENCE:
-                    continue
+            above = 0
+            triggered_ms = int(time.monotonic() * 1000)
+            log.info("wake-word-listener: DETECTED score=%.3f model=%s monotonic_ms=%d",
+                     best, _WAKE_MODEL, triggered_ms)
 
-                # ── WAKE ─────────────────────────────────────────────────────
-                above_run = 0
-                log.info("wake-word-listener: DETECTED score=%.2f model=%s", best, _WAKE_MODEL_NAME)
+            # B4.7: ignore trigger while already listening
+            if _state["state"] == WakeState.LISTENING:
+                log.info("wake-word-listener: already LISTENING -- ignored (B4.7)")
+                continue
 
-                # Chime fires on-device BEFORE any network call.
-                # Scoring pauses for the chime + 200 ms so the mini cannot
-                # wake itself on the chime audio.
-                _play_chime(_CHIME_ACK)
-                await asyncio.sleep(0.2)
+            _play_chime(_CHIME_ACK)
+            chime_done_ms = int(time.monotonic() * 1000)
+            log.info("wake-word-listener: chime latency=%d ms", chime_done_ms - triggered_ms)
+            await asyncio.sleep(0.2)
+            _drain(audio_q)
 
-                # Drain queued audio that accumulated during chime playback.
+            _publish_wake_state(WakeState.LISTENING)
+
+            try:
+                await _run_session(app, audio_q, best, np)
+            except Exception:
+                log.exception("wake-word-listener: session failed")
+                _play_chime(_CHIME_ERR)
+            finally:
+                set_state(WakeState.ARMED)
+                _publish_wake_state(WakeState.ARMED)
+                log.info("wake-word-listener: back to ARMED")
                 _drain(audio_q)
 
-                # Notify all SSE subscribers (broadcast: not scoped to a tenant).
-                from app.local import events
-                events.publish("wake_detected", {"phrase": "hey_vox"}, broadcast=True)
 
-                state = _State.CAPTURE
-                capture_chunks = []
-                silence_run = 0
-                log.info("wake-word-listener: state=IDLE->CAPTURE max_duration=%.0fs", _CAPTURE_MAX_S)
+async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> None:
+    """Create a meeting, run the shared ring+consumer path, stop on silence."""
+    from app.local.audio_ring import AudioRing
+    from app.local.store_meetings import MeetingStore
+    from app.local.finalize import schedule_finalize
+    from app.local import meeting_bus
+    from app.local.models import Segment
+    from voxscribe.meeting.live import LiveTranscriber
 
-            # ── CAPTURE: accumulate until silence or hard cap ─────────────────
-            elif state is _State.CAPTURE:
-                capture_chunks.append(chunk)
+    set_state(WakeState.LISTENING)
+    pool    = app.state.store.pool
+    store   = MeetingStore(pool)
+    asr     = getattr(app.state, "providers", {}).get("asr")
+    settings = getattr(app.state, "settings", None)
 
-                if rms < _RMS_FLOOR:
-                    silence_run += 1
-                else:
-                    silence_run = 0
+    meeting_id = str(uuid.uuid4())
+    now_z      = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-                silence_hit = silence_run >= silence_needed
-                cap_hit = len(capture_chunks) >= cap_max
+    # ── create meeting (same store call as mic button, origin="wake") ─────────
+    await store.create_meeting(
+        meeting_id=meeting_id,
+        title=f"Wake session {datetime.now(UTC).strftime('%H:%M')}",
+        origin="wake",
+        client_request_id=f"wake-{meeting_id}",
+    )
 
-                if not (silence_hit or cap_hit):
-                    continue
+    # record consent (user opted in by arming)
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE meetings SET consent_version=%s, consent_at=%s WHERE id=%s",
+            (_CONSENT_VER, now_z, meeting_id),
+        )
+        await conn.commit()
 
-                # ── DELIVER ───────────────────────────────────────────────────
-                reason = "silence" if silence_hit else "hard_cap"
-                log.info("wake-word-listener: state=CAPTURE->DELIVER reason=%s chunks=%d",
-                         reason, len(capture_chunks))
+    # write wake_events row
+    event_id = str(uuid.uuid4())
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO wake_events (id, phrase, confidence, triggered_at, started_meeting_id) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (event_id, "hey_vox", float(confidence), now_z, meeting_id),
+        )
+        await conn.commit()
 
-                # Lower-tone end chime marks close of capture.
-                _play_chime(_CHIME_END)
+    # ── start meeting (shared start) ─────────────────────────────────────────
+    await store.start_meeting(meeting_id)   # ← shared start (see module docstring)
+    log.info("wake-word-listener: session started meeting_id=%s wake_event=%s",
+             meeting_id, event_id)
 
-                samples = np.concatenate(capture_chunks)
-                transcript = await loop.run_in_executor(
-                    None, _transcribe, asr, samples
-                )
-                log.info("wake-word-listener: transcript=%r", transcript)
+    ring = AudioRing(capacity_ms=60_000.0, policy="drop_oldest")
 
-                from app.local import events
-                events.publish("wake_transcript", {"text": transcript}, broadcast=True)
+    transcriber = None
+    if asr:
+        transcriber = LiveTranscriber(
+            asr,
+            session_id=meeting_id,
+            vad_mode=getattr(settings, "live_vad_mode", "adaptive"),
+            max_segment_ms=getattr(settings, "live_max_segment_ms", 15000) or None,
+        )
 
-                # ── → IDLE ────────────────────────────────────────────────────
-                log.info("wake-word-listener: state=DELIVER->IDLE ready for next phrase")
-                state = _State.IDLE
-                capture_chunks = []
-                silence_run = 0
-                above_run = 0
+    async def _publish_stable(segs):
+        for seg in segs:
+            db = Segment(id=seg.id, startMs=seg.start_ms, endMs=seg.end_ms,
+                         source=seg.source, speaker=seg.speaker,
+                         text=seg.text, state=seg.state)
+            try:
+                await store.upsert_segment(meeting_id, db)
+            except Exception:
+                log.exception("wake: failed to persist segment")
+            await meeting_bus.publish(meeting_id, "transcript.stable", {
+                "id": db.id, "startMs": db.startMs, "endMs": db.endMs,
+                "source": db.source, "speaker": db.speaker,
+                "text": db.text, "state": db.state,
+            })
 
+    async def _consumer():
+        while True:
+            frame = await ring.pop()
+            if frame is None:
+                break
+            if transcriber is None:
+                continue
+            src  = frame[0]
+            data = frame[1:]
+            try:
+                new_stable = await asyncio.to_thread(transcriber.push_audio, src, data)
+                await _publish_stable(new_stable)
+            except Exception:
+                log.exception("wake consumer: transcription error")
 
-def _transcribe(asr, samples) -> str:
-    """Transcribe using the engine's ASR provider (same stack as the rest of the engine)."""
-    if asr is None:
-        return ""
+    consumer = asyncio.create_task(_consumer())
+
+    # ── push mic frames into ring until silence or hard cap ──────────────────
+    silence_run    = 0
+    silence_needed = int(_SILENCE_S * _SAMPLE_RATE / _CHUNK_FRAMES)
+    cap_frames     = int(_CAP_S    * _SAMPLE_RATE / _CHUNK_FRAMES)
+    total_frames   = 0
+
     try:
-        chunks = asr.transcribe(samples.tolist(), _SAMPLE_RATE, "wake", initial_prompt=None)
-        return " ".join(c.text.strip() for c in chunks).strip()
+        while True:
+            chunk = await asyncio.wait_for(audio_q.get(), timeout=_SILENCE_S + 2.0)
+            rms   = float((chunk ** 2).mean() ** 0.5)
+
+            # float32 → PCM16, prepend source_tag byte (0 = mic)
+            pcm16      = (chunk * 32767).clip(-32768, 32767).astype("int16")
+            frame_bytes = bytes([0]) + pcm16.tobytes()
+            ring.push(frame_bytes)
+            total_frames += 1
+
+            silence_run = silence_run + 1 if rms < _RMS_FLOOR else 0
+
+            if silence_run >= silence_needed:
+                log.info("wake-word-listener: end-of-turn silence frames=%d", total_frames)
+                break
+            if total_frames >= cap_frames:
+                log.info("wake-word-listener: hard cap reached frames=%d", total_frames)
+                break
+
+    except asyncio.TimeoutError:
+        log.info("wake-word-listener: audio timeout -- ending session")
+
+    _play_chime(_CHIME_END)
+
+    # drain consumer
+    ring.close()
+    try:
+        await asyncio.wait_for(consumer, timeout=120.0)
+    except asyncio.TimeoutError:
+        consumer.cancel()
+        log.warning("wake: consumer drain timeout meeting_id=%s", meeting_id)
+
+    # flush tail words still in ASR buffer
+    if transcriber is not None:
+        try:
+            tail = await asyncio.to_thread(transcriber.flush)
+            await _publish_stable(tail)
+        except Exception:
+            log.warning("wake: flush failed meeting_id=%s", meeting_id)
+
+    # ── stop meeting (shared stop) ────────────────────────────────────────────
+    meeting, stopped_now = await store.stop_once(meeting_id)  # ← shared stop
+    if stopped_now:
+        await meeting_bus.publish(meeting_id, "status", {"state": "processing"})
+        schedule_finalize(app, meeting_id)
+        log.info("wake-word-listener: finalize scheduled meeting_id=%s pushed_ms=%.0f dropped_ms=%.0f",
+                 meeting_id, ring.stats.pushed_ms, ring.stats.dropped_ms)
+    else:
+        log.info("wake-word-listener: session already stopped meeting_id=%s", meeting_id)
+
+
+def _publish_wake_state(state: WakeState) -> None:
+    try:
+        from app.local import events
+        events.publish("wake_state", {
+            "state": state.value, "model": _WAKE_MODEL, "phrase": "hey_vox"
+        }, broadcast=True)
     except Exception:
-        log.exception("transcription failed in wake loop")
-        return ""
+        pass
 
 
 def _play_chime(path: str) -> None:
     try:
         subprocess.run(["afplay", path], check=False, timeout=3)
     except Exception:
-        pass  # chime failure must never crash the loop
+        pass
 
 
 def _drain(q: asyncio.Queue) -> None:
