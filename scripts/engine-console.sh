@@ -11,40 +11,41 @@ TIMEOUT="${ENGINE_READY_TIMEOUT:-30}"
 CMD="${1:-help}"
 COMPONENT="voxscribe-engine"
 
-# ── ANSI palette ──────────────────────────────────────────────────────────────
-ORANGE='\033[38;5;208m'
-AMBER='\033[1;33m'
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-BLUE='\033[34m'
-DIM='\033[2m'
-BOLD='\033[1m'
-RESET='\033[0m'
+# ── ANSI palette (ideascribe brand: #0066CC blue) ─────────────────────────────
+# Use $'...' so bash stores the actual ESC character (octal 033), not a literal backslash.
+BLUE=$'\033[38;2;0;102;204m'      # #0066CC primary blue -- borders, accents
+BLUE_LT=$'\033[38;2;10;132;255m'  # #0A84FF lighter blue -- headings
+GREEN=$'\033[38;2;0;122;47m'      # #007A2F success
+AMBER=$'\033[38;2;163;71;0m'      # #A34700 warning
+RED=$'\033[38;2;204;0;0m'         # #CC0000 error
+DIM=$'\033[2m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
 # ── Production-grade structured logger ───────────────────────────────────────
 # Format: YYYY-MM-DDTHH:MM:SSZ  LEVEL  component  message
 _ts() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
-log_info()  { printf "${GREEN}$(_ts)${RESET}  ${BOLD}INFO ${RESET}  ${DIM}${COMPONENT}${RESET}  $*\n"; }
-log_warn()  { printf "${YELLOW}$(_ts)${RESET}  ${AMBER}${BOLD}WARN ${RESET}  ${DIM}${COMPONENT}${RESET}  $*\n"; }
+log_info()  { printf "${BLUE}$(_ts)${RESET}  ${BOLD}INFO ${RESET}  ${DIM}${COMPONENT}${RESET}  $*\n"; }
+log_warn()  { printf "${AMBER}$(_ts)${RESET}  ${AMBER}${BOLD}WARN ${RESET}  ${DIM}${COMPONENT}${RESET}  $*\n"; }
 log_error() { printf "${RED}$(_ts)  ERROR  ${COMPONENT}  $*${RESET}\n" >&2; }
 log_fatal() { log_error "$*"; exit 1; }
 
-# ── Box drawing ───────────────────────────────────────────────────────────────
-W=56
+# ── Box drawing (full terminal width, min 60) ────────────────────────────────
+W=$(( $(tput cols 2>/dev/null || echo 80) - 2 ))
+[ "$W" -lt 58 ] && W=58
 
-_box_top()    { printf "${ORANGE}┌"; printf '─%.0s' $(seq 1 $W); printf "┐${RESET}\n"; }
-_box_mid()    { printf "${ORANGE}├"; printf '─%.0s' $(seq 1 $W); printf "┤${RESET}\n"; }
-_box_bot()    { printf "${ORANGE}└"; printf '─%.0s' $(seq 1 $W); printf "┘${RESET}\n"; }
-_box_sep()    { printf "${ORANGE}"; printf '─%.0s' $(seq 1 $(( W + 2 ))); printf "${RESET}\n"; }
+_box_top()    { printf "${BLUE}╭"; printf '─%.0s' $(seq 1 $W); printf "╮${RESET}\n"; }
+_box_mid()    { printf "${BLUE}├"; printf '─%.0s' $(seq 1 $W); printf "┤${RESET}\n"; }
+_box_bot()    { printf "${BLUE}╰"; printf '─%.0s' $(seq 1 $W); printf "╯${RESET}\n"; }
+_box_sep()    { printf "${BLUE}"; printf '─%.0s' $(seq 1 $(( W + 2 ))); printf "${RESET}\n"; }
 _box_row() {
   # Print a box row, stripping ANSI escapes for width calculation
   local raw="$1"
   local visible; visible=$(printf "%s" "$raw" | sed 's/\x1b\[[0-9;]*m//g')
   local pad=$(( W - 2 - ${#visible} ))
   [ $pad -lt 0 ] && pad=0
-  printf "${ORANGE}│${RESET} %s%${pad}s ${ORANGE}│${RESET}\n" "$raw" ""
+  printf "${BLUE}│${RESET} %s%${pad}s ${BLUE}│${RESET}\n" "$raw" ""
 }
 _box_blank()  { _box_row ""; }
 
@@ -72,7 +73,7 @@ _banner() {
     | sed 's|postgresql://[^@]*@||' | cut -c1-28)
 
   local -a info=(
-    "port    ${AMBER}${PORT}${RESET}"
+    "port    ${BLUE_LT}${PORT}${RESET}"
     "db      ${DIM}${db_short}${RESET}"
     "log     ${DIM}${LOG}${RESET}"
     ""
@@ -81,7 +82,7 @@ _banner() {
 
   echo ""
   _box_top
-  _box_row "${BOLD}${AMBER}  VoxScribe Engine${ver_str}${RESET}"
+  _box_row "${BOLD}${BLUE_LT}  VoxScribe Engine${ver_str}${RESET}"
   _box_mid
 
   local col1=11
@@ -92,7 +93,7 @@ _banner() {
     local inf_vis; inf_vis=$(printf "%s" "$inf" | sed 's/\x1b\[[0-9;]*m//g')
     local pad=$(( W - col1 - 3 - ${#inf_vis} ))
     [ $pad -lt 0 ] && pad=0
-    printf "${ORANGE}│${RESET} ${ORANGE}%s${RESET}  %s%${pad}s ${ORANGE}│${RESET}\n" \
+    printf "${BLUE}│${RESET} ${BLUE}%s${RESET}  %s%${pad}s ${BLUE}│${RESET}\n" \
       "$mic" "$inf" ""
   done
 
@@ -226,7 +227,7 @@ cmd_status() {
   local pid; pid=$(_engine_pid)
   _box_top
   if [ -n "$pid" ]; then
-    _box_row "  ${GREEN}running${RESET}  pid=${AMBER}${pid}${RESET}  port=${AMBER}${PORT}${RESET}"
+    _box_row "  ${GREEN}running${RESET}  pid=${BLUE_LT}${pid}${RESET}  port=${BLUE_LT}${PORT}${RESET}"
     local json; json=$(_fetch_health 2>/dev/null || true)
     if [ -n "$json" ]; then
       _print_health "$json"
@@ -263,14 +264,14 @@ cmd_logs() {
 cmd_help() {
   echo ""
   _box_top
-  _box_row "  ${BOLD}${AMBER}VoxScribe Engine${RESET}  management commands"
+  _box_row "  ${BOLD}${BLUE_LT}VoxScribe Engine${RESET}  management commands"
   _box_mid
-  _box_row "  ${AMBER}make engine${RESET}          start engine, then tail log"
-  _box_row "  ${AMBER}make engine-restart${RESET}  kill, restart, then tail log"
-  _box_row "  ${AMBER}make engine-stop${RESET}     stop the engine"
-  _box_row "  ${AMBER}make engine-status${RESET}   running state and health summary"
-  _box_row "  ${AMBER}make engine-health${RESET}   GET /v1/health and render result"
-  _box_row "  ${AMBER}make engine-logs${RESET}     tail the engine log file"
+  _box_row "  ${BLUE}make engine${RESET}          start engine, then tail log"
+  _box_row "  ${BLUE}make engine-restart${RESET}  kill, restart, then tail log"
+  _box_row "  ${BLUE}make engine-stop${RESET}     stop the engine"
+  _box_row "  ${BLUE}make engine-status${RESET}   running state and health summary"
+  _box_row "  ${BLUE}make engine-health${RESET}   GET /v1/health and render result"
+  _box_row "  ${BLUE}make engine-logs${RESET}     tail the engine log file"
   _box_blank
   _box_row "  ${DIM}ENGINE_PORT=${PORT}   ENGINE_LOG=${LOG}${RESET}"
   _box_row "  ${DIM}VOXSCRIBE_TOKEN loaded from .env automatically${RESET}"
