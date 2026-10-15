@@ -241,6 +241,8 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
             max_segment_ms=getattr(settings, "live_max_segment_ms", 15000) or None,
         )
 
+    _turn_texts: list[str] = []  # accumulate stable text for LLM input
+
     async def _publish_stable(segs):
         for seg in segs:
             db = Segment(id=seg.id, startMs=seg.start_ms, endMs=seg.end_ms,
@@ -255,6 +257,8 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
                 "source": db.source, "speaker": db.speaker,
                 "text": db.text, "state": db.state,
             })
+            if db.text:
+                _turn_texts.append(db.text)
 
     async def _consumer():
         while True:
@@ -294,6 +298,7 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
 
     # Any exception after start_meeting must still call stop_once so the meeting
     # does not stay stuck in "recording" status forever (CK6 fix).
+    _turn_end_ms: int = 0
     try:
         try:
             while True:
@@ -329,6 +334,7 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
         except asyncio.TimeoutError:
             log.info("wake-word-listener: audio timeout -- ending session")
 
+        _turn_end_ms = _mono_ms()
         await _play_chime_async(_CHIME_END)
 
         # drain consumer
@@ -346,6 +352,13 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
                 await _publish_stable(tail)
             except Exception:
                 log.warning("wake: flush failed meeting_id=%s", meeting_id)
+
+        # launch reply chain as background task (LLM -> gate -> TTS -> playback)
+        turn_text = " ".join(_turn_texts).strip()
+        asyncio.create_task(
+            _run_reply_safe(app, meeting_id, turn_text, _turn_end_ms),
+            name=f"reply-{meeting_id[:8]}",
+        )
 
     finally:
         # ── stop meeting (shared stop) — always runs after start_meeting ─────
@@ -384,6 +397,14 @@ async def _play_chime_async(path: str) -> None:
         await asyncio.to_thread(subprocess.run, ["afplay", path], check=False, timeout=3)
     except Exception:
         pass
+
+
+async def _run_reply_safe(app, meeting_id: str, turn_text: str, turn_end_ms: int) -> None:
+    try:
+        from app.local.reply_chain import run_reply
+        await run_reply(app, meeting_id, turn_text, turn_end_ms)
+    except Exception:
+        log.exception("wake: reply chain failed meeting_id=%s", meeting_id)
 
 
 def _drain(q: asyncio.Queue) -> None:
