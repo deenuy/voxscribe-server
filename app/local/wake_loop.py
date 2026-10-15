@@ -93,6 +93,9 @@ async def run_wake_loop(app) -> None:
         raise
 
 
+_BARGE_RATIO = 2.5   # mic_rms / playback_rms threshold for barge-in detection
+
+
 async def _inner(app) -> None:
     try:
         import numpy as np
@@ -115,69 +118,102 @@ async def _inner(app) -> None:
 
     _publish_wake_state(WakeState.ARMED)
 
-    loop = asyncio.get_running_loop()
-    audio_q: asyncio.Queue = asyncio.Queue(maxsize=512)
+    # Use AudioEngine.subscribe() if available (single mic stream per process).
+    # Fall back to direct sd.InputStream when AudioEngine is not started.
+    engine = getattr(app.state, "audio_engine", None)
 
-    def _cb(indata, frames, t, status):
-        if status:
-            log.debug("sounddevice status: %s", status)
+    async def _run_with_engine(engine):
+        audio_q = engine.subscribe()
         try:
-            loop.call_soon_threadsafe(audio_q.put_nowait, indata[:, 0].copy())
-        except asyncio.QueueFull:
-            pass
+            await _mic_loop(app, audio_q, oww, np, engine=engine)
+        finally:
+            engine.unsubscribe(audio_q)
 
-    with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1,
-                        dtype="float32", blocksize=_CHUNK_FRAMES, callback=_cb):
-        log.info("wake-word-listener: mic open state=ARMED")
-        above = 0
+    async def _run_with_direct_stream():
+        loop = asyncio.get_running_loop()
+        audio_q: asyncio.Queue = asyncio.Queue(maxsize=512)
 
-        while True:
-            if _state["state"] == WakeState.OFF:
-                log.info("wake-word-listener: disarmed -- closing mic")
-                return
-
-            chunk = await audio_q.get()
-            rms = float((chunk ** 2).mean() ** 0.5)
-
-            if rms < _RMS_FLOOR:
-                above = 0
-                continue
-
-            scores = await asyncio.to_thread(oww.predict, chunk)
-            best = max(scores.values()) if scores else 0.0
-
-            above = above + 1 if best >= _THRESHOLD else 0
-            if above < _PATIENCE:
-                continue
-
-            above = 0
-            triggered_ms = int(time.monotonic() * 1000)
-            log.info("wake-word-listener: DETECTED score=%.3f model=%s monotonic_ms=%d",
-                     best, _WAKE_MODEL, triggered_ms)
-
-            # B4.7: ignore trigger while already listening
-            if _state["state"] == WakeState.LISTENING:
-                log.info("wake-word-listener: already LISTENING -- ignored (B4.7)")
-                continue
-
-            await _play_chime_async(_CHIME_ACK)
-            chime_done_ms = int(time.monotonic() * 1000)
-            log.info("wake-word-listener: chime latency=%d ms", chime_done_ms - triggered_ms)
-            await asyncio.sleep(0.2)
-            _drain(audio_q)
-
-            _publish_wake_state(WakeState.LISTENING)
-
+        def _cb(indata, frames, t, status):
+            if status:
+                log.debug("sounddevice status: %s", status)
             try:
-                await _run_session(app, audio_q, best, np)
-            except Exception:
-                log.exception("wake-word-listener: session failed")
-                await _play_chime_async(_CHIME_ERR)
-            finally:
-                set_state(WakeState.ARMED)
-                _publish_wake_state(WakeState.ARMED)
-                log.info("wake-word-listener: back to ARMED")
-                _drain(audio_q)
+                loop.call_soon_threadsafe(audio_q.put_nowait, indata[:, 0].copy())
+            except asyncio.QueueFull:
+                pass
+
+        with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1,
+                            dtype="float32", blocksize=_CHUNK_FRAMES, callback=_cb):
+            log.info("wake-word-listener: mic open (direct stream) state=ARMED")
+            await _mic_loop(app, audio_q, oww, np, engine=None)
+
+    if engine is not None:
+        log.info("wake-word-listener: mic via AudioEngine.subscribe()")
+        await _run_with_engine(engine)
+    else:
+        log.info("wake-word-listener: mic via direct sd.InputStream")
+        await _run_with_direct_stream()
+
+
+async def _mic_loop(app, audio_q: asyncio.Queue, oww, np, *, engine) -> None:
+    """Core detection loop. Runs under either AudioEngine or direct stream."""
+    above = 0
+
+    while True:
+        if _state["state"] == WakeState.OFF:
+            log.info("wake-word-listener: disarmed -- closing mic")
+            return
+
+        chunk = await audio_q.get()
+        rms = float((chunk ** 2).mean() ** 0.5)
+
+        # P1 barge-in: energy-over-echo-estimate gate stops playback.
+        if engine is not None and engine.is_playing and rms > _RMS_FLOOR:
+            pb_ref = engine.playback_ref()
+            if pb_ref:
+                pb_rms = float((np.array(pb_ref) ** 2).mean() ** 0.5)
+                if rms > _BARGE_RATIO * max(pb_rms, 1e-6):
+                    log.info("wake: barge-in detected mic_rms=%.4f pb_rms=%.4f", rms, pb_rms)
+                    engine.cancel_playback()
+
+        if rms < _RMS_FLOOR:
+            above = 0
+            continue
+
+        scores = await asyncio.to_thread(oww.predict, chunk)
+        best = max(scores.values()) if scores else 0.0
+
+        above = above + 1 if best >= _THRESHOLD else 0
+        if above < _PATIENCE:
+            continue
+
+        above = 0
+        triggered_ms = int(time.monotonic() * 1000)
+        log.info("wake-word-listener: DETECTED score=%.3f model=%s monotonic_ms=%d",
+                 best, _WAKE_MODEL, triggered_ms)
+
+        # B4.7: ignore trigger while already listening
+        if _state["state"] == WakeState.LISTENING:
+            log.info("wake-word-listener: already LISTENING -- ignored (B4.7)")
+            continue
+
+        await _play_chime_async(_CHIME_ACK)
+        chime_done_ms = int(time.monotonic() * 1000)
+        log.info("wake-word-listener: chime latency=%d ms", chime_done_ms - triggered_ms)
+        await asyncio.sleep(0.2)
+        _drain(audio_q)
+
+        _publish_wake_state(WakeState.LISTENING)
+
+        try:
+            await _run_session(app, audio_q, best, np)
+        except Exception:
+            log.exception("wake-word-listener: session failed")
+            await _play_chime_async(_CHIME_ERR)
+        finally:
+            set_state(WakeState.ARMED)
+            _publish_wake_state(WakeState.ARMED)
+            log.info("wake-word-listener: back to ARMED")
+            _drain(audio_q)
 
 
 async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> None:

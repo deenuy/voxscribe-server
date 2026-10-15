@@ -149,6 +149,23 @@ class AudioEngine:
     # ------------------------------------------------------------------
     # public: playback
 
+    @property
+    def is_playing(self) -> bool:
+        """True while the playback queue has samples or the task is draining."""
+        return not self._playback_q.empty()
+
+    def cancel_playback(self) -> None:
+        """Discard all queued playback samples (barge-in gate, P1)."""
+        discarded = 0
+        while not self._playback_q.empty():
+            try:
+                self._playback_q.get_nowait()
+                discarded += 1
+            except asyncio.QueueEmpty:
+                break
+        if discarded:
+            log.info("audio_engine: playback cancelled discarded=%d chunks", discarded)
+
     async def play(self, samples, *, block: bool = False) -> None:
         """Enqueue float32 samples for playback.
 

@@ -34,9 +34,18 @@ async def lifespan(app: FastAPI):
     """FastAPI lifespan context manager."""
     log.info("engine startup: initializing components")
 
-    # Start wake word listener if enabled
+    # Start AudioEngine (single mic + speaker stream) when wake is enabled.
     wake_task = None
     if getattr(app.state, "wake_enabled", False):
+        try:
+            from app.local.audio_engine import AudioEngine
+            engine = AudioEngine()
+            await engine.start()
+            app.state.audio_engine = engine
+            log.info("audio-engine: started (capture+playback)")
+        except Exception as exc:
+            log.warning("audio-engine: could not start -- wake loop will use direct stream: %s", exc)
+
         from app.local.wake_loop import run_wake_loop
         log.info("wake-word-listener: initializing -- model=hey_jarvis")
         wake_task = asyncio.create_task(run_wake_loop(app), name="wake-loop")
@@ -85,6 +94,9 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "ingestion_worker"):
         await app.state.ingestion_worker.stop()
         log.info("ingestion-worker: stopped")
+    if hasattr(app.state, "audio_engine"):
+        await app.state.audio_engine.stop()
+        log.info("audio-engine: stopped")
     if hasattr(app.state, "store"):
         await app.state.store.close()
     log.info("engine shutdown: complete")
