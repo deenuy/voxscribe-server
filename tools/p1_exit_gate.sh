@@ -16,6 +16,26 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPORT_DIR="${TMPDIR:-/tmp}/p1_gate_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$REPORT_DIR"
 
+# Poll /v1/wake/state until not 'listening' (session closed and engine armed).
+# Usage: wait_for_armed <engine_url> [timeout_s]
+wait_for_armed() {
+  local url="$1/v1/wake/state"
+  local timeout="${2:-90}"
+  local elapsed=0
+  while [ $elapsed -lt $timeout ]; do
+    local state
+    state=$(curl -sf "$url" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('state',''))" 2>/dev/null || true)
+    if [ "$state" != "listening" ] && [ -n "$state" ]; then
+      echo "    engine state: $state (ready)"
+      return 0
+    fi
+    sleep 0.5
+    elapsed=$((elapsed + 1))
+  done
+  echo "    WARNING: wait_for_armed timed out after ${timeout}s"
+  return 1
+}
+
 echo "=== P1 EXIT GATE ==="
 echo "report dir: $REPORT_DIR"
 echo ""
@@ -62,7 +82,7 @@ uv run tools/roomplay.py \
   --report "$REPORT_DIR/run1_c3_sweep.json" || echo "WARNING: run1 had errors"
 
 echo ""
-sleep 3.0
+wait_for_armed "$ENGINE_URL"
 
 # -- run 2: disfluency pair (C3 hard case) ----------------------------------
 echo "[2/4] RUN 2 -- two disfluency utterances (um inside pause)"
@@ -78,7 +98,7 @@ for LABEL in "um_3s" "um_8s"; do
     --engine-url "$ENGINE_URL" \
     --label "$LABEL" \
     --report "$REPORT_DIR/run2_$LABEL.json" || echo "WARNING: $LABEL had errors"
-  sleep 4.0
+  wait_for_armed "$ENGINE_URL"
 done
 
 echo ""

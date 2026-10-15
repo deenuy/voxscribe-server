@@ -289,6 +289,29 @@ def _trigger_session(engine_base_url: str) -> bool:
         return False
 
 
+def _wait_for_armed(engine_base_url: str, timeout_s: float = 60.0) -> bool:
+    """Poll GET /v1/wake/state until state is not 'listening' (session closed).
+
+    Returns True if state reached 'armed', False if timeout or error.
+    """
+    import urllib.request, urllib.error, json as _json
+    url = f"{engine_base_url}/v1/wake/state"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                body = _json.loads(resp.read())
+                state = body.get("state", "")
+                if state != "listening":
+                    log.info("engine state: %s (ready for next run)", state)
+                    return True
+        except Exception as exc:
+            log.debug("state poll error: %s", exc)
+        time.sleep(0.5)
+    log.warning("_wait_for_armed: timed out after %.0fs", timeout_s)
+    return False
+
+
 def run_one(
     utterance_path: Path,
     utterance_dur_s: float,
@@ -505,8 +528,11 @@ def main() -> int:
                 result = run_one(wav_path, dur, stop_at_s=args.stop_at,
                                  label=label, engine_base_url=engine_base_url)
                 results.append(result)
-                # brief gap between runs
-                time.sleep(2.0)
+                # wait for engine to return to armed state before next trigger
+                if engine_base_url and i < len(pause_values) - 1:
+                    _wait_for_armed(engine_base_url, timeout_s=90.0)
+                else:
+                    time.sleep(2.0)
         else:
             wav_path = tmpdir_path / "utterance.wav"
             log.info("building utterance ...")
