@@ -24,7 +24,6 @@ VOXSCRIBE_CAPTURE_DEVICE="MacBook Pro Microphone" \
 VOXSCRIBE_PLAYBACK_DEVICE="MacBook Pro Speakers" \
 VOXSCRIBE_VOICE_MODE="seniorcare" \
 VOXSCRIBE_VOICE_REPLY_MODEL="llama3.2" \
-VOXSCRIBE_VOICE_USE_TURN_DETECTOR="false" \
   uv run python -m app.local.engine --wake --no-auth --port 0 \
   > "$LOG_DIR/engine.log" 2>&1 &
 ENGINE_PID=$!
