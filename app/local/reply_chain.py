@@ -3,35 +3,60 @@
 Called as a background task after turn close in wake_loop._run_session.
 
 Pipeline per turn:
-  1. Call LLM (Ollama streaming) with the user's transcript text.
-  2. Collect the full reply (gate needs the complete text before playback).
-  3. Gate check (gate.check): mode-aware, injection-resistant regex. G1-G5 satisfied.
-  4. Write rows: turns, replies, gate_decisions, latency_ledger. Behaviour log (G6).
-  5. TTS and play via tts_engine.synthesize_and_play.
+  1. LLM streams tokens; split into sentences at punctuation boundaries.
+  2. Gate each sentence as it arrives (per-sentence check, mode-aware).
+  3. If gate passes: synthesize with Kokoro + play. First audio starts
+     before LLM finishes generating (V1-P01 clause-level streaming).
+  4. If gate refuses any sentence: cancel playback, play fixed refusal phrase.
+  5. Write rows: turns, replies, gate_decisions, latency_ledger. Behaviour log.
   6. Publish reply event over meeting_bus.
 
 Latency budget (idle MacBook): turn_end to first_audio under 1.5 s.
-This is P1 bar (adult); seniorcare bar is 1.5 s.
-
-TTS is macOS 'say' stub (see tts_engine.py).
-LLM is Ollama streaming (see llm_adapter.py).
-
-LIMITS:
-- Streaming TTS (first clause while LLM generates rest) deferred to P4.
-  R6 collects the full reply before synthesizing.
-- Playback reference for echo cancellation wired in R7 / P4.
+TTS: Kokoro-ONNX primary, macOS say fallback (see tts_engine.py).
+LLM: Ollama streaming (see llm_adapter.py).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 log = logging.getLogger("app.local.reply_chain")
 
-_OLLAMA_TIMEOUT_S = 10.0
+_OLLAMA_TIMEOUT_S  = 10.0
+_FALLBACK_PHRASE   = "I'm sorry, I didn't catch that. Could you say it again?"
+_SENTENCE_RE       = re.compile(r'[.!?]["\')\]]*\s+')
+
+
+async def _sentence_stream(
+    user_text: str,
+    model: str,
+    timeout_s: float,
+) -> AsyncIterator[str]:
+    """Stream LLM tokens and yield complete sentences at punctuation boundaries."""
+    from app.local.llm_adapter import stream_reply
+
+    buf = ""
+    try:
+        async with asyncio.timeout(timeout_s):
+            async for token in stream_reply(user_text, model=model):
+                buf += token
+                while True:
+                    m = _SENTENCE_RE.search(buf)
+                    if not m:
+                        break
+                    sentence = buf[: m.end()].strip()
+                    buf = buf[m.end():]
+                    if sentence:
+                        yield sentence
+    except TimeoutError:
+        log.warning("reply_chain: LLM stream timed out")
+    if buf.strip():
+        yield buf.strip()
 
 
 async def warm_phrase_cache() -> None:
@@ -64,7 +89,6 @@ async def run_reply(
     Publishes reply event on meeting_bus.
     Errors are logged and suppressed; the wake loop does not depend on this completing.
     """
-    from app.local.llm_adapter import collect_reply
     from app.local.tts_engine import synthesize_and_play, play_prerendered, prerender_phrase
     from app.local import meeting_bus, gate
     from app.local.audio_engine import monotonic_ms
@@ -94,33 +118,86 @@ async def run_reply(
     except Exception:
         log.exception("reply_chain: failed to write turn row meeting_id=%s", meeting_id)
 
-    # ── 2. LLM ───────────────────────────────────────────────────────────────
+    # ── 2-5. LLM stream → gate per sentence → Kokoro → play ─────────────────
+    # Gate each sentence as it arrives. First audio starts before LLM finishes
+    # generating (V1-P01 clause-level streaming). If any sentence is refused,
+    # cancel playback and play the fixed refusal phrase.
+
     llm_first_token_ms: int | None = None
+    tts_first_audio_ms: int | None = None
+    playback_end_ms: int | None = None
     reply_text = _FALLBACK_PHRASE
+    decision = "pass"
+    gate_category = "ok"
+    all_sentences: list[str] = []
 
-    if user_text.strip():
-        try:
-            llm_start_ms = monotonic_ms()
-            reply_text = await collect_reply(user_text, model=model,
-                                             timeout_s=_OLLAMA_TIMEOUT_S)
-            llm_first_token_ms = llm_start_ms  # best approximation (collected, not streamed)
-            log.info("reply_chain: LLM reply len=%d model=%s", len(reply_text), model)
-        except Exception:
-            log.exception("reply_chain: LLM failed, using fallback meeting_id=%s", meeting_id)
-            reply_text = _FALLBACK_PHRASE
-    else:
+    if not user_text.strip():
         log.info("reply_chain: empty user_text, using fallback meeting_id=%s", meeting_id)
-
-    # ── 3. Gate (G2-G5) ──────────────────────────────────────────────────────
-    decision, category = gate.check(user_text or "", reply_text, mode=mode)
-    if decision != "pass":
-        log.info("reply_chain: gate refused category=%s mode=%s meeting_id=%s",
-                 category, mode, meeting_id)
-        reply_text = gate.refusal_phrase(category, mode)
         decision = "refuse"
+        gate_category = "empty"
+        reply_text = gate.refusal_phrase("empty", mode)
+    else:
+        llm_start_ms = monotonic_ms()
+        try:
+            async for sentence in _sentence_stream(user_text, model, _OLLAMA_TIMEOUT_S):
+                if llm_first_token_ms is None:
+                    llm_first_token_ms = monotonic_ms()
 
-    gate_category = category
+                # Gate each sentence before speaking it
+                s_decision, s_category = gate.check(user_text, sentence, mode=mode)
+                if s_decision != "pass":
+                    decision = "refuse"
+                    gate_category = s_category
+                    reply_text = gate.refusal_phrase(s_category, mode)
+                    log.info("reply_chain: gate refused sentence category=%s mode=%s",
+                             s_category, mode)
+                    if audio_engine is not None and all_sentences:
+                        audio_engine.cancel_playback()
+                    break
+
+                all_sentences.append(sentence)
+
+                if audio_engine is not None:
+                    try:
+                        s_dur = await synthesize_and_play(sentence, audio_engine)
+                        if tts_first_audio_ms is None:
+                            tts_first_audio_ms = monotonic_ms()
+                            log.info("reply_chain: first audio at +%d ms from turn_end",
+                                     tts_first_audio_ms - turn_end_ms)
+                    except Exception:
+                        log.exception("reply_chain: TTS failed for sentence meeting_id=%s",
+                                      meeting_id)
+        except Exception:
+            log.exception("reply_chain: LLM stream failed meeting_id=%s", meeting_id)
+
+        if not all_sentences and decision == "pass":
+            log.warning("reply_chain: LLM produced no sentences, using fallback")
+            reply_text = _FALLBACK_PHRASE
+        elif decision == "pass":
+            reply_text = " ".join(all_sentences)
+
     decided_z = _now_z()
+
+    # Gate refusal: play fixed phrase (pre-rendered, zero synthesis latency)
+    if decision == "refuse" and audio_engine is not None:
+        try:
+            phrase_path = await prerender_phrase(reply_text)
+            if phrase_path is not None:
+                if tts_first_audio_ms is None:
+                    tts_first_audio_ms = monotonic_ms()
+                await play_prerendered(phrase_path, audio_engine)
+            else:
+                if tts_first_audio_ms is None:
+                    tts_first_audio_ms = monotonic_ms()
+                await synthesize_and_play(reply_text, audio_engine)
+        except Exception:
+            log.exception("reply_chain: refusal playback failed meeting_id=%s", meeting_id)
+
+    if audio_engine is not None:
+        playback_end_ms = monotonic_ms()
+
+    log.info("reply_chain: reply_len=%d decision=%s meeting_id=%s",
+             len(reply_text), decision, meeting_id)
 
     # ── 4. Write replies + gate_decisions rows + behaviour log (G1, G6) ───────
     try:
@@ -135,7 +212,7 @@ async def run_reply(
                 " (id, reply_id, meeting_id, mode, input_text, decision, category, decided_at)"
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 (gate_id, reply_id, meeting_id, mode,
-                 (user_text or "")[:1000], decision, category, decided_z),
+                 (user_text or "")[:1000], decision, gate_category, decided_z),
             )
             await conn.commit()
     except Exception:
@@ -146,32 +223,8 @@ async def run_reply(
         turn_n=turn_n,
         mode=mode,
         decision=decision,
-        category=category,
+        category=gate_category,
     )
-
-    # ── 5. TTS + playback (pre-rendered for gate refusals) ──────────────────
-    tts_first_audio_ms: int | None = None
-    playback_end_ms: int | None = None
-
-    if audio_engine is not None:
-        try:
-            tts_start_ms = monotonic_ms()
-            tts_first_audio_ms = tts_start_ms
-            if decision == "refuse":
-                # Use pre-rendered WAV: zero synthesis time for fixed phrases (V1-P03)
-                phrase_path = await prerender_phrase(reply_text)
-                if phrase_path is not None:
-                    duration_s = await play_prerendered(phrase_path, audio_engine)
-                else:
-                    duration_s = await synthesize_and_play(reply_text, audio_engine)
-            else:
-                duration_s = await synthesize_and_play(reply_text, audio_engine)
-            playback_end_ms = monotonic_ms()
-            log.info("reply_chain: played duration=%.2f s meeting_id=%s", duration_s, meeting_id)
-        except Exception:
-            log.exception("reply_chain: TTS/playback failed meeting_id=%s", meeting_id)
-    else:
-        log.warning("reply_chain: no audio_engine, skipping TTS meeting_id=%s", meeting_id)
 
     # ── 6. Write played_at + latency ledger ──────────────────────────────────
     try:
@@ -204,7 +257,7 @@ async def run_reply(
             "text": reply_text,
             "turn_n": turn_n,
             "gate": decision,
-            "category": category,
+            "category": gate_category,
         })
     except Exception:
         log.warning("reply_chain: failed to publish reply event meeting_id=%s", meeting_id)
