@@ -83,13 +83,15 @@ class Config:
     def tenancy_enforced(self) -> bool:
         return bool(self.identity_issuer and self.identity_audience and self.identity_jwks_url)
 
-    # Voice (planned, accepted but unused)
+    # Voice
     voice_enabled: bool = False
     tts_engine: str = "piper"
     tts_voice: str = ""
     voice_barge_in: bool = True
     voice_echo_guard: bool = True
     voice_max_reply_seconds: int = 20
+    voice_mode: str = "default"          # default | classroom | seniorcare
+    voice_reply_model: str = "llama3.2"  # 3B-4B class for spoken replies
 
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "Config":
@@ -264,6 +266,16 @@ class Config:
         config_dict["voice_max_reply_seconds"] = _parse_int(
             env_vars, "VOXSCRIBE_VOICE_MAX_REPLY_SECONDS", 20
         )
+
+        voice_mode = env_vars.get("VOXSCRIBE_VOICE_MODE", "").strip().lower()
+        if voice_mode:
+            if voice_mode not in ("default", "classroom", "seniorcare"):
+                _fail("VOXSCRIBE_VOICE_MODE", f"must be default|classroom|seniorcare, got {voice_mode!r}")
+            config_dict["voice_mode"] = voice_mode
+
+        voice_reply_model = env_vars.get("VOXSCRIBE_VOICE_REPLY_MODEL", "").strip()
+        if voice_reply_model:
+            config_dict["voice_reply_model"] = voice_reply_model
 
         return cls(**config_dict)
 
