@@ -184,7 +184,8 @@ def _latest_meeting_after(conn, since_z: str) -> dict | None:
 
 def _ledger_row(conn, meeting_id: str) -> dict | None:
     row = conn.execute(
-        "SELECT turn_end_ms, llm_first_token_ms, tts_first_audio_ms, "
+        "SELECT turn_end_ms, asr_final_ms, llm_request_sent_ms,"
+        "       llm_first_token_ms, tts_first_audio_ms, "
         "       playback_end_ms, recorded_at "
         "FROM latency_ledger WHERE meeting_id = %s "
         "ORDER BY recorded_at DESC LIMIT 1",
@@ -193,11 +194,13 @@ def _ledger_row(conn, meeting_id: str) -> dict | None:
     if row is None:
         return None
     return {
-        "turn_end_ms":       row[0],
-        "llm_first_token_ms": row[1],
-        "tts_first_audio_ms": row[2],
-        "playback_end_ms":   row[3],
-        "recorded_at":       str(row[4]),
+        "turn_end_ms":          row[0],
+        "asr_final_ms":         row[1],
+        "llm_request_sent_ms":  row[2],
+        "llm_first_token_ms":   row[3],
+        "tts_first_audio_ms":   row[4],
+        "playback_end_ms":      row[5],
+        "recorded_at":          str(row[6]),
     }
 
 

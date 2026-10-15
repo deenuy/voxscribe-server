@@ -83,6 +83,7 @@ async def run_reply(
     turn_end_ms: int,
     turn_n: int = 1,
     mode: str = "default",
+    asr_final_ms: int | None = None,
 ) -> None:
     """Background task: generate and play spoken reply for one wake turn.
 
@@ -134,6 +135,7 @@ async def run_reply(
     # cancel playback and play the fixed refusal phrase.
 
     llm_first_token_ms: int | None = None
+    llm_request_sent_ms: int | None = None
     tts_first_audio_ms: int | None = None
     playback_end_ms: int | None = None
     reply_text = _FALLBACK_PHRASE
@@ -147,7 +149,7 @@ async def run_reply(
         gate_category = "empty"
         reply_text = gate.refusal_phrase("empty", mode)
     else:
-        llm_start_ms = monotonic_ms()
+        llm_request_sent_ms = monotonic_ms()
         try:
             async for sentence in _sentence_stream(user_text, model, _OLLAMA_TIMEOUT_S):
                 if llm_first_token_ms is None:
@@ -250,10 +252,12 @@ async def run_reply(
             )
             await conn.execute(
                 "INSERT INTO latency_ledger"
-                " (id, meeting_id, turn_n, turn_end_ms, llm_first_token_ms,"
+                " (id, meeting_id, turn_n, turn_end_ms, asr_final_ms,"
+                "  llm_request_sent_ms, llm_first_token_ms,"
                 "  tts_first_audio_ms, playback_end_ms, recorded_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (ledger_id, meeting_id, turn_n, turn_end_ms, llm_first_token_ms,
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (ledger_id, meeting_id, turn_n, turn_end_ms, asr_final_ms,
+                 llm_request_sent_ms, llm_first_token_ms,
                  tts_first_audio_ms, playback_end_ms, played_z),
             )
             await conn.commit()

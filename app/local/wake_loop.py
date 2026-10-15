@@ -118,10 +118,11 @@ async def _inner(app) -> None:
 
     _publish_wake_state(WakeState.ARMED)
 
-    # Pre-warm the reply model so the first wake turn doesn't pay a cold-load penalty.
+    # Pre-warm reply model and Kokoro so first wake turn hits resident models.
     settings = getattr(app.state, "settings", None)
     reply_model = getattr(settings, "voice_reply_model", "llama3.2")
     asyncio.create_task(_prewarm_llm(reply_model), name="llm-prewarm")
+    asyncio.create_task(_prewarm_kokoro(), name="kokoro-prewarm")
 
     # Use AudioEngine.subscribe() if available (single mic stream per process).
     # Fall back to direct sd.InputStream when AudioEngine is not started.
@@ -400,10 +401,16 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
             except Exception:
                 log.warning("wake: flush failed meeting_id=%s", meeting_id)
 
+        # Record when ASR is fully ready (flush done, turn_texts populated).
+        # This splits the turn_end → llm_first_token gap into:
+        #   [turn_end → asr_final] ASR/consumer drain  +  [asr_final → llm_first_token] LLM warm-up.
+        _asr_final_ms = _mono_ms()
+
         # launch reply chain as background task (LLM -> gate -> TTS -> playback)
         turn_text = " ".join(_turn_texts).strip()
         asyncio.create_task(
-            _run_reply_safe(app, meeting_id, turn_text, _turn_end_ms),
+            _run_reply_safe(app, meeting_id, turn_text, _turn_end_ms,
+                            asr_final_ms=_asr_final_ms),
             name=f"reply-{meeting_id[:8]}",
         )
 
@@ -446,10 +453,12 @@ async def _play_chime_async(path: str) -> None:
         pass
 
 
-async def _run_reply_safe(app, meeting_id: str, turn_text: str, turn_end_ms: int) -> None:
+async def _run_reply_safe(app, meeting_id: str, turn_text: str, turn_end_ms: int,
+                          asr_final_ms: int | None = None) -> None:
     try:
         from app.local.reply_chain import run_reply
-        await run_reply(app, meeting_id, turn_text, turn_end_ms)
+        await run_reply(app, meeting_id, turn_text, turn_end_ms,
+                        asr_final_ms=asr_final_ms)
     except Exception:
         log.exception("wake: reply chain failed meeting_id=%s", meeting_id)
 
@@ -457,17 +466,35 @@ async def _run_reply_safe(app, meeting_id: str, turn_text: str, turn_end_ms: int
 async def _prewarm_llm(model: str) -> None:
     """Send a one-token request so Ollama loads the reply model into Metal GPU memory.
 
+    Sends the real system prompt so Ollama caches the prefix KV; subsequent
+    requests reuse the cached context and skip prefix prefill (~100-200ms savings).
     Runs once at arm time. keep_alive in llm_adapter keeps it resident between turns.
     Non-critical: failure is logged and ignored.
     """
-    from app.local.llm_adapter import stream_reply
+    from app.local.llm_adapter import stream_reply, _SYSTEM_PROMPT
     try:
         log.info("wake: pre-warming reply model=%s", model)
-        async for _ in stream_reply("hi", model=model):
-            break  # first token is enough; model is now resident
+        async for _ in stream_reply("hi", model=model, system_prompt=_SYSTEM_PROMPT):
+            break  # first token enough; model + system-prompt KV now resident
         log.info("wake: reply model warmed model=%s", model)
     except Exception:
         log.debug("wake: prewarm failed (non-critical) model=%s", model)
+
+
+async def _prewarm_kokoro() -> None:
+    """Synthesize a silent phrase so Kokoro-ONNX loads its model into memory.
+
+    First synthesis after cold start pays a ~300-500ms load penalty; pre-warm
+    eliminates that from the first real reply.
+    Non-critical: failure is logged and ignored.
+    """
+    try:
+        from app.local.tts_engine import prerender_phrase
+        log.info("wake: pre-warming Kokoro TTS")
+        await prerender_phrase("hm")  # _THINKING_PHRASE; already in cache if warmed
+        log.info("wake: Kokoro TTS warmed")
+    except Exception:
+        log.debug("wake: Kokoro prewarm failed (non-critical)")
 
 
 def _drain(q: asyncio.Queue) -> None:
