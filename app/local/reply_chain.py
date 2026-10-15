@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 
 log = logging.getLogger("app.local.reply_chain")
 
-_OLLAMA_TIMEOUT_S  = 10.0
+_OLLAMA_TIMEOUT_S  = 60.0   # gemma4:12b first-token ~11-35s on MacBook Pro under load (no GPU)
 _FALLBACK_PHRASE   = "I'm sorry, I didn't catch that. Could you say it again?"
 _THINKING_PHRASE   = "hm"
 _SENTENCE_RE       = re.compile(r'[.!?]["\')\]]*\s+')

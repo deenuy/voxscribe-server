@@ -1,11 +1,15 @@
 """Wake word state API.
 
-GET  /v1/wake/state   → {state, model, phrase}   states: armed | listening | off | error
-POST /v1/wake/arm     → arm (no-op if already armed/listening)
-POST /v1/wake/disarm  → set state to off; mic stream closes within ~32 ms
+GET  /v1/wake/state     → {state, model, phrase}   states: armed | listening | off | error
+POST /v1/wake/arm       → arm (no-op if already armed/listening)
+POST /v1/wake/disarm    → set state to off; mic stream closes within ~32 ms
+POST /v1/wake/trigger   → DEBUG ONLY (--no-auth). Bypass OWW, start a session immediately.
+                          Returns {meeting_id}. Use for automated roomplay tests.
 """
 
-from fastapi import APIRouter, Request
+import asyncio
+
+from fastapi import APIRouter, HTTPException, Request
 
 from app.local import events
 from app.local.wake_loop import WakeState, get_state, set_state
@@ -43,3 +47,45 @@ async def disarm_wake(_: Request):
     set_state(WakeState.OFF)
     events.publish("wake_state", get_state(), broadcast=True)
     return {"state": WakeState.OFF.value, "changed": True}
+
+
+@router.post("/trigger", status_code=202)
+async def trigger_wake_session(request: Request):
+    """DEBUG ONLY: bypass OWW and start a wake session immediately.
+
+    Only reachable when the server was started with --no-auth.
+    Use for automated roomplay tests where TTS voice doesn't trigger OWW.
+    Returns {meeting_id} immediately; session runs as a background task.
+    """
+    from app.local.wake_loop import _run_session
+    import numpy as np
+
+    app = request.app
+    auth_disabled = getattr(app.state, "auth_disabled", False)
+    if not auth_disabled:
+        raise HTTPException(status_code=403, detail="trigger only available with --no-auth")
+
+    current = get_state()["state"]
+    if current == WakeState.LISTENING:
+        raise HTTPException(status_code=409, detail="session already in progress")
+
+    audio_engine = getattr(app.state, "audio_engine", None)
+    if audio_engine is None:
+        raise HTTPException(status_code=503, detail="audio engine not running")
+
+    # Subscribe to the AudioEngine capture stream for this session
+    audio_q = audio_engine.subscribe()
+
+    async def _session_task():
+        try:
+            await _run_session(app, audio_q, confidence=1.0, np=np)
+        finally:
+            audio_engine.unsubscribe(audio_q)
+
+    task = asyncio.create_task(_session_task(), name="trigger-session")
+
+    # Wait briefly for the session to create its meeting_id (it appears in DB within ~200ms)
+    await asyncio.sleep(0.3)
+
+    # Return state so caller knows it started
+    return {"triggered": True, "state": get_state()["state"].value}

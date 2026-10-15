@@ -18,3 +18,8 @@ CREATE INDEX ix_wake_events_meeting   ON wake_events(started_meeting_id)
 ALTER TABLE meetings
     ADD COLUMN IF NOT EXISTS consent_version TEXT,
     ADD COLUMN IF NOT EXISTS consent_at      TIMESTAMPTZ;
+
+-- Allow origin='wake' for meetings started by the wake word listener.
+ALTER TABLE meetings DROP CONSTRAINT IF EXISTS meetings_origin_check;
+ALTER TABLE meetings ADD CONSTRAINT meetings_origin_check
+    CHECK (origin IN ('recorded', 'text', 'file', 'youtube', 'wake'));

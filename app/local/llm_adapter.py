@@ -26,7 +26,7 @@ log = logging.getLogger("app.local.llm_adapter")
 
 _OLLAMA_URL   = "http://localhost:11434/api/generate"
 _DEFAULT_MODEL = "gemma4:12b"
-_REQUEST_TIMEOUT = 30.0
+_REQUEST_TIMEOUT = 90.0   # gemma4:12b first-token ~11-35s; outer reply_chain timeout governs
 
 _SYSTEM_PROMPT = """You are a helpful voice assistant. Reply in 1-2 short sentences only.
 Be direct and conversational. No markdown, no lists, no headers.

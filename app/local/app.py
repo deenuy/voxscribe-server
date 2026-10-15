@@ -39,7 +39,11 @@ async def lifespan(app: FastAPI):
     if getattr(app.state, "wake_enabled", False):
         try:
             from app.local.audio_engine import AudioEngine
-            engine = AudioEngine()
+            import os as _os
+            engine = AudioEngine(
+                capture_device=_os.environ.get("VOXSCRIBE_CAPTURE_DEVICE") or None,
+                playback_device=_os.environ.get("VOXSCRIBE_PLAYBACK_DEVICE") or None,
+            )
             await engine.start()
             app.state.audio_engine = engine
             log.info("audio-engine: started (capture+playback)")

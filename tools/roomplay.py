@@ -55,13 +55,15 @@ log = logging.getLogger("roomplay")
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     level=logging.INFO)
 
-_DB_URL      = os.environ.get("VOXSCRIBE_DATABASE_URL",
-                              "postgresql://localhost:5432/ideascribe_dev")
-_VOICE       = os.environ.get("ROOMPLAY_VOICE", "Samantha")
-_POLL_S      = float(os.environ.get("ROOMPLAY_POLL_S", "0.3"))
-_TIMEOUT_S   = float(os.environ.get("ROOMPLAY_TIMEOUT_S", "90"))
-_SAMPLE_RATE = 24_000
-_CHANNELS    = 1
+_DB_URL       = os.environ.get("VOXSCRIBE_DATABASE_URL",
+                               "postgresql://localhost:5432/ideascribe_dev")
+_ENGINE_URL   = os.environ.get("ROOMPLAY_ENGINE_URL", "http://127.0.0.1")
+_ENGINE_PORT  = int(os.environ.get("ROOMPLAY_ENGINE_PORT", "0"))   # 0 = auto-detect from ready line
+_VOICE        = os.environ.get("ROOMPLAY_VOICE", "Samantha")
+_POLL_S       = float(os.environ.get("ROOMPLAY_POLL_S", "0.3"))
+_TIMEOUT_S    = float(os.environ.get("ROOMPLAY_TIMEOUT_S", "90"))
+_SAMPLE_RATE  = 24_000
+_CHANNELS     = 1
 
 
 # ---------------------------------------------------------------------------
@@ -227,22 +229,65 @@ def _meeting_row(conn, meeting_id: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Speaker playback
+# Speaker playback (sounddevice, not afplay, so volume is independent of
+# system volume setting and the mic gets a clean near-field signal)
 # ---------------------------------------------------------------------------
 
+def _read_wav_float32(path: Path):
+    """Read WAV as float32 array and sample rate."""
+    import numpy as np
+    with wave.open(str(path), "rb") as wf:
+        rate = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+    samples_i16 = np.frombuffer(raw, dtype="<i2")
+    return samples_i16.astype("float32") / 32768.0, rate
+
+
 def _play_wav_blocking(path: Path) -> None:
-    """Play WAV through default system output, blocking until done."""
-    subprocess.run(["afplay", str(path)], check=True, timeout=120)
+    """Play WAV through default system output, blocking until done.
+
+    Uses sounddevice.play() so amplitude is system-volume-independent
+    (afplay respects the macOS volume knob, giving near-zero RMS at the mic
+    when volume is low).
+    """
+    import sounddevice as sd
+    samples, rate = _read_wav_float32(path)
+    sd.play(samples, samplerate=rate, device="MacBook Pro Speakers")
+    sd.wait()
 
 
-def _play_wav_async_proc(path: Path) -> subprocess.Popen:
-    """Start playing WAV; returns Popen so caller can kill it."""
-    return subprocess.Popen(["afplay", str(path)])
+def _play_wav_nonblocking(path: Path):
+    """Start playing WAV; caller must call sounddevice.stop() when done."""
+    import sounddevice as sd
+    samples, rate = _read_wav_float32(path)
+    sd.play(samples, samplerate=rate, device="MacBook Pro Speakers")
 
 
 # ---------------------------------------------------------------------------
 # Core run logic
 # ---------------------------------------------------------------------------
+
+def _trigger_session(engine_base_url: str) -> bool:
+    """POST /v1/wake/trigger to start a session without OWW detection.
+
+    Returns True if the session started, False on error.
+    """
+    import urllib.request, urllib.error, json as _json
+    url = f"{engine_base_url}/v1/wake/trigger"
+    req = urllib.request.Request(url, data=b"{}", method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = _json.loads(resp.read())
+            log.info("trigger response: %s", body)
+            return bool(body.get("triggered"))
+    except urllib.error.HTTPError as exc:
+        log.error("trigger failed: HTTP %d: %s", exc.code, exc.read()[:200])
+        return False
+    except Exception as exc:
+        log.error("trigger failed: %s", exc)
+        return False
+
 
 def run_one(
     utterance_path: Path,
@@ -250,10 +295,15 @@ def run_one(
     *,
     stop_at_s: float | None = None,
     label: str = "run",
+    engine_base_url: str = "",
 ) -> dict:
     """Play one utterance through the speaker and collect the engine's response.
 
     Returns a result dict with timing data and pass/fail verdicts.
+
+    The utterance WAV should contain only the content AFTER the wake phrase
+    (e.g. the question/statement). The trigger endpoint starts the session,
+    then this plays the audio into the mic so the engine captures it.
     """
     result: dict = {
         "label": label,
@@ -261,6 +311,7 @@ def run_one(
         "utterance_dur_s": utterance_dur_s,
         "stop_at_s": stop_at_s,
         "played_at": datetime.now(UTC).isoformat(),
+        "mode": "trigger+roomplay [SIM:wake]",
         "meeting": None,
         "ledger": None,
         "gate": None,
@@ -273,7 +324,17 @@ def run_one(
         conn = _db_connect()
         since_z = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-        # -- play utterance ------------------------------------------------
+        # -- trigger session via API (bypasses OWW acoustic detection) ----
+        if engine_base_url:
+            log.info("[%s] triggering session via %s ...", label, engine_base_url)
+            if not _trigger_session(engine_base_url):
+                result["error"] = "trigger failed -- see logs"
+                return result
+            time.sleep(0.5)  # let session start and chime play
+        else:
+            log.warning("[%s] no engine_base_url -- relying on acoustic wake detection", label)
+
+        # -- play utterance (content speech) into mic ----------------------
         log.info("[%s] playing utterance (%.1f s) ...", label, utterance_dur_s)
         play_start_mono = time.monotonic()
         _play_wav_blocking(utterance_path)
@@ -311,9 +372,10 @@ def run_one(
                              label, stop_at_s)
                     time.sleep(stop_at_s)
                     log.info("[%s] playing 'stop' interjection", label)
-                    stop_proc = _play_wav_async_proc(stop_clip_path)
                     stop_play_mono = time.monotonic()
-                    stop_proc.wait(timeout=10)
+                    _play_wav_nonblocking(stop_clip_path)
+                    import sounddevice as sd
+                    sd.wait()
                     result["stop_played_at_mono"] = stop_play_mono
                     break
                 time.sleep(_POLL_S)
@@ -417,7 +479,13 @@ def main() -> int:
                         help="Write JSON report to this file. Default: print to stdout.")
     parser.add_argument("--keep-wav", action="store_true",
                         help="Keep generated WAV files after the run.")
+    parser.add_argument("--engine-url", default="",
+                        help="Base URL of running engine (e.g. http://127.0.0.1:55115). "
+                             "When set, uses /v1/wake/trigger to start sessions instead "
+                             "of relying on acoustic OWW detection. Wake phrase tagged [SIM].")
     args = parser.parse_args()
+
+    engine_base_url = args.engine_url.rstrip("/")
 
     results: list[dict] = []
 
@@ -434,7 +502,8 @@ def main() -> int:
                 if args.keep_wav:
                     import shutil
                     shutil.copy(wav_path, f"/tmp/{label}.wav")
-                result = run_one(wav_path, dur, stop_at_s=args.stop_at, label=label)
+                result = run_one(wav_path, dur, stop_at_s=args.stop_at,
+                                 label=label, engine_base_url=engine_base_url)
                 results.append(result)
                 # brief gap between runs
                 time.sleep(2.0)
@@ -445,7 +514,8 @@ def main() -> int:
             if args.keep_wav:
                 import shutil
                 shutil.copy(wav_path, f"/tmp/{args.label}.wav")
-            result = run_one(wav_path, dur, stop_at_s=args.stop_at, label=args.label)
+            result = run_one(wav_path, dur, stop_at_s=args.stop_at,
+                             label=args.label, engine_base_url=engine_base_url)
             results.append(result)
 
     # -- summary -----------------------------------------------------------
