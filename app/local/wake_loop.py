@@ -181,13 +181,14 @@ async def _inner(app) -> None:
 
 
 async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> None:
-    """Create a meeting, run the shared ring+consumer path, stop on silence."""
+    """Create a meeting, run the shared ring+consumer path, stop on turn end."""
     from app.local.audio_ring import AudioRing
     from app.local.store_meetings import MeetingStore
     from app.local.finalize import schedule_finalize
     from app.local import meeting_bus
     from app.local.models import Segment
     from voxscribe.meeting.live import LiveTranscriber
+    from app.local.end_of_turn import TurnDetector
 
     set_state(WakeState.LISTENING)
     pool    = app.state.store.pool
@@ -272,28 +273,53 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
 
     consumer = asyncio.create_task(_consumer())
 
-    # ── push mic frames into ring until silence or hard cap ──────────────────
+    # ── push mic frames into ring until turn ends or hard cap ────────────────
+    # TurnDetector (parked S4 policy) replaces the fixed 6-second silence counter.
+    # Falls back to the silence counter if the speech stack is not importable.
+    try:
+        turn_detector = TurnDetector()
+        turn_detector.reset()
+        use_turn_detector = True
+        log.info("wake-word-listener: using S4 turn detector")
+    except RuntimeError:
+        use_turn_detector = False
+        log.info("wake-word-listener: S4 turn detector unavailable, falling back to silence counter")
+
     silence_run    = 0
     silence_needed = int(_SILENCE_S * _SAMPLE_RATE / _CHUNK_FRAMES)
     cap_frames     = int(_CAP_S    * _SAMPLE_RATE / _CHUNK_FRAMES)
     total_frames   = 0
 
+    from app.local.audio_engine import monotonic_ms as _mono_ms
+
     try:
         while True:
             chunk = await asyncio.wait_for(audio_q.get(), timeout=_SILENCE_S + 2.0)
-            rms   = float((chunk ** 2).mean() ** 0.5)
+            now_ms = _mono_ms()
 
             # float32 → PCM16, prepend source_tag byte (0 = mic)
-            pcm16      = (chunk * 32767).clip(-32768, 32767).astype("int16")
-            frame_bytes = bytes([0]) + pcm16.tobytes()
+            pcm16       = (chunk * 32767).clip(-32768, 32767).astype("int16")
+            pcm16_bytes = pcm16.tobytes()
+            frame_bytes = bytes([0]) + pcm16_bytes
             ring.push(frame_bytes)
             total_frames += 1
 
-            silence_run = silence_run + 1 if rms < _RMS_FLOOR else 0
+            if use_turn_detector:
+                decision = turn_detector.push_pcm16(pcm16_bytes, now_ms)
+                # Poll adapter every 5 frames for silence decisions
+                if total_frames % 5 == 0:
+                    decision = turn_detector.tick(now_ms) or decision
+                if decision is not None and decision.closes_turn:
+                    log.info("wake-word-listener: turn closed action=%s silence_ms=%d frames=%d",
+                             decision.action, decision.silence_ms, total_frames)
+                    break
+            else:
+                rms = float((chunk ** 2).mean() ** 0.5)
+                silence_run = silence_run + 1 if rms < _RMS_FLOOR else 0
+                if silence_run >= silence_needed:
+                    log.info("wake-word-listener: end-of-turn silence frames=%d", total_frames)
+                    break
 
-            if silence_run >= silence_needed:
-                log.info("wake-word-listener: end-of-turn silence frames=%d", total_frames)
-                break
             if total_frames >= cap_frames:
                 log.info("wake-word-listener: hard cap reached frames=%d", total_frames)
                 break
