@@ -346,6 +346,9 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
 
     # Any exception after start_meeting must still call stop_once so the meeting
     # does not stay stuck in "recording" status forever (CK6 fix).
+    _engine     = getattr(app.state, "audio_engine", None)
+    _echo_guard = _engine.echo_guard if _engine is not None else None
+
     _turn_end_ms: int = 0
     try:
         try:
@@ -357,6 +360,16 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np) -> No
                 pcm16       = (chunk * 32767).clip(-32768, 32767).astype("int16")
                 pcm16_bytes = pcm16.tobytes()
                 frame_bytes = bytes([0]) + pcm16_bytes
+
+                # Self-echo guard: discard mic frames that fall within the TTS
+                # playback window + 500 ms tail. Keeps them out of ASR and resets
+                # the silence counter so we never close the turn on our own audio.
+                if _echo_guard is not None:
+                    decision, _ = _echo_guard.observe(chunk, None)
+                    if decision == "muted":
+                        silence_run = 0
+                        continue
+
                 ring.push(frame_bytes)
                 total_frames += 1
 

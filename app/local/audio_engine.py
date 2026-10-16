@@ -47,15 +47,29 @@ def monotonic_ms() -> int:
 
 
 class EchoGuard:
-    """Passthrough stub: returns mic frame unchanged.
+    """Time-based mic mute: suppresses mic frames during TTS playback + 500 ms tail.
 
-    In R6 this is replaced by the BargeInDetector from voxscribe-core which
-    needs a playback reference. The interface is frozen here so callers can
-    import it and call observe(mic, ref) without changes in R6.
+    Call notify_playback_end(ms) whenever a playback chunk finishes writing.
+    observe() returns ("muted", mic_frame) while within the tail window,
+    ("pass", mic_frame) otherwise.
+
+    Callers must discard "muted" frames — never push them to ASR.
+    Full AEC (correlation-based) is deferred until after daily-use baseline.
     """
 
+    _TAIL_MS = 500
+
+    def __init__(self) -> None:
+        self._mute_until_ms: int = -1
+
+    def notify_playback_end(self, end_ms: int) -> None:
+        """Record that playback finished at end_ms; extends mute window."""
+        self._mute_until_ms = end_ms + self._TAIL_MS
+
     def observe(self, mic_frame, playback_ref) -> object:
-        """Returns (decision, mic_frame). decision is always 'pass' in stub mode."""
+        """Returns ("muted", mic_frame) or ("pass", mic_frame)."""
+        if monotonic_ms() <= self._mute_until_ms:
+            return ("muted", mic_frame)
         return ("pass", mic_frame)
 
 
@@ -283,6 +297,7 @@ class AudioEngine:
                 self._playback_ref.push(chunk.tolist())
                 try:
                     self._playback_stream.write(chunk)
+                    self._echo_guard.notify_playback_end(monotonic_ms())
                 except Exception:
                     log.exception("audio_engine: playback write error")
         except asyncio.CancelledError:
