@@ -16,7 +16,7 @@ log = logging.getLogger("app.local.tools.web_search")
 
 _SEARXNG_URL = os.environ.get("VOX_SEARXNG_URL", "http://127.0.0.1:8080")
 _TOP_N       = 5
-_TIMEOUT_S   = 3.0
+_TIMEOUT_S   = 6.0
 
 
 async def _call(arguments: dict) -> str:
