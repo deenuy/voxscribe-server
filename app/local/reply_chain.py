@@ -123,8 +123,8 @@ async def run_reply(
     from app.local.tts_engine import synthesize_and_play, play_prerendered, prerender_phrase
     from app.local import meeting_bus, gate
     from app.local.audio_engine import monotonic_ms
-
     from app.local.context import current_context_header
+    from app.local import pre_router
 
     pool = app.state.store.pool
     settings = getattr(app.state, "settings", None)
@@ -142,6 +142,9 @@ async def run_reply(
         "Be direct and conversational. No markdown, no lists, no headers. "
         "Keep replies under 30 words."
     ).strip() if ctx_header else None
+
+    # Pre-router: answer pure date/time/day queries from the clock (no LLM call)
+    clock_answer = pre_router.route(user_text or "", settings) if settings else None
 
     turn_id   = str(uuid.uuid4())
     reply_id  = str(uuid.uuid4())
@@ -214,6 +217,16 @@ async def run_reply(
         decision = "refuse"
         gate_category = "empty"
         reply_text = gate.refusal_phrase("empty", mode)
+    elif clock_answer:
+        log.info("reply_chain: pre-router clock answer source=clock text=%r", user_text[:60])
+        reply_text = clock_answer
+        all_sentences = [clock_answer]
+        if audio_engine is not None:
+            try:
+                await synthesize_and_play(clock_answer, audio_engine)
+                tts_first_audio_ms = monotonic_ms()
+            except Exception:
+                log.exception("reply_chain: TTS failed for clock answer meeting_id=%s", meeting_id)
     else:
         src = "pre_stream" if pre_stream is not None else "llm"
         log.info("reply_chain: querying %s model=%s history_turns=%d text=%r",
