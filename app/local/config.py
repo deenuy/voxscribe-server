@@ -110,10 +110,14 @@ class Config:
         2. Dotenv file (if env_file or VOXSCRIBE_ENV_FILE points to one)
         3. Built-in defaults (in the dataclass)
         """
-        # Load dotenv file if specified
+        # Load dotenv file: explicit arg > VOXSCRIBE_ENV_FILE env var > .env in CWD
         env_vars = {}
         if env_file is None:
             env_file = os.environ.get("VOXSCRIBE_ENV_FILE")
+        if env_file is None:
+            candidate = Path.cwd() / ".env"
+            if candidate.exists():
+                env_file = str(candidate)
 
         if env_file and Path(env_file).exists():
             env_vars = _parse_env_file(env_file)
