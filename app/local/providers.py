@@ -1,6 +1,7 @@
 """Provider selection and initialization."""
 
 import logging
+import os
 from typing import Literal
 
 from voxscribe.audio_providers import WhisperASRProvider
@@ -131,12 +132,25 @@ class LocalASRProvider:
             log.info(f"Loaded {self.name} model")
         return self._provider
 
+    # Load thresholds for the beam-size profile (load-aware ASR, completion plan Phase 1).
+    # beam_size=1 at load > 3: faster decode under CPU pressure, slightly lower WER.
+    # beam_size=5 otherwise: accuracy-tuned default per WhisperASRProvider docs.
+    _BEAM_LOAD_HIGH = 3.0
+    _BEAM_SIZE_HIGH = 1
+    _BEAM_SIZE_NORMAL = 5
+
     def transcribe(self, samples, sample_rate, session_id, initial_prompt=None):
-        """Transcribe using faster-whisper.
+        """Transcribe using faster-whisper with load-aware beam size.
 
         This is called from the event loop via asyncio.to_thread.
         """
+        import os as _os
         provider = self._load_provider()
+        load = _os.getloadavg()[0]
+        target_beam = self._BEAM_SIZE_HIGH if load > self._BEAM_LOAD_HIGH else self._BEAM_SIZE_NORMAL
+        if provider.beam_size != target_beam:
+            log.info("load-aware ASR: beam_size %d→%d (load=%.1f)", provider.beam_size, target_beam, load)
+            provider.beam_size = target_beam
         return provider.transcribe(samples, sample_rate, session_id, initial_prompt)
 
     async def health(self) -> bool:
