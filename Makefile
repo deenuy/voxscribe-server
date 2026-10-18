@@ -167,6 +167,44 @@ wake-test6: ## Trigger 6 sessions sequentially — speak after each TRIGGERING l
 wake-logs: ## Tail the wake engine log
 	@tail -f $(WAKE_LOG)
 
+# ── SearXNG ────────────────────────────────────────────────────────────────────
+SEARXNG_DIR     ?= $(HOME)/services/searxng
+SEARXNG_PLIST   ?= $(HOME)/Library/LaunchAgents/com.voxscribe.searxng.plist
+SEARXNG_LABEL   ?= com.voxscribe.searxng
+SEARXNG_LOG     ?= /tmp/searxng.log
+SEARXNG_SETTINGS ?= $(SEARXNG_DIR)/etc/settings.yml
+
+.PHONY: searxng-install
+searxng-install: ## Clone and install SearXNG into ~/services/searxng with its own venv
+	@if [ -d "$(SEARXNG_DIR)/.git" ]; then \
+	  echo "SearXNG already cloned at $(SEARXNG_DIR)"; \
+	else \
+	  mkdir -p $(HOME)/services && git clone https://github.com/searxng/searxng.git $(SEARXNG_DIR); \
+	fi
+	@if [ ! -d "$(SEARXNG_DIR)/.venv" ]; then \
+	  echo "Creating venv..."; \
+	  python3 -m venv $(SEARXNG_DIR)/.venv; \
+	fi
+	@$(SEARXNG_DIR)/.venv/bin/pip install -r $(SEARXNG_DIR)/requirements.txt --quiet
+	@$(SEARXNG_DIR)/.venv/bin/pip install granian --quiet
+	@mkdir -p $(SEARXNG_DIR)/etc
+	@echo "SearXNG installed. Run: make searxng-start"
+
+.PHONY: searxng-start
+searxng-start: ## Load the SearXNG launchd agent (starts now and on login)
+	@launchctl load -w $(SEARXNG_PLIST) 2>/dev/null || launchctl load $(SEARXNG_PLIST)
+	@sleep 2
+	@curl -s http://127.0.0.1:8080/healthz > /dev/null && echo "SearXNG: reachable" || echo "SearXNG: not yet up (check $(SEARXNG_LOG))"
+
+.PHONY: searxng-stop
+searxng-stop: ## Unload the SearXNG launchd agent
+	@launchctl unload $(SEARXNG_PLIST) 2>/dev/null && echo "SearXNG: stopped" || echo "SearXNG: was not loaded"
+
+.PHONY: searxng-status
+searxng-status: ## Check if SearXNG is reachable
+	@curl -s http://127.0.0.1:8080/healthz > /dev/null && echo "SearXNG: reachable" || echo "SearXNG: down"
+	@launchctl list | grep $(SEARXNG_LABEL) || echo "(launchd job not loaded)"
+
 .PHONY: local
 local: ## Run the local engine with voxscribe-engine
 	@echo "Use: uv run voxscribe-engine --port 0 --providers fake"

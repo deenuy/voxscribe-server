@@ -1,15 +1,25 @@
-"""Pre-router: answers deterministic queries from the clock without an LLM call.
+"""Pre-router: answers deterministic queries without an LLM call, or routes to tools.
 
 Patterns handled (case-insensitive, flexible phrasing):
-  - "what day is it" / "what day is today" / "what's today"
-  - "what's the date" / "what date is it" / "today's date"
-  - "what time is it" / "what's the time"
 
-Any of these get a one-sentence clock answer built from the context header,
-with no Ollama round-trip. "And tomorrow" / follow-up phrasing is NOT caught
-here — it goes to the LLM with history so C1 tests context resolution.
+  Clock (no LLM, no tool):
+    - "what day is it" / "what day is today" / "what's today"
+    - "what's the date" / "what date is it" / "today's date"
+    - "what time is it" / "what's the time"
 
-The caller writes a turns row with source='clock'.
+  Search (tool call required, filler phrase spoken first):
+    - weather, news, latest, today's <X>, price of, who won, current <X>, score of
+
+"And tomorrow" / follow-up phrasing is NOT caught here — it goes to the LLM
+with history so C1 tests context resolution.
+
+route() returns:
+  - ("clock", answer_str)  for clock queries answered from the OS clock
+  - ("search", query_str)  for queries that should go to web_search
+  - None                   to continue to LLM
+
+Return is a tuple (source, value) | None. Old callers that expected str | None
+are updated; use route_clock() for the clock-only path.
 """
 
 from __future__ import annotations
@@ -51,33 +61,56 @@ _DAY_PATTERNS = re.compile(
 )
 
 
-def route(user_text: str, cfg) -> str | None:
-    """Return a clock-sourced answer string, or None to continue to LLM.
+_SEARCH_PATTERNS = re.compile(
+    r"""
+    (?:
+        weather\s+\w|               # "weather in ..."
+        (?:latest|current|recent)\s+\w|  # "latest news", "current score"
+        (?:today'?s?\s+\w)|         # "today's weather"
+        (?:who\s+won)|              # "who won the game"
+        (?:price\s+of)|             # "price of gold"
+        (?:what'?s?\s+(?:the\s+)?(?:score|news|weather|temperature))|
+        (?:how\s+(?:is|are)\s+(?:the\s+)?(?:market|stocks|weather))
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
-    Only answers if the entire utterance (after stripping filler) is a
-    pure date/time/day question. A sentence with any other substance
-    (e.g. "and tomorrow") returns None.
+
+def route(user_text: str, cfg) -> tuple[str, str] | None:
+    """Return (source, value) or None.
+
+    ("clock", answer) — answered from OS clock, no LLM call.
+    ("search", query) — should be routed to web_search tool.
+    None — continue to LLM unchanged.
     """
     text = user_text.strip().rstrip(".?!")
 
-    # Reject if text has AND / follow-up content — let LLM handle those
-    if re.search(r'\band\b', text, re.IGNORECASE):
-        return None
+    # Clock path: short pure date/time/day questions only
+    if not re.search(r'\band\b', text, re.IGNORECASE) and len(text.split()) <= 10:
+        from app.local.context import _local_now
+        tz_name = getattr(cfg, "vox_timezone", "UTC") or "UTC"
+        now = _local_now(tz_name)
 
-    # Reject if longer than ~8 words — probably a compound query
-    if len(text.split()) > 10:
-        return None
+        if _DAY_PATTERNS.search(text):
+            return ("clock", _day_answer(now))
+        if _DATE_PATTERNS.search(text):
+            return ("clock", _date_answer(now))
+        if _TIME_PATTERNS.search(text):
+            return ("clock", _time_answer(now))
 
-    from app.local.context import _local_now
-    tz_name = getattr(cfg, "vox_timezone", "UTC") or "UTC"
-    now = _local_now(tz_name)
+    # Search path: queries about current facts, weather, news
+    if _SEARCH_PATTERNS.search(text):
+        return ("search", text)
 
-    if _DAY_PATTERNS.search(text):
-        return _day_answer(now)
-    if _DATE_PATTERNS.search(text):
-        return _date_answer(now)
-    if _TIME_PATTERNS.search(text):
-        return _time_answer(now)
+    return None
+
+
+def route_clock(user_text: str, cfg) -> str | None:
+    """Legacy helper: returns clock answer str or None (no search routing)."""
+    result = route(user_text, cfg)
+    if result and result[0] == "clock":
+        return result[1]
     return None
 
 

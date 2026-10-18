@@ -30,6 +30,7 @@ log = logging.getLogger("app.local.reply_chain")
 _OLLAMA_TIMEOUT_S  = 30.0   # llama3.2 first-token <3s warm, ~8s cold; 30s covers first-time load
 _FALLBACK_PHRASE   = "I'm sorry, I didn't catch that. Could you say it again?"
 _THINKING_PHRASE   = "hm"
+_FILLER_PHRASE     = "Let me check."
 _SENTENCE_RE       = re.compile(r'[.!?]["\')\]]*\s+')
 
 
@@ -95,7 +96,8 @@ async def warm_phrase_cache() -> None:
         CLASSROOM_REFUSAL_PHRASE,
         SENIORCARE_ESCALATION_PHRASE,
     )
-    for phrase in (_THINKING_PHRASE, DEFAULT_REFUSAL_PHRASE, CLASSROOM_REFUSAL_PHRASE, SENIORCARE_ESCALATION_PHRASE):
+    for phrase in (_THINKING_PHRASE, _FILLER_PHRASE, DEFAULT_REFUSAL_PHRASE,
+                   CLASSROOM_REFUSAL_PHRASE, SENIORCARE_ESCALATION_PHRASE):
         await prerender_phrase(phrase)
 
 
@@ -143,8 +145,10 @@ async def run_reply(
         "Keep replies under 30 words."
     ).strip() if ctx_header else None
 
-    # Pre-router: answer pure date/time/day queries from the clock (no LLM call)
-    clock_answer = pre_router.route(user_text or "", settings) if settings else None
+    # Pre-router: clock answers or search routing
+    _route = pre_router.route(user_text or "", settings) if settings else None
+    clock_answer: str | None = _route[1] if _route and _route[0] == "clock" else None
+    search_query: str | None = _route[1] if _route and _route[0] == "search" else None
 
     turn_id   = str(uuid.uuid4())
     reply_id  = str(uuid.uuid4())
@@ -227,6 +231,101 @@ async def run_reply(
                 tts_first_audio_ms = monotonic_ms()
             except Exception:
                 log.exception("reply_chain: TTS failed for clock answer meeting_id=%s", meeting_id)
+    elif search_query:
+        log.info("reply_chain: search route query=%r meeting_id=%s", search_query[:80], meeting_id)
+        # 1. Filler phrase (gated once) — play immediately so speaker isn't silent
+        if audio_engine is not None:
+            try:
+                filler_path = await prerender_phrase(_FILLER_PHRASE)
+                if filler_path is not None:
+                    await play_prerendered(filler_path, audio_engine)
+                else:
+                    await synthesize_and_play(_FILLER_PHRASE, audio_engine)
+                tts_first_audio_ms = monotonic_ms()
+            except Exception:
+                log.debug("reply_chain: filler phrase failed (non-critical) meeting_id=%s", meeting_id)
+
+        # 2. Execute web search
+        from app.local.tools.web_search import search as web_search
+        import time as _time
+        t_search = _time.monotonic()
+        search_result = ""
+        search_error: str | None = None
+        try:
+            async with asyncio.timeout(4.0):
+                search_result = await web_search(search_query)
+        except Exception as exc:
+            search_error = str(exc)
+            log.warning("reply_chain: web_search failed: %s", exc)
+
+        search_dur_ms = int((_time.monotonic() - t_search) * 1000)
+
+        # 3. Write tool_calls row
+        tool_call_id = str(uuid.uuid4())
+        try:
+            async with pool.connection() as conn:
+                await conn.execute(
+                    "INSERT INTO tool_calls"
+                    " (id, turn_id, meeting_id, tool, query, engine, result_count,"
+                    "  duration_ms, error, called_at)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT DO NOTHING",
+                    (tool_call_id, turn_id, meeting_id, "web_search", search_query,
+                     "searxng", len([l for l in search_result.splitlines() if l.startswith("1.")
+                                     or l[:2] in ("2.", "3.", "4.", "5.")]),
+                     search_dur_ms, search_error, _now_z()),
+                )
+                await conn.commit()
+        except Exception:
+            log.debug("reply_chain: tool_calls insert failed (non-critical)")
+
+        # 4. Build LLM prompt with search results grounding the answer
+        if search_error or "[web_search: unavailable" in search_result:
+            reply_text = "I can't look that up right now."
+            all_sentences = [reply_text]
+            if audio_engine is not None:
+                try:
+                    await synthesize_and_play(reply_text, audio_engine)
+                except Exception:
+                    pass
+        else:
+            search_system = (
+                f"{system_prompt or ''}\n\n"
+                f"Use the following search results to answer the user's question. "
+                f"Do not reproduce URLs. Summarise in 1-2 sentences.\n\n"
+                f"{search_result}"
+            ).strip()
+            llm_request_sent_ms = monotonic_ms()
+            sentence_gen = _sentence_stream(
+                user_text, model, _OLLAMA_TIMEOUT_S,
+                history=history, system_prompt=search_system,
+            )
+            try:
+                async for sentence in sentence_gen:
+                    if llm_first_token_ms is None:
+                        llm_first_token_ms = monotonic_ms()
+                    s_decision, s_category = gate.check(user_text, sentence, mode=mode)
+                    if s_decision != "pass":
+                        decision = "refuse"
+                        gate_category = s_category
+                        reply_text = gate.refusal_phrase(s_category, mode)
+                        if audio_engine is not None and all_sentences:
+                            audio_engine.cancel_playback()
+                        break
+                    all_sentences.append(sentence)
+                    if audio_engine is not None:
+                        try:
+                            await synthesize_and_play(sentence, audio_engine)
+                            if tts_first_audio_ms is None:
+                                tts_first_audio_ms = monotonic_ms()
+                        except Exception:
+                            log.exception("reply_chain: TTS failed search sentence meeting_id=%s", meeting_id)
+            except Exception:
+                log.exception("reply_chain: LLM search stream failed meeting_id=%s", meeting_id)
+            if not all_sentences and decision == "pass":
+                reply_text = _FALLBACK_PHRASE
+            elif decision == "pass":
+                reply_text = " ".join(all_sentences)
     else:
         src = "pre_stream" if pre_stream is not None else "llm"
         log.info("reply_chain: querying %s model=%s history_turns=%d text=%r",

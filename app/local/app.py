@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
             log.warning("reply-chain: phrase cache warm failed: %s", exc)
 
         from app.local.wake_loop import run_wake_loop
-        log.info("wake-word-listener: initializing -- model=hey_jarvis")
+        log.info("wake-word-listener: initializing -- model=whisper/tiny.en phrase=env:VOXSCRIBE_WAKE_PHRASE")
         wake_task = asyncio.create_task(run_wake_loop(app), name="wake-loop")
         log.info("wake-word-listener: task created, awaiting mic open")
 
@@ -408,6 +408,14 @@ async def create_app(
             except Exception:
                 embedding_name = f"ollama:{settings.embed_model}"
 
+        # SearXNG health
+        from app.local.tools.web_search import is_reachable as searxng_reachable
+        try:
+            searxng_ok = await searxng_reachable()
+        except Exception:
+            searxng_ok = False
+        searxng_status = "reachable" if searxng_ok else "down"
+
         status = "ok" if (db_ok and asr_ok and llm_ok and embedding_ok) else "degraded"
 
         result = {
@@ -451,6 +459,7 @@ async def create_app(
                     "name": embedding_name,
                 },
             },
+            "searxng": searxng_status,
         }
         return result
 
