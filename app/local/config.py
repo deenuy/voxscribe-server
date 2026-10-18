@@ -93,6 +93,14 @@ class Config:
     voice_mode: str = "default"          # default | classroom | seniorcare
     voice_reply_model: str = "llama3.2"  # 3B-4B class for spoken replies
 
+    # Wake word — any phrase, no model training required (VOXSCRIBE_WAKE_PHRASE)
+    wake_phrase: str = "hey vox"
+
+    # Context header injected into every reply turn
+    vox_timezone: str = "UTC"
+    vox_location: str = ""
+    vox_user_name: str = ""
+
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "Config":
         """Load configuration from environment.
@@ -276,6 +284,20 @@ class Config:
         voice_reply_model = env_vars.get("VOXSCRIBE_VOICE_REPLY_MODEL", "").strip()
         if voice_reply_model:
             config_dict["voice_reply_model"] = voice_reply_model
+
+        wake_phrase = env_vars.get("VOXSCRIBE_WAKE_PHRASE", "").strip().lower()
+        if wake_phrase:
+            config_dict["wake_phrase"] = wake_phrase
+
+        # Context header — read VOX_* from .env or os.environ
+        for env_key, field in (
+            ("VOX_TIMEZONE", "vox_timezone"),
+            ("VOX_LOCATION", "vox_location"),
+            ("VOX_USER_NAME", "vox_user_name"),
+        ):
+            val = env_vars.get(env_key, "") or os.environ.get(env_key, "")
+            if val.strip():
+                config_dict[field] = val.strip()
 
         return cls(**config_dict)
 

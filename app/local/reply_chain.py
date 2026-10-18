@@ -37,6 +37,8 @@ async def _sentence_stream(
     user_text: str,
     model: str,
     timeout_s: float,
+    history: list[dict] | None = None,
+    system_prompt: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream LLM tokens and yield complete sentences at punctuation boundaries."""
     from app.local.llm_adapter import stream_reply
@@ -44,7 +46,8 @@ async def _sentence_stream(
     buf = ""
     try:
         async with asyncio.timeout(timeout_s):
-            async for token in stream_reply(user_text, model=model):
+            async for token in stream_reply(user_text, model=model, history=history,
+                                            system_prompt=system_prompt):
                 buf += token
                 while True:
                     m = _SENTENCE_RE.search(buf)
@@ -56,6 +59,30 @@ async def _sentence_stream(
                         yield sentence
     except TimeoutError:
         log.warning("reply_chain: LLM stream timed out")
+    if buf.strip():
+        yield buf.strip()
+
+
+async def _sentence_stream_from_tokens(
+    token_source: AsyncIterator[str],
+    timeout_s: float,
+) -> AsyncIterator[str]:
+    """Yield sentences from a pre-started token stream (speculative generation)."""
+    buf = ""
+    try:
+        async with asyncio.timeout(timeout_s):
+            async for token in token_source:
+                buf += token
+                while True:
+                    m = _SENTENCE_RE.search(buf)
+                    if not m:
+                        break
+                    sentence = buf[: m.end()].strip()
+                    buf = buf[m.end():]
+                    if sentence:
+                        yield sentence
+    except TimeoutError:
+        log.warning("reply_chain: pre-stream timed out")
     if buf.strip():
         yield buf.strip()
 
@@ -84,7 +111,9 @@ async def run_reply(
     turn_n: int = 1,
     mode: str = "default",
     asr_final_ms: int | None = None,
-) -> None:
+    history: list[dict] | None = None,
+    pre_stream: AsyncIterator[str] | None = None,
+) -> str:
     """Background task: generate and play spoken reply for one wake turn.
 
     Writes turns, replies, gate_decisions, latency_ledger rows.
@@ -95,12 +124,24 @@ async def run_reply(
     from app.local import meeting_bus, gate
     from app.local.audio_engine import monotonic_ms
 
+    from app.local.context import current_context_header
+
     pool = app.state.store.pool
     settings = getattr(app.state, "settings", None)
     audio_engine = getattr(app.state, "audio_engine", None)
     model = getattr(settings, "voice_reply_model", "llama3.2")
     if mode == "default":
         mode = getattr(settings, "voice_mode", "default")
+
+    # Build context header from OS clock at turn start (not session start)
+    ctx_header = current_context_header(settings) if settings else ""
+    system_prompt = (
+        f"{ctx_header} "
+        "You are a helpful voice assistant. "
+        "Reply in 1-2 short sentences only. "
+        "Be direct and conversational. No markdown, no lists, no headers. "
+        "Keep replies under 30 words."
+    ).strip() if ctx_header else None
 
     turn_id   = str(uuid.uuid4())
     reply_id  = str(uuid.uuid4())
@@ -129,12 +170,18 @@ async def run_reply(
         except Exception:
             log.debug("reply_chain: thinking cue failed (non-critical)")
 
-    # ── 1c. Write preliminary gate_decisions row before any playback (SC-G3) ──
-    # SC-G3 requires a gate_decisions row to exist BEFORE playback starts.
-    # Write 'pending' now; UPDATE to the real decision after the LLM loop.
+    # ── 1c. Write preliminary reply + gate_decisions rows before any playback ──
+    # gate_decisions has an FK on replies(id), so both must be inserted together.
+    # Write placeholder text now; UPDATE to the real content after the LLM loop.
     gate_pre_written = False
+    reply_pre_written = False
     try:
         async with pool.connection() as conn:
+            await conn.execute(
+                "INSERT INTO replies (id, meeting_id, turn_n, text, model, gate_category, created_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (reply_id, meeting_id, turn_n, "", model, "pending", started_z),
+            )
             await conn.execute(
                 "INSERT INTO gate_decisions"
                 " (id, reply_id, meeting_id, mode, input_text, decision, category, decided_at)"
@@ -144,6 +191,7 @@ async def run_reply(
             )
             await conn.commit()
         gate_pre_written = True
+        reply_pre_written = True
     except Exception:
         log.exception("reply_chain: failed to pre-write gate_decisions meeting_id=%s", meeting_id)
 
@@ -167,11 +215,22 @@ async def run_reply(
         gate_category = "empty"
         reply_text = gate.refusal_phrase("empty", mode)
     else:
+        src = "pre_stream" if pre_stream is not None else "llm"
+        log.info("reply_chain: querying %s model=%s history_turns=%d text=%r",
+                 src, model, len(history) // 2 if history else 0, user_text[:120])
         llm_request_sent_ms = monotonic_ms()
+        sentence_gen = (
+            _sentence_stream_from_tokens(pre_stream, _OLLAMA_TIMEOUT_S)
+            if pre_stream is not None
+            else _sentence_stream(user_text, model, _OLLAMA_TIMEOUT_S,
+                                  history=history, system_prompt=system_prompt)
+        )
         try:
-            async for sentence in _sentence_stream(user_text, model, _OLLAMA_TIMEOUT_S):
+            async for sentence in sentence_gen:
                 if llm_first_token_ms is None:
                     llm_first_token_ms = monotonic_ms()
+                    log.info("reply_chain: LLM first-token +%d ms from turn_end",
+                             llm_first_token_ms - turn_end_ms)
 
                 # Gate each sentence before speaking it
                 s_decision, s_category = gate.check(user_text, sentence, mode=mode)
@@ -229,14 +288,20 @@ async def run_reply(
     log.info("reply_chain: reply_len=%d decision=%s meeting_id=%s",
              len(reply_text), decision, meeting_id)
 
-    # ── 4. Write replies row; UPDATE gate_decisions with final decision ──────
+    # ── 4. Finalise replies + gate_decisions with real content ───────────────
     try:
         async with pool.connection() as conn:
-            await conn.execute(
-                "INSERT INTO replies (id, meeting_id, turn_n, text, model, gate_category, created_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (reply_id, meeting_id, turn_n, reply_text, model, gate_category, decided_z),
-            )
+            if reply_pre_written:
+                await conn.execute(
+                    "UPDATE replies SET text=%s, model=%s, gate_category=%s, created_at=%s WHERE id=%s",
+                    (reply_text, model, gate_category, decided_z, reply_id),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO replies (id, meeting_id, turn_n, text, model, gate_category, created_at)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (reply_id, meeting_id, turn_n, reply_text, model, gate_category, decided_z),
+                )
             if gate_pre_written:
                 await conn.execute(
                     "UPDATE gate_decisions"
@@ -300,3 +365,5 @@ async def run_reply(
         })
     except Exception:
         log.warning("reply_chain: failed to publish reply event meeting_id=%s", meeting_id)
+
+    return reply_text
