@@ -1,5 +1,10 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.7.1
+
+### Changed
+- Changed the voxscribe-core dependency to resolve from a tracked wheel file rather than a sibling source directory, so installs are reproducible without the separate repository being checked out.
+
 ## What's New in VoxScribe Server 0.7.0
 
 ### New Features
