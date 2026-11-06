@@ -48,15 +48,16 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
         await websocket.close(code=1011, reason="internal error")
         return
 
-    # Validate token
-    if not token:
-        await websocket.close(code=1008, reason="token required")
-        return
-
-    expected_token = getattr(app.state, "auth_token", None)
-    if expected_token and not hmac.compare_digest(token.encode(), expected_token.encode()):
-        await websocket.close(code=1008, reason="invalid token")
-        return
+    # Validate token (skip when --no-auth)
+    auth_disabled = getattr(app.state, "auth_disabled", False)
+    if not auth_disabled:
+        if not token:
+            await websocket.close(code=1008, reason="token required")
+            return
+        expected_token = getattr(app.state, "auth_token", None)
+        if expected_token and not hmac.compare_digest(token.encode(), expected_token.encode()):
+            await websocket.close(code=1008, reason="invalid token")
+            return
 
     pool = app.state.store.pool if hasattr(app.state, "store") else None
     if not pool:
@@ -473,6 +474,8 @@ def _to_frame(event: dict) -> dict | None:
         return {"type": kind, "state": data.get("state")}
     if kind == "summary.ready":
         return {"type": kind}
+    if kind == "reply":
+        return {"type": kind, **data}
     return None
 
 

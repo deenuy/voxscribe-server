@@ -10,7 +10,7 @@ packages = ["app"]
 # ---------------------------------------------------------------------------
 [project]
 name = "voxscribe-server"
-version = "0.6.1"
+version = "0.7.0"
 description = "Local engine implementing the Ideascribe contract: meetings, knowledge, live transcription, enrichment"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -70,10 +70,9 @@ local-asr = [
 ]
 
 # Always-on wake word listener (--wake flag). Needs mic access on the host.
+# Wake phrase is set via VOXSCRIBE_WAKE_PHRASE in .env — no model training required.
 # Install with: uv sync --extra wake
 wake = [
-    "openwakeword>=0.6",
-    "onnxruntime>=1.17",
     "sounddevice>=0.4",
     "numpy>=1.24",
 ]

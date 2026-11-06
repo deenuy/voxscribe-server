@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+from datetime import UTC, datetime
 
 import uvicorn
 
@@ -21,33 +22,58 @@ VERSION = "0.1.0"
 _MONOTONIC_START = time.monotonic()
 
 
-class _MonotonicHandler(logging.StreamHandler):
-    """StreamHandler subclass used as a marker for the already-installed guard."""
+class _AppHandler(logging.StreamHandler):
+    """Marker class so the already-installed guard can find this handler."""
+
+
+# Maps logger names to short component labels shown in [brackets].
+_COMPONENT_LABELS: dict[str, str] = {
+    "app.local.app":           "engine",
+    "app.local.wake":          "wake",
+    "app.local.reply_chain":   "reply",
+    "app.local.llm_adapter":   "llm",
+    "app.local.tts_engine":    "tts",
+    "app.local.audio_engine":  "audio",
+    "app.local.gate":          "gate",
+    "app.local.finalize":      "finalize",
+    "app.local.store_meetings":"store",
+    "app.local.end_of_turn":   "eot",
+}
 
 
 def _install_app_local_handler(log_level: str) -> None:
-    """Add a handler to app.local.* that prefixes every line with monotonic ms.
+    """Install a unified log handler that matches the app-console format exactly.
 
-    Monotonic offsets let wake and session log lines sort correctly even when
-    the wall clock jumps (NTP resync, sleep/wake). Detection latency is the
-    diff between two monotonic values printed on the same log line.
+    Format: 2026-10-17T05:33:44Z  INFO   [wake]  message
+
+    Also silences uvicorn's INFO startup chatter (Waiting for application
+    startup, Started server process …) since that's already captured by the
+    engine-start Makefile target.
     Already-installed guard prevents double-add on uvicorn hot-reload.
     """
     logger = logging.getLogger("app.local")
-    if any(isinstance(h, _MonotonicHandler) for h in logger.handlers):
+    if any(isinstance(h, _AppHandler) for h in logger.handlers):
         return
 
     class _Fmt(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:
-            record.monotonic_ms = int((time.monotonic() - _MONOTONIC_START) * 1000)
-            return super().format(record)
+            ts        = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            level     = record.levelname[:4]          # INFO→INFO  WARNING→WARN
+            component = _COMPONENT_LABELS.get(record.name, record.name.split(".")[-1])
+            return f"{ts}  {level}   [{component}]  {record.getMessage()}"
 
-    handler = _MonotonicHandler()
-    handler.setFormatter(_Fmt(fmt="[%(monotonic_ms)8d ms] %(name)s %(levelname)s %(message)s"))
     level = getattr(logging, log_level.upper(), logging.INFO)
+    handler = _AppHandler()
+    handler.setFormatter(_Fmt())
     handler.setLevel(level)
     logger.setLevel(level)
     logger.addHandler(handler)
+
+    # Silence uvicorn startup INFO lines — engine URL is already shown by the
+    # Makefile health check; these lines just add noise to the shared log tail.
+    for uv_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uv_log = logging.getLogger(uv_logger_name)
+        uv_log.setLevel(logging.WARNING)
 
 
 async def main():

@@ -22,9 +22,10 @@ async def wake_state(_: Request):
     s = get_state()
     v = s["state"]
     return {
-        "state":  v.value if isinstance(v, WakeState) else str(v),
-        "model":  s["model"],
-        "phrase": s["phrase"],
+        "state":      v.value if isinstance(v, WakeState) else str(v),
+        "model":      s["model"],
+        "phrase":     s["phrase"],
+        "meeting_id": s.get("meeting_id"),
     }
 
 
@@ -85,10 +86,13 @@ async def trigger_wake_session(request: Request):
             set_state(WakeState.ARMED)
             audio_engine.unsubscribe(audio_q)
 
-    task = asyncio.create_task(_session_task(), name="trigger-session")
+    asyncio.create_task(_session_task(), name="trigger-session")
 
-    # Wait briefly for the session to create its meeting_id (it appears in DB within ~200ms)
-    await asyncio.sleep(0.3)
+    # Poll up to 2 s for meeting_id to appear in _state (set by _run_session after DB write).
+    for _ in range(20):
+        await asyncio.sleep(0.1)
+        mid = get_state().get("meeting_id")
+        if mid:
+            return {"triggered": True, "state": get_state()["state"].value, "meeting_id": mid}
 
-    # Return state so caller knows it started
-    return {"triggered": True, "state": get_state()["state"].value}
+    return {"triggered": True, "state": get_state()["state"].value, "meeting_id": None}
