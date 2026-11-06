@@ -10,7 +10,7 @@ packages = ["app"]
 # ---------------------------------------------------------------------------
 [project]
 name = "voxscribe-server"
-version = "0.7.0"
+version = "0.7.1"
 description = "Local engine implementing the Ideascribe contract: meetings, knowledge, live transcription, enrichment"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -49,7 +49,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "pyyaml>=6.0",
     "psycopg[binary,pool]>=3.1",
-    "voxscribe-core>=0.0.1",
+    "voxscribe-core[knowledge]==0.1.1",
     "httpx>=0.27",
     "faster-whisper>=1.0",
     "pyjwt>=2.15.1",
@@ -99,8 +99,14 @@ voxscribe-engine = "app.local.engine:run"
 # ---------------------------------------------------------------------------
 # Path dependencies (uv)
 # ---------------------------------------------------------------------------
+# voxscribe-core comes from a wheel that is tracked in this repository under
+# wheels/, so any checkout works with no sibling repository. The path is relative
+# to this file, and uv.lock records the wheel's sha256. When the pinned version
+# changes, update the dependency pin above and the file name below, or run
+# `make core-wheel` and follow what it prints.
+# Development against the sibling core: `make core-dev`. Back to the wheel: `make core-pinned`.
 [tool.uv.sources]
-voxscribe-core = { path = "../voxscribe-core", editable = true }
+voxscribe-core = { path = "wheels/voxscribe_core-0.1.1-py3-none-any.whl" }
 
 # ---------------------------------------------------------------------------
 # Tool: pytest

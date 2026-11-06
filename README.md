@@ -48,6 +48,52 @@ device, and a stale claim past `RECORDING_TTL_SECONDS` is reclaimed so a crashed
 client never blocks a device permanently. The one-shot upload path does not
 claim a device, since the recording already finished client-side.
 
+## voxscribe-core dependency
+
+This server depends on voxscribe-core, the shared intelligence kernel. The
+dependency is pinned to an exact version and resolved from a wheel that is
+tracked in this repository at `wheels/voxscribe_core-0.1.1-py3-none-any.whl`.
+The path is relative to `pyproject.toml` and `uv.lock` records the wheel's
+sha256, so any checkout builds the same way with no sibling repository needed.
+The `knowledge` extra (pypdf, openpyxl) is requested, so PDF and spreadsheet
+ingestion work.
+
+To rebuild the wheel from a core release tag (after a core update):
+
+```bash
+make core-wheel                       # builds from ../voxscribe-core at tag v0.1.1
+make core-wheel CORE_TAG=v0.1.2       # or another tag; CORE_DIR=... for another checkout
+# if the version changed, update the pin and the file name in pyproject.toml, then:
+uv lock --upgrade-package voxscribe-core && git add wheels pyproject.toml uv.lock
+```
+
+Rebuilding from the same tag gives the same bytes (the build uses the tag's commit
+time), so the hash only changes when core's content changes. If you swap the wheel
+without refreshing the lock, `uv sync --frozen` refuses it because the hash no longer
+matches. That is the pin doing its job.
+
+### Development: switch between the pinned wheel and the sibling core
+
+To work on voxscribe-core while running this server:
+
+```bash
+make core-dev            # installs ../voxscribe-core in editable mode
+# ... change ../voxscribe-core; changes are picked up on the next import ...
+make core-pinned         # back to the pinned wheel
+```
+
+Switching back uses `uv sync --frozen --extra dev --reinstall-package voxscribe-core`.
+While you are working against the sibling core, do not run a plain `uv sync`: it
+reinstalls the pinned wheel and, without `--extra dev`, removes pytest and the other
+dev tools.
+
+### About the wheel in git
+
+`wheels/*.whl` is a binary (about 240 KB) that lives in git history, so each distinct
+rebuild adds a blob. Rebuild only when core has a new release tag, and squash
+intermediate rebuilds before merging. When a private package index exists, replace
+the tracked wheel with it.
+
 ## Run it
 
 ```bash

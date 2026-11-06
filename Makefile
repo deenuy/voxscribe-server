@@ -235,3 +235,39 @@ db-reset: ## Drop and recreate the engine schema (requires CONFIRM=yes)
 .PHONY: clean
 clean: ## Remove the local data directory (sessions + sqlite db)
 	rm -rf ./data
+
+# ---------------------------------------------------------------------------
+# Core wheel management (rebuild from source, switch between pinned/dev)
+# ---------------------------------------------------------------------------
+
+CORE_DIR ?= ../voxscribe-core
+CORE_TAG ?= v0.1.1
+# Name the interpreter explicitly: a stale ~/.python-version makes uv build fail under $HOME otherwise.
+CORE_PYTHON ?= 3.13
+
+.PHONY: core-wheel
+core-wheel: ## Rebuild the pinned voxscribe-core wheel from a core git tag
+	@echo "Building voxscribe-core from tag $(CORE_TAG) in $(CORE_DIR)..."
+	@set -e; TMPDIR=$$(mktemp -d); \
+	  git -C "$(CORE_DIR)" archive "$(CORE_TAG)" | tar -x -C "$$TMPDIR"; \
+	  SOURCE_DATE_EPOCH=$$(git -C "$(CORE_DIR)" log -1 --format=%ct "$(CORE_TAG)") \
+	    uv build --wheel --python "$(CORE_PYTHON)" --out-dir "$$TMPDIR/dist" "$$TMPDIR"; \
+	  WHL_BASE=$$(basename "$$(ls -1 $$TMPDIR/dist/voxscribe_core-*.whl | tail -1)"); \
+	  rm -f wheels/voxscribe_core-*.whl; \
+	  cp "$$TMPDIR/dist/$$WHL_BASE" wheels/; \
+	  rm -rf "$$TMPDIR"; \
+	  echo "Wheel ready: wheels/$$WHL_BASE"; \
+	  echo "SHA256: $$(shasum -a 256 wheels/$$WHL_BASE | cut -d' ' -f1)"; \
+	  echo "Next: make sure pyproject.toml pins this version and names this file under [tool.uv.sources],"; \
+	  echo "      then run: uv lock --upgrade-package voxscribe-core && git add wheels pyproject.toml uv.lock"
+
+.PHONY: core-dev
+core-dev: ## Switch to editable development source of voxscribe-core (sibling repo)
+	uv pip install --python .venv/bin/python -e $(CORE_DIR)
+	@echo "Switched to editable voxscribe-core from $(CORE_DIR)"
+	@echo "Do not run a plain 'uv sync' now: it reinstalls the pinned wheel. Use 'make core-pinned' to switch back."
+
+.PHONY: core-pinned
+core-pinned: ## Switch back to the pinned wheel version (keeps the dev tools such as pytest)
+	uv sync --frozen --extra dev --reinstall-package voxscribe-core
+	@echo "Switched back to pinned wheel from wheels/"
