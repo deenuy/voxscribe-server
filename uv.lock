@@ -2128,14 +2128,14 @@ wheels = [
 
 [[package]]
 name = "voxscribe-core"
-version = "0.1.1"
-source = { path = "wheels/voxscribe_core-0.1.1-py3-none-any.whl" }
+version = "0.2.0"
+source = { path = "wheels/voxscribe_core-0.2.0-py3-none-any.whl" }
 dependencies = [
     { name = "pyyaml" },
     { name = "tzdata" },
 ]
 wheels = [
-    { filename = "voxscribe_core-0.1.1-py3-none-any.whl", hash = "sha256:0051c51bb7f1a769d56ed2dd9e768f085f0fea6a325a40fb9af3740c534d3211" },
+    { filename = "voxscribe_core-0.2.0-py3-none-any.whl", hash = "sha256:1655da73d215e99285da076fdd21045eeb6f66c2607e79804edf4d2e92cf6406" },
 ]
 
 [package.optional-dependencies]
@@ -2147,7 +2147,10 @@ knowledge = [
 [package.metadata]
 requires-dist = [
     { name = "faster-whisper", marker = "extra == 'listen'", specifier = ">=1.0" },
+    { name = "faster-whisper", marker = "extra == 'speech'", specifier = ">=1.0" },
     { name = "numpy", marker = "extra == 'listen'", specifier = ">=1.24" },
+    { name = "numpy", marker = "extra == 'speech'", specifier = ">=1.24" },
+    { name = "onnxruntime", marker = "extra == 'speech'", specifier = ">=1.16" },
     { name = "openpyxl", marker = "extra == 'knowledge'", specifier = ">=3.0" },
     { name = "pyobjc-framework-cocoa", marker = "extra == 'mac'", specifier = ">=10" },
     { name = "pypdf", marker = "extra == 'knowledge'", specifier = ">=4.0" },
@@ -2157,7 +2160,7 @@ requires-dist = [
     { name = "sounddevice", marker = "extra == 'listen'", specifier = ">=0.4" },
     { name = "tzdata", specifier = ">=2026.2" },
 ]
-provides-extras = ["dev", "mac", "listen", "knowledge", "meeting"]
+provides-extras = ["dev", "mac", "listen", "speech", "knowledge", "meeting"]
 
 [[package]]
 name = "voxscribe-server"
@@ -2227,7 +2230,7 @@ requires-dist = [
     { name = "sounddevice", marker = "extra == 'wake'", specifier = ">=0.4" },
     { name = "soundfile", specifier = ">=0.14.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.29" },
-    { name = "voxscribe-core", extras = ["knowledge"], path = "wheels/voxscribe_core-0.1.1-py3-none-any.whl" },
+    { name = "voxscribe-core", extras = ["knowledge"], path = "wheels/voxscribe_core-0.2.0-py3-none-any.whl" },
     { name = "voxscribe-server", extras = ["local-asr", "wake", "dev"], marker = "extra == 'all'" },
     { name = "youtube-transcript-api", specifier = ">=1.2.4" },
 ]
