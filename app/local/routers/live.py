@@ -6,13 +6,20 @@ import json
 import logging
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
-from voxscribe.meeting.live import LiveTranscriber
+from voxscribe.speech import SpeechDetectorUnavailable
 
 from app.local import meeting_bus, tenancy
 from app.local.audio_ring import AudioRing
 from app.local.identity import IdentityError, tenant_for
 from app.local.enrichment import EnrichmentService
-from app.local.live_support import build_live_assist, build_retriever
+from app.local.live_support import (
+    LEVEL_INTERVAL_MS,
+    build_live_assist,
+    build_live_transcriber,
+    build_retriever,
+    level_message,
+    vad_message,
+)
 from app.local.models import Block, EnhancedBlock, Segment
 from app.local.store_meetings import MeetingStore
 
@@ -21,12 +28,19 @@ log = logging.getLogger(__name__)
 
 
 @router.websocket("/{meeting_id}/live")
-async def live_meeting(websocket: WebSocket, meeting_id: str, token: str = Query(None), identity: str = Query(None)):
+async def live_meeting(
+    websocket: WebSocket,
+    meeting_id: str,
+    token: str = Query(None),
+    identity: str = Query(None),
+    levels: int = Query(0),
+):
     """WebSocket endpoint for live meeting transcription.
 
     Clients connect with token auth (and, when tenant isolation is on, the account's access token as `identity`:
     a browser cannot set headers on a WebSocket). The tenant is fixed once at connect and held for the whole
-    recording; everything the connection starts runs inside it.
+    recording; everything the connection starts runs inside it. `levels=1` opts in to `vad.level` messages (the
+    detector's latest speech probability, at most 10 per second of audio; only the detector modes have one).
     """
     app = websocket.scope.get("app")
     if app is not None and getattr(app.state, "identity", None) is not None:
@@ -36,12 +50,12 @@ async def live_meeting(websocket: WebSocket, meeting_id: str, token: str = Query
             await websocket.close(code=1008, reason="identity required")
             return
         with tenancy.tenant_scope(scope):
-            await _live_meeting(websocket, meeting_id, token)
+            await _live_meeting(websocket, meeting_id, token, bool(levels))
         return
-    await _live_meeting(websocket, meeting_id, token)
+    await _live_meeting(websocket, meeting_id, token, bool(levels))
 
 
-async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None):
+async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None, send_levels: bool = False):
     # Extract app from scope first (before validation)
     app = websocket.scope.get("app")
     if not app:
@@ -88,13 +102,15 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
             return
 
         settings = getattr(app.state, "settings", None)
-        transcriber = LiveTranscriber(
-            asr_provider,
-            session_id=meeting_id,
-            vad_mode=getattr(settings, "live_vad_mode", "adaptive"),
-            max_segment_ms=getattr(settings, "live_max_segment_ms", 15000) or None,
-        )
-        speaking = False  # last speech state told to the client
+        try:
+            transcriber = build_live_transcriber(settings, asr_provider, meeting_id)
+        except SpeechDetectorUnavailable as e:
+            log.error(f"Live turn detection unavailable for {meeting_id}: {e}")
+            await websocket.send_json({"type": "error", "code": "provider_unavailable", "detail": f"speech detector unavailable: {e}"})
+            await websocket.close(code=1011, reason="provider unavailable")
+            return
+        last_level_ms = -LEVEL_INTERVAL_MS  # session time of the last vad.level sent
+        send_levels = bool(levels)
         # Set to True when schedule_finalize is called from inside the session (auto-stop
         # path) so the finally block does not schedule a second finalization.
         finalize_scheduled = False
@@ -179,7 +195,7 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
 
         # Consumer: drains the ring and calls push_audio off the event loop
         async def audio_consumer():
-            nonlocal speaking
+            nonlocal last_level_ms
             _auto_stop_silence_start_ms = None
 
             while True:
@@ -196,10 +212,19 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                     log.error(f"Transcription error: {e}")
                     continue
 
-                if transcriber.in_speech != speaking:
-                    speaking = transcriber.in_speech
+                for transition in transcriber.pop_speech_transitions():
                     try:
-                        await websocket.send_json({"type": "vad", "speech": speaking})
+                        await websocket.send_json(vad_message(transition))
+                    except Exception:
+                        pass
+                if (
+                    send_levels
+                    and transcriber.speech_probability is not None
+                    and transcriber.speech_probability_at_ms - last_level_ms >= LEVEL_INTERVAL_MS
+                ):
+                    last_level_ms = transcriber.speech_probability_at_ms
+                    try:
+                        await websocket.send_json(level_message(last_level_ms, transcriber.speech_probability))
                     except Exception:
                         pass
 
@@ -394,9 +419,9 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                 ring.stats.peak_fill_ms,
             )
 
-            # Flush any words still in the ASR buffer after consumer drained.
+            # close() flushes tail words and logs the session summary (audio/speech seconds, detector, mode).
             try:
-                tail = await asyncio.to_thread(transcriber.flush)
+                tail = await asyncio.to_thread(transcriber.close)
                 await _publish_stable(websocket, store, meeting_id, tail, send=False)
             except Exception as e:
                 log.warning(f"Could not keep the last words of {meeting_id}: {e}")

@@ -250,3 +250,46 @@ def test_config_float_parsing():
     finally:
         del os.environ["VOXSCRIBE_LLM_TEMPERATURE"]
         del os.environ["VOXSCRIBE_LIVE_TEMPERATURE"]
+
+
+# ---- live turn detection mode: four values, no silent fallback -------------------------------------------------
+
+
+def test_live_vad_mode_defaults_to_adaptive_and_accepts_every_detector():
+    os.environ.pop("VOXSCRIBE_LIVE_VAD_MODE", None)
+    assert Config.from_env().live_vad_mode == "adaptive"  # the ADR: no default change before the evaluation wins
+    try:
+        for mode in ("fixed", "adaptive", "heuristic"):
+            os.environ["VOXSCRIBE_LIVE_VAD_MODE"] = mode
+            assert Config.from_env().live_vad_mode == mode
+        os.environ["VOXSCRIBE_LIVE_VAD_MODE"] = "Silero"  # case does not matter
+        from voxscribe.speech.silero import SileroDetector
+
+        if SileroDetector.is_available():
+            assert Config.from_env().live_vad_mode == "silero"
+        else:
+            with pytest.raises(SystemExit):
+                Config.from_env()
+    finally:
+        del os.environ["VOXSCRIBE_LIVE_VAD_MODE"]
+
+
+def test_live_vad_mode_refuses_an_unknown_value():
+    os.environ["VOXSCRIBE_LIVE_VAD_MODE"] = "loud"
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            Config.from_env()
+        assert exc_info.value.code == 2
+    finally:
+        del os.environ["VOXSCRIBE_LIVE_VAD_MODE"]
+
+
+def test_silero_that_cannot_run_is_a_startup_error_not_a_quiet_fallback(monkeypatch, capsys):
+    from voxscribe.speech.silero import SileroDetector
+
+    monkeypatch.setattr(SileroDetector, "unavailable_reason", classmethod(lambda cls: "onnxruntime is missing"))
+    monkeypatch.setenv("VOXSCRIBE_LIVE_VAD_MODE", "silero")
+    with pytest.raises(SystemExit) as exc_info:
+        Config.from_env()
+    assert exc_info.value.code == 2
+    assert "onnxruntime is missing" in capsys.readouterr().err

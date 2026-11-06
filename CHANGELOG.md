@@ -1,5 +1,31 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.8.0
+
+### New Features
+- Added two live turn detection modes, `VOXSCRIBE_LIVE_VAD_MODE=silero` and `heuristic`, which segment speech with core's shared speech activity capability under its segmentation policy; the default stays `adaptive` and `silero` refuses to start with the reason when its model or runtime is missing.
+- Added `at_ms`, `p` and `detector` to the live socket's `vad` message, so old clients keep reading `type` and `speech` while new ones get richer timing and probability data.
+- Added an opt-in `vad.level` message (`levels=1` on the live URL, at most 10 per second of audio) that carries the detector's latest speech probability for a live level meter.
+- Added `speech_activity` to `/v1/health`: the detectors this machine can run, the configured live mode and the spec version.
+- Added a live turn detection evaluation script (`scripts/eval_live_vad.py`) that scores every mode on the baseline fixture with fan noise and noise-only clips and writes `results/eval-live-vad.json`.
+- Added multi-turn conversations to the voice assistant: after answering, it stays listening for the next question for up to 20 seconds, so a full back-and-forth exchange needs only one wake phrase.
+- Added stop-phrase recognition so saying "thank you vox", "bye vox", or similar phrases ends the conversation and returns the assistant to standby without waiting for the idle timeout.
+- Added speculative response start that begins generating the reply while speech recognition is still finishing its final pass, reducing first-audio latency from around 4.7 seconds to around 2 seconds on a warm device.
+- Added a no-authentication mode for development and testing, letting the engine accept WebSocket and trigger connections without requiring a token.
+
+### UX Improvements
+- Improved engine log output to show a structured timestamp, log level, and component label on every line, making it faster to identify which part of the voice pipeline each message came from.
+
+### Bug Fixes
+- Fixed voice-session recordings left open by a server restart appearing as interrupted sessions, which prompted a spurious resume dialog on the next app launch.
+- Fixed the wake trigger endpoint returning before the meeting identifier was available, causing callers to receive an empty meeting ID.
+- Fixed voice reply events not being forwarded to open WebSocket connections, so live session listeners now receive spoken response text as it arrives.
+
+### Changed
+- Changed the wake-word model setup so it loads only when the listener first activates, removing openwakeword and onnxruntime as declared install extras.
+- Changed the live connection to log one summary per recording (seconds of audio and speech, utterances, recognizer time, mode and detector) at the end of each session.
+
+
 ## What's New in VoxScribe Server 0.7.1
 
 ### Changed
