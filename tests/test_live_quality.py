@@ -36,8 +36,11 @@ class _Store:
     async def get_enhanced(self, meeting_id):
         return {"blocks": []}
 
-    async def set_summary(self, meeting_id, overview, details, generated_at):
+    async def set_summary(self, meeting_id, overview, details, generated_at, **kwargs):
         self.saved = (overview, details)
+
+    async def set_summary_status(self, meeting_id, status):
+        pass
 
 
 async def test_no_speech_skips_the_model(monkeypatch, caplog):
@@ -61,6 +64,7 @@ async def test_an_unusable_summary_is_tried_once_more(monkeypatch):
         return SimpleNamespace(overview="We talked.", details=[SimpleNamespace(title="A", body="B")])
 
     monkeypatch.setattr(summary_service, "summarize_meeting", summarize)
+    monkeypatch.setattr(summary_service, "MIN_WORDS_FOR_SUMMARY", 0)
     store = _Store(["hello there"])
     await SummaryService(store, llm=object()).generate_summary("m1")
     assert len(attempts) == 2

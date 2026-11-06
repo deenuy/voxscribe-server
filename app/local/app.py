@@ -34,11 +34,31 @@ async def lifespan(app: FastAPI):
     """FastAPI lifespan context manager."""
     log.info("engine startup: initializing components")
 
-    # Start wake word listener if enabled
+    # Start AudioEngine (single mic + speaker stream) when wake is enabled.
     wake_task = None
     if getattr(app.state, "wake_enabled", False):
+        try:
+            from app.local.audio_engine import AudioEngine
+            import os as _os
+            engine = AudioEngine(
+                capture_device=_os.environ.get("VOXSCRIBE_CAPTURE_DEVICE") or None,
+                playback_device=_os.environ.get("VOXSCRIBE_PLAYBACK_DEVICE") or None,
+            )
+            await engine.start()
+            app.state.audio_engine = engine
+            log.info("audio-engine: started (capture+playback)")
+        except Exception as exc:
+            log.warning("audio-engine: could not start -- wake loop will use direct stream: %s", exc)
+
+        try:
+            from app.local.reply_chain import warm_phrase_cache
+            await warm_phrase_cache()
+            log.info("reply-chain: phrase cache warmed")
+        except Exception as exc:
+            log.warning("reply-chain: phrase cache warm failed: %s", exc)
+
         from app.local.wake_loop import run_wake_loop
-        log.info("wake-word-listener: initializing -- model=hey_jarvis")
+        log.info("wake-word-listener: initializing -- model=whisper/tiny.en phrase=env:VOXSCRIBE_WAKE_PHRASE")
         wake_task = asyncio.create_task(run_wake_loop(app), name="wake-loop")
         log.info("wake-word-listener: task created, awaiting mic open")
 
@@ -85,6 +105,9 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "ingestion_worker"):
         await app.state.ingestion_worker.stop()
         log.info("ingestion-worker: stopped")
+    if hasattr(app.state, "audio_engine"):
+        await app.state.audio_engine.stop()
+        log.info("audio-engine: stopped")
     if hasattr(app.state, "store"):
         await app.state.store.close()
     log.info("engine shutdown: complete")
@@ -385,6 +408,14 @@ async def create_app(
             except Exception:
                 embedding_name = f"ollama:{settings.embed_model}"
 
+        # SearXNG health
+        from app.local.tools.web_search import is_reachable as searxng_reachable
+        try:
+            searxng_ok = await searxng_reachable()
+        except Exception:
+            searxng_ok = False
+        searxng_status = "reachable" if searxng_ok else "down"
+
         status = "ok" if (db_ok and asr_ok and llm_ok and embedding_ok) else "degraded"
 
         result = {
@@ -428,6 +459,7 @@ async def create_app(
                     "name": embedding_name,
                 },
             },
+            "searxng": searxng_status,
         }
         return result
 

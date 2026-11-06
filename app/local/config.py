@@ -83,13 +83,23 @@ class Config:
     def tenancy_enforced(self) -> bool:
         return bool(self.identity_issuer and self.identity_audience and self.identity_jwks_url)
 
-    # Voice (planned, accepted but unused)
+    # Voice
     voice_enabled: bool = False
     tts_engine: str = "piper"
     tts_voice: str = ""
     voice_barge_in: bool = True
     voice_echo_guard: bool = True
     voice_max_reply_seconds: int = 20
+    voice_mode: str = "default"          # default | classroom | seniorcare
+    voice_reply_model: str = "llama3.2"  # 3B-4B class for spoken replies
+
+    # Wake word — any phrase, no model training required (VOXSCRIBE_WAKE_PHRASE)
+    wake_phrase: str = "hey vox"
+
+    # Context header injected into every reply turn
+    vox_timezone: str = "UTC"
+    vox_location: str = ""
+    vox_user_name: str = ""
 
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "Config":
@@ -100,10 +110,14 @@ class Config:
         2. Dotenv file (if env_file or VOXSCRIBE_ENV_FILE points to one)
         3. Built-in defaults (in the dataclass)
         """
-        # Load dotenv file if specified
+        # Load dotenv file: explicit arg > VOXSCRIBE_ENV_FILE env var > .env in CWD
         env_vars = {}
         if env_file is None:
             env_file = os.environ.get("VOXSCRIBE_ENV_FILE")
+        if env_file is None:
+            candidate = Path.cwd() / ".env"
+            if candidate.exists():
+                env_file = str(candidate)
 
         if env_file and Path(env_file).exists():
             env_vars = _parse_env_file(env_file)
@@ -264,6 +278,30 @@ class Config:
         config_dict["voice_max_reply_seconds"] = _parse_int(
             env_vars, "VOXSCRIBE_VOICE_MAX_REPLY_SECONDS", 20
         )
+
+        voice_mode = env_vars.get("VOXSCRIBE_VOICE_MODE", "").strip().lower()
+        if voice_mode:
+            if voice_mode not in ("default", "classroom", "seniorcare"):
+                _fail("VOXSCRIBE_VOICE_MODE", f"must be default|classroom|seniorcare, got {voice_mode!r}")
+            config_dict["voice_mode"] = voice_mode
+
+        voice_reply_model = env_vars.get("VOXSCRIBE_VOICE_REPLY_MODEL", "").strip()
+        if voice_reply_model:
+            config_dict["voice_reply_model"] = voice_reply_model
+
+        wake_phrase = env_vars.get("VOXSCRIBE_WAKE_PHRASE", "").strip().lower()
+        if wake_phrase:
+            config_dict["wake_phrase"] = wake_phrase
+
+        # Context header — read VOX_* from .env or os.environ
+        for env_key, field in (
+            ("VOX_TIMEZONE", "vox_timezone"),
+            ("VOX_LOCATION", "vox_location"),
+            ("VOX_USER_NAME", "vox_user_name"),
+        ):
+            val = env_vars.get(env_key, "") or os.environ.get(env_key, "")
+            if val.strip():
+                config_dict[field] = val.strip()
 
         return cls(**config_dict)
 

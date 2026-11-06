@@ -1,5 +1,24 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.7.0
+
+### New Features
+- Added multi-turn conversations to the voice assistant: after answering, it stays listening for the next question for up to 20 seconds, so a full back-and-forth exchange needs only one wake phrase.
+- Added stop-phrase recognition so saying "thank you vox", "bye vox", or similar phrases ends the conversation and returns the assistant to standby without waiting for the idle timeout.
+- Added speculative response start that begins generating the reply while speech recognition is still finishing its final pass, reducing first-audio latency from around 4.7 seconds to around 2 seconds on a warm device.
+- Added a no-authentication mode for development and testing, letting the engine accept WebSocket and trigger connections without requiring a token.
+
+### UX Improvements
+- Improved engine log output to show a structured timestamp, log level, and component label on every line, making it faster to identify which part of the voice pipeline each message came from.
+
+### Bug Fixes
+- Fixed voice-session recordings left open by a server restart appearing as interrupted sessions, which prompted a spurious resume dialog on the next app launch.
+- Fixed the wake trigger endpoint returning before the meeting identifier was available, causing callers to receive an empty meeting ID.
+- Fixed voice reply events not being forwarded to open WebSocket connections, so live session listeners now receive spoken response text as it arrives.
+
+### Changed
+- Changed the wake-word model setup so it loads only when the listener first activates, removing openwakeword and onnxruntime as declared install extras.
+
 ## What's New in VoxScribe Server 0.6.1
 
 ### Bug Fixes

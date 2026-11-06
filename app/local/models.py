@@ -50,7 +50,7 @@ class Meeting(BaseModel):
     hasTranscript: bool = False
     hasSummary: bool = False
     projectId: str | None = None
-    origin: Literal["recorded", "text", "file", "youtube"] = "recorded"
+    origin: Literal["recorded", "text", "file", "youtube", "wake"] = "recorded"
     language: str | None = None
     segmentCount: int = 0
     wordCount: int = 0

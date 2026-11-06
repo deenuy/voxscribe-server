@@ -10,6 +10,8 @@ ENGINE_DB            ?= postgresql://localhost:5432/ideascribe_dev
 ENGINE_LOG           ?= /tmp/engine.log
 ENGINE_READY_TIMEOUT ?= 30
 
+WAKE_LOG             ?= /tmp/engine_wake.log
+
 # Load .env if present so VOXSCRIBE_TOKEN does not need to be passed manually.
 -include .env
 export
@@ -104,6 +106,104 @@ engine-logs: ## Tail the engine log
 	@chmod +x $(CONSOLE)
 	@ENGINE_PORT=$(ENGINE_PORT) ENGINE_LOG=$(ENGINE_LOG) \
 	  bash $(CONSOLE) logs
+
+.PHONY: wake
+wake: ## Kill any engine, start in wake+default mode, wait for "reply model warmed"
+	@echo "Stopping any running wake engine..."
+	@pkill -f "app.local.engine.*--wake" 2>/dev/null || true
+	@sleep 1
+	@echo "Starting wake engine (default mode, no-auth)..."
+	@uv run python3 -m app.local.engine --wake --no-auth --port 0 \
+	  > $(WAKE_LOG) 2>&1 &
+	@echo "Waiting for reply model warm..."
+	@for i in $$(seq 1 30); do \
+	  sleep 2; \
+	  grep -q "reply model warmed" $(WAKE_LOG) 2>/dev/null && break; \
+	  grep -q "Traceback\|startup failed\|Address already in use" $(WAKE_LOG) 2>/dev/null && \
+	    { echo "Engine failed — check $(WAKE_LOG)"; exit 1; }; \
+	done
+	@PORT=$$(grep '"port":' $(WAKE_LOG) 2>/dev/null | python3 -c \
+	  "import sys,json,re; m=re.search(r'\"port\": ?(\d+)', sys.stdin.read()); print(m.group(1) if m else '?')"); \
+	  echo ""; \
+	  echo "  Engine ready on port $$PORT  (log: $(WAKE_LOG))"; \
+	  echo "  Trigger: curl -s -X POST http://127.0.0.1:$$PORT/v1/wake/trigger"; \
+	  echo ""
+
+.PHONY: wake-trigger
+wake-trigger: ## Trigger one session on the running wake engine (speak immediately after)
+	@PORT=$$(grep '"port":' $(WAKE_LOG) 2>/dev/null | python3 -c \
+	  "import sys,json,re; m=re.search(r'\"port\": ?(\d+)', sys.stdin.read()); print(m.group(1) if m else '')"); \
+	  [ -z "$$PORT" ] && { echo "No wake engine found — run: make wake"; exit 1; }; \
+	  echo "Triggering session on port $$PORT — speak now"; \
+	  curl -s -X POST http://127.0.0.1:$$PORT/v1/wake/trigger
+
+.PHONY: wake-test6
+wake-test6: ## Trigger 6 sessions sequentially — speak after each TRIGGERING line
+	@PORT=$$(grep '"port":' $(WAKE_LOG) 2>/dev/null | python3 -c \
+	  "import sys,json,re; m=re.search(r'\"port\": ?(\d+)', sys.stdin.read()); print(m.group(1) if m else '')"); \
+	  [ -z "$$PORT" ] && { echo "No wake engine found — run: make wake"; exit 1; }; \
+	  ENGINE=http://127.0.0.1:$$PORT; \
+	  for i in 1 2 3 4 5 6; do \
+	    echo "$$(date +%H:%M:%S) session $$i: waiting for ARMED..."; \
+	    for _ in $$(seq 1 30); do \
+	      STATE=$$(curl -s $$ENGINE/v1/wake/state | python3 -c \
+	        "import sys,json; print(json.load(sys.stdin).get('state',''))" 2>/dev/null); \
+	      [ "$$STATE" = "armed" ] && break; sleep 2; \
+	    done; \
+	    echo "$$(date +%H:%M:%S) session $$i: TRIGGERING — speak now"; \
+	    curl -s -X POST $$ENGINE/v1/wake/trigger > /dev/null; \
+	    sleep 3; \
+	    for _ in $$(seq 1 60); do \
+	      STATE=$$(curl -s $$ENGINE/v1/wake/state | python3 -c \
+	        "import sys,json; print(json.load(sys.stdin).get('state',''))" 2>/dev/null); \
+	      [ "$$STATE" = "armed" ] && break; sleep 2; \
+	    done; \
+	    echo "$$(date +%H:%M:%S) session $$i: done"; \
+	    sleep 1; \
+	  done; \
+	  echo "All 6 done."
+
+.PHONY: wake-logs
+wake-logs: ## Tail the wake engine log
+	@tail -f $(WAKE_LOG)
+
+# ── SearXNG ────────────────────────────────────────────────────────────────────
+SEARXNG_DIR     ?= $(HOME)/services/searxng
+SEARXNG_PLIST   ?= $(HOME)/Library/LaunchAgents/com.voxscribe.searxng.plist
+SEARXNG_LABEL   ?= com.voxscribe.searxng
+SEARXNG_LOG     ?= /tmp/searxng.log
+SEARXNG_SETTINGS ?= $(SEARXNG_DIR)/etc/settings.yml
+
+.PHONY: searxng-install
+searxng-install: ## Clone and install SearXNG into ~/services/searxng with its own venv
+	@if [ -d "$(SEARXNG_DIR)/.git" ]; then \
+	  echo "SearXNG already cloned at $(SEARXNG_DIR)"; \
+	else \
+	  mkdir -p $(HOME)/services && git clone https://github.com/searxng/searxng.git $(SEARXNG_DIR); \
+	fi
+	@if [ ! -d "$(SEARXNG_DIR)/.venv" ]; then \
+	  echo "Creating venv..."; \
+	  python3 -m venv $(SEARXNG_DIR)/.venv; \
+	fi
+	@$(SEARXNG_DIR)/.venv/bin/pip install -r $(SEARXNG_DIR)/requirements.txt --quiet
+	@$(SEARXNG_DIR)/.venv/bin/pip install granian --quiet
+	@mkdir -p $(SEARXNG_DIR)/etc
+	@echo "SearXNG installed. Run: make searxng-start"
+
+.PHONY: searxng-start
+searxng-start: ## Load the SearXNG launchd agent (starts now and on login)
+	@launchctl load -w $(SEARXNG_PLIST) 2>/dev/null || launchctl load $(SEARXNG_PLIST)
+	@sleep 2
+	@curl -s http://127.0.0.1:8080/healthz > /dev/null && echo "SearXNG: reachable" || echo "SearXNG: not yet up (check $(SEARXNG_LOG))"
+
+.PHONY: searxng-stop
+searxng-stop: ## Unload the SearXNG launchd agent
+	@launchctl unload $(SEARXNG_PLIST) 2>/dev/null && echo "SearXNG: stopped" || echo "SearXNG: was not loaded"
+
+.PHONY: searxng-status
+searxng-status: ## Check if SearXNG is reachable
+	@curl -s http://127.0.0.1:8080/healthz > /dev/null && echo "SearXNG: reachable" || echo "SearXNG: down"
+	@launchctl list | grep $(SEARXNG_LABEL) || echo "(launchd job not loaded)"
 
 .PHONY: local
 local: ## Run the local engine with voxscribe-engine

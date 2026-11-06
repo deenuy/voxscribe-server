@@ -1,41 +1,98 @@
-"""POST /v1/wake — external wake-detected and transcript injection.
+"""Wake word state API.
 
-Useful for testing without a mic, and for a future MacBook-side client
-that detects a wake phrase locally and notifies the engine.
-
-Auth: same Bearer token as every other engine endpoint (enforced by the
-app-level middleware). No additional checks here.
+GET  /v1/wake/state     → {state, model, phrase}   states: armed | listening | off | error
+POST /v1/wake/arm       → arm (no-op if already armed/listening)
+POST /v1/wake/disarm    → set state to off; mic stream closes within ~32 ms
+POST /v1/wake/trigger   → DEBUG ONLY (--no-auth). Bypass OWW, start a session immediately.
+                          Returns {meeting_id}. Use for automated roomplay tests.
 """
 
-from fastapi import APIRouter, Request
-from pydantic import BaseModel
+import asyncio
+
+from fastapi import APIRouter, HTTPException, Request
 
 from app.local import events
+from app.local.wake_loop import WakeState, get_state, set_state
 
 router = APIRouter(prefix="/v1/wake", tags=["wake"])
 
 
-class WakeDetectedRequest(BaseModel):
-    phrase: str = "hey_vox"
+@router.get("/state")
+async def wake_state(_: Request):
+    s = get_state()
+    v = s["state"]
+    return {
+        "state":      v.value if isinstance(v, WakeState) else str(v),
+        "model":      s["model"],
+        "phrase":     s["phrase"],
+        "meeting_id": s.get("meeting_id"),
+    }
 
 
-class WakeTranscriptRequest(BaseModel):
-    text: str
+@router.post("/arm", status_code=200)
+async def arm_wake(_: Request):
+    current = get_state()["state"]
+    if current in (WakeState.ARMED, WakeState.LISTENING):
+        return {"state": current.value if isinstance(current, WakeState) else str(current),
+                "changed": False}
+    set_state(WakeState.ARMED)
+    events.publish("wake_state", get_state(), broadcast=True)
+    return {"state": WakeState.ARMED.value, "changed": True}
 
 
-@router.post("/detected", status_code=204)
-async def wake_detected(body: WakeDetectedRequest):
-    """Publish a wake_detected event to all SSE subscribers."""
-    events.publish("wake_detected", {"phrase": body.phrase}, broadcast=True)
+@router.post("/disarm", status_code=200)
+async def disarm_wake(_: Request):
+    current = get_state()["state"]
+    if current == WakeState.OFF:
+        return {"state": WakeState.OFF.value, "changed": False}
+    set_state(WakeState.OFF)
+    events.publish("wake_state", get_state(), broadcast=True)
+    return {"state": WakeState.OFF.value, "changed": True}
 
 
-@router.post("/transcript", status_code=204)
-async def wake_transcript(body: WakeTranscriptRequest):
-    """Publish a wake_transcript event to all SSE subscribers."""
-    events.publish("wake_transcript", {"text": body.text}, broadcast=True)
+@router.post("/trigger", status_code=202)
+async def trigger_wake_session(request: Request):
+    """DEBUG ONLY: bypass OWW and start a wake session immediately.
 
+    Only reachable when the server was started with --no-auth.
+    Use for automated roomplay tests where TTS voice doesn't trigger OWW.
+    Returns {meeting_id} immediately; session runs as a background task.
+    """
+    from app.local.wake_loop import _run_session
+    import numpy as np
 
-@router.get("/status")
-async def wake_status(request: Request):
-    """Report whether the wake loop is running in this engine process."""
-    return {"wake_enabled": bool(getattr(request.app.state, "wake_enabled", False))}
+    app = request.app
+    auth_disabled = getattr(app.state, "auth_disabled", False)
+    if not auth_disabled:
+        raise HTTPException(status_code=403, detail="trigger only available with --no-auth")
+
+    current = get_state()["state"]
+    if current == WakeState.LISTENING:
+        raise HTTPException(status_code=409, detail="session already in progress")
+
+    audio_engine = getattr(app.state, "audio_engine", None)
+    if audio_engine is None:
+        raise HTTPException(status_code=503, detail="audio engine not running")
+
+    # Subscribe to the AudioEngine capture stream for this session
+    audio_q = audio_engine.subscribe()
+
+    async def _session_task():
+        try:
+            await _run_session(app, audio_q, confidence=1.0, np=np)
+        finally:
+            # Mirror _mic_loop's finally: reset state so /trigger is not stuck
+            # in LISTENING forever (trigger path never goes through _mic_loop).
+            set_state(WakeState.ARMED)
+            audio_engine.unsubscribe(audio_q)
+
+    asyncio.create_task(_session_task(), name="trigger-session")
+
+    # Poll up to 2 s for meeting_id to appear in _state (set by _run_session after DB write).
+    for _ in range(20):
+        await asyncio.sleep(0.1)
+        mid = get_state().get("meeting_id")
+        if mid:
+            return {"triggered": True, "state": get_state()["state"].value, "meeting_id": mid}
+
+    return {"triggered": True, "state": get_state()["state"].value, "meeting_id": None}

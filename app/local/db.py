@@ -46,6 +46,7 @@ async def create_pool(database_url: str, min_size: int = 2, max_size: int = 10, 
         database_url,
         min_size=min_size,
         max_size=max_size,
+        open=False,
         configure=configure_conn if schema else None,
         reset=reset_connection,
     )

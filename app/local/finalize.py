@@ -53,7 +53,9 @@ def schedule_finalize(app, meeting_id: str) -> asyncio.Task:
 async def recover_unfinished(app) -> int:
     """At startup, recover meetings a crash left in mid-flight states.
 
-    'recording' sessions are marked 'interrupted' (their socket is gone; they can never be completed).
+    'recording' sessions whose origin='wake' are closed as 'done' — they are voice-assistant
+    turns the user never manually started, so there is nothing to resume. All other 'recording'
+    sessions are marked 'interrupted' so the user can choose to resume them.
     'processing' sessions are scheduled for finalization (enrichment + summary) as normal.
 
     With tenant isolation on, every tenant's schema is checked and each meeting is handled inside its own
@@ -65,27 +67,44 @@ async def recover_unfinished(app) -> int:
     store = MeetingStore(pool)
     enforced = getattr(pool, "enforced", False)
     total_interrupted = 0
+    total_wake_closed = 0
     total_processing = 0
     for scope in (await pool.provisioner.known_tenants()) if enforced else [None]:
         with tenancy.tenant_scope(scope) if scope else nullcontext():
             async with pool.connection() as conn:
                 recording_rows = await (
-                    await conn.execute("SELECT id FROM meetings WHERE status = 'recording'")
+                    await conn.execute(
+                        "SELECT id, origin FROM meetings WHERE status = 'recording'"
+                    )
                 ).fetchall()
                 processing_rows = await (
                     await conn.execute("SELECT id FROM meetings WHERE status = 'processing'")
                 ).fetchall()
-            for (meeting_id,) in recording_rows:
+            for (meeting_id, origin) in recording_rows:
                 try:
-                    await store.mark_interrupted(meeting_id)
+                    if origin == "wake":
+                        # Wake sessions are voice-assistant turns; the user never started them
+                        # manually, so closing as done (not interrupted) prevents a spurious
+                        # "resume recording?" dialog on next app launch.
+                        async with pool.connection() as conn:
+                            await conn.execute(
+                                "UPDATE meetings SET status='done', ended_at=NOW() WHERE id=%s AND status='recording'",
+                                (meeting_id,),
+                            )
+                            await conn.commit()
+                        total_wake_closed += 1
+                    else:
+                        await store.mark_interrupted(meeting_id)
+                        total_interrupted += 1
                 except Exception:
-                    log.error("Could not mark recording meeting %s as interrupted", meeting_id, exc_info=True)
+                    log.error("Could not recover recording meeting %s", meeting_id, exc_info=True)
             for (meeting_id,) in processing_rows:
                 schedule_finalize(app, meeting_id)
-            total_interrupted += len(recording_rows)
             total_processing += len(processing_rows)
+    if total_wake_closed:
+        log.info("Closed %d wake session(s) as done (server restart)", total_wake_closed)
     if total_interrupted:
         log.info("Marked %d recording session(s) as interrupted (server restart)", total_interrupted)
     if total_processing:
         log.info("Recovering %d meeting(s) left processing by a restart", total_processing)
-    return total_interrupted + total_processing
+    return total_interrupted + total_wake_closed + total_processing

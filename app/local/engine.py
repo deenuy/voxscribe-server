@@ -3,8 +3,11 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
+import time
+from datetime import UTC, datetime
 
 import uvicorn
 
@@ -15,6 +18,62 @@ from app.local.log_redaction import install as redact_secrets_in_logs
 from app.local.migrations import run_migrations
 
 VERSION = "0.1.0"
+
+_MONOTONIC_START = time.monotonic()
+
+
+class _AppHandler(logging.StreamHandler):
+    """Marker class so the already-installed guard can find this handler."""
+
+
+# Maps logger names to short component labels shown in [brackets].
+_COMPONENT_LABELS: dict[str, str] = {
+    "app.local.app":           "engine",
+    "app.local.wake":          "wake",
+    "app.local.reply_chain":   "reply",
+    "app.local.llm_adapter":   "llm",
+    "app.local.tts_engine":    "tts",
+    "app.local.audio_engine":  "audio",
+    "app.local.gate":          "gate",
+    "app.local.finalize":      "finalize",
+    "app.local.store_meetings":"store",
+    "app.local.end_of_turn":   "eot",
+}
+
+
+def _install_app_local_handler(log_level: str) -> None:
+    """Install a unified log handler that matches the app-console format exactly.
+
+    Format: 2026-10-17T05:33:44Z  INFO   [wake]  message
+
+    Also silences uvicorn's INFO startup chatter (Waiting for application
+    startup, Started server process …) since that's already captured by the
+    engine-start Makefile target.
+    Already-installed guard prevents double-add on uvicorn hot-reload.
+    """
+    logger = logging.getLogger("app.local")
+    if any(isinstance(h, _AppHandler) for h in logger.handlers):
+        return
+
+    class _Fmt(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            ts        = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            level     = record.levelname[:4]          # INFO→INFO  WARNING→WARN
+            component = _COMPONENT_LABELS.get(record.name, record.name.split(".")[-1])
+            return f"{ts}  {level}   [{component}]  {record.getMessage()}"
+
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    handler = _AppHandler()
+    handler.setFormatter(_Fmt())
+    handler.setLevel(level)
+    logger.setLevel(level)
+    logger.addHandler(handler)
+
+    # Silence uvicorn startup INFO lines — engine URL is already shown by the
+    # Makefile health check; these lines just add noise to the shared log tail.
+    for uv_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uv_log = logging.getLogger(uv_logger_name)
+        uv_log.setLevel(logging.WARNING)
 
 
 async def main():
@@ -89,6 +148,10 @@ async def main():
         ws_ping_interval=None,
         ws_ping_timeout=None,
     )
+    # app.local.* handler: writes wake + session lines with monotonic offset so they are sortable
+    # even when the wall clock jumps (NTP, sleep). Handler is added once here before the server starts.
+    _install_app_local_handler(settings.log_level)
+
     # uvicorn sets up its loggers in Config; the live socket's address carries tokens, so redact them in log lines.
     redact_secrets_in_logs()
 
