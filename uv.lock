@@ -2135,7 +2135,7 @@ dependencies = [
     { name = "tzdata" },
 ]
 wheels = [
-    { filename = "voxscribe_core-0.2.0-py3-none-any.whl", hash = "sha256:1655da73d215e99285da076fdd21045eeb6f66c2607e79804edf4d2e92cf6406" },
+    { filename = "voxscribe_core-0.2.0-py3-none-any.whl", hash = "sha256:784ad0e4a0f1384f6ff30532af7bedbca7757d30bbb938b2c40de69af0d9754a" },
 ]
 
 [package.optional-dependencies]
