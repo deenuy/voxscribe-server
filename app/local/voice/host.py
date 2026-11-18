@@ -57,10 +57,12 @@ from voxscribe.session.ports import (
     TurnDecision,
     WakeDetector,
 )
+from voxscribe.session.ports import ReplyStream
 from voxscribe.session.stages.reply import speak_reply
 from voxscribe.wake.gate import ASR_CONFIRM_PHRASE, FRAME_SAMPLES, GateConfig, WakeGate
 
 log = logging.getLogger("app.local.wake")
+log_tts = logging.getLogger("app.local.tts")
 
 SAMPLE_RATE = 16_000
 CHUNK_FRAMES = 512              # 32 ms at 16 kHz, the capture block
@@ -105,6 +107,9 @@ MAX_NO_SPEECH_PROB = 0.6        # Whisper's own no-speech threshold
 TRIGGER_DETECTOR = "trigger"    # wake_events.detector for the debug trigger route
 QUIET_HOURS_REASON = "quiet_hours"
 STOP_HINT = "thank you vox"
+
+# Clause-streaming constants (T11) -- keep in sync with clause_splitter.CLAUSE_GAP_MAX_MS
+_CLAUSE_GAP_MAX_MS = 300        # gap above this is perceptible; log a warning
 
 # Phrases that end the conversation, including Whisper mishearings of "vox" (wox, wux, walks).
 STOP_PHRASES: dict[str, set[str]] = {
@@ -240,6 +245,74 @@ class StreamClock:
 
     def mono_ms(self) -> int:
         return int(self._mono())
+
+
+class _ClauseTalker:
+    """Talker wrapper that logs a warning when synthesis of clause N+1 is not ready
+    before clause N's expected playback end (a perceptible gap between clauses).
+
+    The gap estimate is conservative: it compares synthesis duration against the
+    PCM length of the previous clause, treating play() as non-blocking (queued)
+    which is the AudioOut contract.
+    """
+
+    def __init__(self, inner: Talker, clock: StreamClock) -> None:
+        self._inner = inner
+        self._clock = clock
+        self._prev_pcm_duration_ms: int = 0
+        self._prev_synth_done_ms: int | None = None
+        self._clause_index: int = 0
+
+    @property
+    def sample_rate(self) -> int:
+        return self._inner.sample_rate
+
+    async def synthesize(self, text: str) -> np.ndarray:
+        self._clause_index += 1
+        t_start = self._clock.mono_ms()
+        pcm = await self._inner.synthesize(text)
+        t_done = self._clock.mono_ms()
+        synth_ms = t_done - t_start
+
+        # Gap = how much longer synthesis took than the previous clause's playback.
+        if self._prev_synth_done_ms is not None and self._clause_index > 1:
+            expected_prev_end = self._prev_synth_done_ms + self._prev_pcm_duration_ms
+            gap_ms = max(0, t_done - expected_prev_end)
+            if gap_ms > 0:
+                log_tts.warning(
+                    "tts: gap before clause %d dur_ms=%d synth_ms=%d (max=%d ms)",
+                    self._clause_index, gap_ms, synth_ms, _CLAUSE_GAP_MAX_MS,
+                )
+
+        # Record timing for the next clause's gap check.
+        pcm_len = getattr(pcm, "size", len(pcm))
+        if pcm_len > 0:
+            self._prev_pcm_duration_ms = int(pcm_len * 1000 / self._inner.sample_rate)
+        self._prev_synth_done_ms = t_done
+        return pcm
+
+    async def fixed(self, phrase: str) -> np.ndarray:
+        # Fixed phrases (cues, refusals) are not clauses; reset gap tracking.
+        self._prev_synth_done_ms = None
+        self._clause_index = 0
+        return await self._inner.fixed(phrase)
+
+    async def warm(self) -> None:
+        await self._inner.warm()
+
+
+async def _clause_sentence_stream(original_sentences):
+    """Wrap an async sentence iterator to yield clauses instead of sentences.
+
+    Each sentence from the delegate is split at valid clause boundaries so that
+    the first clause can be synthesised and queued for playback before the rest
+    of the sentence is ready. Gate and synthesis proceed per clause.
+    """
+    from app.local.voice.clause_splitter import split_into_clauses  # lazy: no model load
+
+    async for sentence in original_sentences:
+        for clause in split_into_clauses(sentence):
+            yield clause
 
 
 @dataclass
@@ -929,7 +1002,13 @@ class VoiceHost:
     async def reply_turn(self, session_id: str, turn_n: int, text: str, *,
                          history: list[dict] | None = None, speculation=None,
                          turn_end_ms: int = 0, asr_final_ms: int | None = None) -> str:
-        """Stages reply and playback for one turn. Returns the text recorded as spoken."""
+        """Stages reply and playback for one turn. Returns the text recorded as spoken.
+
+        Sentences from the delegate are split into clauses (T11): the first clause
+        is synthesised and queued for playback before the rest of the sentence
+        arrives. The gate is applied per clause. A _ClauseTalker wrapper logs a
+        warning when synthesis of clause N+1 is not ready before clause N ends.
+        """
         p = await self._ready()
         try:
             log.info("[Vox Thinking] turn=%d words=%d history_turns=%d", turn_n,
@@ -937,8 +1016,24 @@ class VoiceHost:
             turn = await p.store.begin_turn(session_id, turn_n, text)
             stream = await p.delegate.reply(text, session_id, turn_id=turn.turn_id,
                                             history=history, speculation=speculation)
+
+            # T11: split sentences into clauses so synthesis starts at the first
+            # clause boundary rather than waiting for the full sentence. The gate
+            # is applied per clause by speak_reply (each clause is treated as a
+            # sentence). AudioOut.play() returns once queued (non-blocking), so
+            # clause N plays while clause N+1 is being synthesised.
+            clause_stream = ReplyStream(
+                sentences=_clause_sentence_stream(stream.sentences),
+                source=stream.source,
+                cue=stream.cue,
+                lead_in=stream.lead_in,
+                fallback=stream.fallback,
+            )
+            clause_talker = _ClauseTalker(p.talker, p.clock)
+
             outcome = await speak_reply(
-                stream, gate=p.gate, talker=p.talker, audio_out=p.audio_out, clock=p.clock,
+                clause_stream, gate=p.gate, talker=clause_talker,
+                audio_out=p.audio_out, clock=p.clock,
                 user_text=text, session_tools=lambda: p.store.session_tools(session_id))
             if outcome.first_audio_ms is not None:
                 log.info("voice host: first audio +%d ms from turn end",
