@@ -4,15 +4,22 @@ One instance per process. Owns:
   - the capture stream  (microphone at 16 kHz, float32)
   - the playback stream (speaker, float32, sample rate matches TTS)
   - one monotonic clock (monotonic_ms()) shared by capture and playback timestamps
-  - a playback reference ring (last 250 ms of played samples, for AEC in R6)
-  - an EchoGuard passthrough stub (returns mic frames unchanged until R6 wires real AEC)
+  - a playback reference ring (last 250 ms of played samples, read by the barge-in gate)
+  - capture clean-up (T12): every capture chunk passes through AcousticEchoCanceller, which
+    subtracts what the speaker is playing (WebRTC AEC3) and, when enabled, then suppresses
+    stationary noise, before any subscriber sees it
+  - an EchoGuard time-based mute, kept behind the canceller as a fallback
+
+Capture path:
+    mic chunk -> echo cancellation -> noise suppression (opt-in) -> subscribers
+    (the voice host then applies the EchoGuard mute before ASR: AudioIn.capture_muted)
 
 Usage:
     engine = AudioEngine(capture_device="MacBook Pro Microphone", playback_device="MacBook Pro Speakers")
     await engine.start()
     sub = engine.subscribe()          # returns asyncio.Queue[np.ndarray]
     await engine.play(samples_f32)
-    engine.echo_guard(mic_frame)      # passthrough until R6
+    engine.echo_guard.observe(mic_frame, None)
     await engine.stop()
 
 One mic stream per process: the voice host (app/local/voice/host.py) reads it through the
@@ -27,6 +34,7 @@ Playback reference ring:
 import asyncio
 import collections
 import logging
+import threading
 import time
 
 log = logging.getLogger("app.local.audio_engine")
@@ -34,7 +42,17 @@ log = logging.getLogger("app.local.audio_engine")
 _CAPTURE_RATE     = 16_000   # Hz; matches faster-whisper and OWW
 _PLAYBACK_RATE    = 24_000   # Hz; Kokoro MLX / Piper output rate
 _CHUNK_FRAMES     = 512      # 32 ms at capture rate
-_PLAYBACK_REF_MS  = 250      # milliseconds of playback kept for AEC
+_PLAYBACK_REF_MS  = 250      # milliseconds of playback kept for the barge-in gate
+
+# Capture clean-up (T12). WebRTC's audio processing runs on 10 ms frames.
+_APM_FRAME_MS        = 10
+# Far-end audio held for the canceller before the oldest is dropped. The playback loop pushes one
+# sentence at a time, so this only fills if capture stops while playback continues.
+_REFERENCE_BACKLOG_S = 60
+# WebRTC noise suppression level: 0..3 is 6, 12, 18, 21 dB. 1 is the library default.
+# Suppression is opt-in (Config.noise_suppress_enabled): it raised recognizer word error on the
+# 10 dB SNR fan fixture, which T12's acceptance does not allow.
+_NS_LEVEL            = 1
 
 # Shared epoch for all monotonic timestamps in this process.
 _EPOCH = time.monotonic()
@@ -63,7 +81,8 @@ class EchoGuard:
     ("pass", mic_frame) otherwise.
 
     Callers must discard "muted" frames — never push them to ASR.
-    Full AEC (correlation-based) is deferred until after daily-use baseline.
+    Since T12 the capture path is echo-cancelled before this guard sees it
+    (AcousticEchoCanceller); the mute stays as a second line for a burst the canceller misses.
     """
 
     _TAIL_MS = 500
@@ -107,6 +126,227 @@ class _PlaybackRefRing:
         return list(self._buf)
 
 
+class _SampleFifo:
+    """First-in first-out float32 samples, read in exact lengths. Not thread-safe on its own."""
+
+    def __init__(self, np, max_samples: int | None = None) -> None:
+        self._np = np
+        self._chunks: collections.deque = collections.deque()
+        self._head = 0          # samples already read from the first chunk
+        self._size = 0
+        self._max = max_samples
+        self.dropped = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    def push(self, samples) -> None:
+        arr = self._np.asarray(samples, dtype=self._np.float32).reshape(-1)
+        if arr.size == 0:
+            return
+        self._chunks.append(arr)
+        self._size += arr.size
+        if self._max is not None and self._size > self._max:
+            self.dropped += self._size - self._max
+            self._discard(self._size - self._max)
+
+    def pop(self, n: int):
+        """Return exactly n samples; zeros fill whatever the queue does not hold."""
+        out = self._np.zeros(n, dtype=self._np.float32)
+        filled = 0
+        while filled < n and self._chunks:
+            first = self._chunks[0]
+            take = min(n - filled, first.size - self._head)
+            out[filled: filled + take] = first[self._head: self._head + take]
+            filled += take
+            self._advance(take)
+        return out
+
+    def clear(self) -> None:
+        self._chunks.clear()
+        self._head = 0
+        self._size = 0
+
+    def _discard(self, n: int) -> None:
+        while n > 0 and self._chunks:
+            take = min(n, self._chunks[0].size - self._head)
+            self._advance(take)
+            n -= take
+
+    def _advance(self, n: int) -> None:
+        self._head += n
+        self._size -= n
+        if self._head >= self._chunks[0].size:
+            self._chunks.popleft()
+            self._head = 0
+
+
+class _LinearResampler:
+    """Streaming linear-interpolation resampler, continuous across chunk boundaries.
+
+    Converts the playback reference to the capture rate. Linear interpolation folds a little of
+    the band above the capture Nyquist back in; measured on TTS speech it cancels as well as a
+    polyphase filter, so the simpler form is kept.
+    """
+
+    def __init__(self, np, src_rate: int, dst_rate: int) -> None:
+        self._np = np
+        self._step = src_rate / dst_rate
+        self._t = 0.0       # next output position, in source samples, from the next chunk start
+        self._last = 0.0    # last source sample of the previous chunk (position -1)
+
+    def __call__(self, x):
+        np = self._np
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if self._step == 1.0 or x.size == 0:
+            return x
+        n = x.size
+        if self._t > n - 1:
+            self._t -= n
+            self._last = float(x[-1])
+            return np.zeros(0, dtype=np.float32)
+        count = int((n - 1 - self._t) // self._step) + 1
+        pos = self._t + np.arange(count) * self._step
+        ext = np.concatenate([np.array([self._last], dtype=np.float32), x])
+        out = np.interp(pos + 1.0, np.arange(n + 1), ext).astype(np.float32)
+        self._t = float(pos[-1] + self._step - n)
+        self._last = float(x[-1])
+        return out
+
+    def reset(self) -> None:
+        self._t = 0.0
+        self._last = 0.0
+
+
+_apm_unavailable_logged = False
+
+
+def _load_audio_processor():
+    """The WebRTC AudioProcessor class, or None when pywebrtc-audio is not installed (logged once)."""
+    global _apm_unavailable_logged
+    try:
+        from pywebrtc_audio import AudioProcessor
+        return AudioProcessor
+    except ImportError:
+        if not _apm_unavailable_logged:
+            _apm_unavailable_logged = True
+            log.warning("audio_engine: pywebrtc-audio not installed; echo cancellation and noise "
+                        "suppression are off and only the time-based echo guard runs "
+                        "(install with: uv sync --extra aec)")
+        return None
+
+
+class AcousticEchoCanceller:
+    """Subtract the playback reference from the capture signal, then suppress stationary noise.
+
+    WebRTC's audio processing module (AEC3, then noise suppression, the order WebRTC runs them:
+    suppressing noise first would make the echo path nonlinear and stop the adaptive filter from
+    converging). The reference is what the playback loop is about to write; the canceller holds
+    it in a queue and takes one 10 ms frame of it for every 10 ms of capture, so the two stay
+    aligned by sample count while the speaker plays in real time. AEC3 estimates the remaining
+    delay (output buffer, room, input buffer) itself.
+
+    Thread use: push_reference() runs on the event loop thread, process_capture() on the
+    PortAudio capture thread; one lock serialises them.
+
+    Output is delayed by one 10 ms frame (plus the processor's own filter delay) so that every
+    call returns exactly as many samples as it was given.
+
+    Falls back to passthrough, leaving EchoGuard's time-based mute as the only guard, when
+    pywebrtc-audio is not installed or both stages are disabled.
+    """
+
+    def __init__(
+        self,
+        *,
+        capture_rate: int = _CAPTURE_RATE,
+        playback_rate: int = _PLAYBACK_RATE,
+        echo_cancellation: bool = True,
+        noise_suppression: bool = False,
+        processor_cls=None,
+    ) -> None:
+        import numpy as np
+
+        self._np = np
+        self.capture_rate = capture_rate
+        self.frame_samples = capture_rate * _APM_FRAME_MS // 1000
+        self._lock = threading.Lock()
+        self._resample = _LinearResampler(np, playback_rate, capture_rate)
+        self._far = _SampleFifo(np, max_samples=_REFERENCE_BACKLOG_S * capture_rate)
+        self._near = _SampleFifo(np)
+        self._out = _SampleFifo(np)
+
+        self._apm = None
+        if echo_cancellation or noise_suppression:
+            cls = processor_cls or _load_audio_processor()
+            if cls is not None:
+                self._apm = cls(
+                    sample_rate=capture_rate,
+                    num_channels=1,
+                    echo_cancellation=echo_cancellation,
+                    noise_suppression=noise_suppression,
+                    ns_level=_NS_LEVEL,
+                )
+        self.echo_cancellation = echo_cancellation and self._apm is not None
+        self.noise_suppression = noise_suppression and self._apm is not None
+        self._error_logged = False
+        self._prime()
+        log.info("audio_engine: capture clean-up echo_cancellation=%s noise_suppression=%s",
+                 self.echo_cancellation, self.noise_suppression)
+
+    @property
+    def active(self) -> bool:
+        """True when frames are processed; False means process_capture() is a passthrough."""
+        return self._apm is not None
+
+    def push_reference(self, pcm_float32) -> None:
+        """Queue audio the speaker is about to play (the far-end reference), at playback rate."""
+        if not self.echo_cancellation:
+            return
+        ref = self._resample(pcm_float32)
+        with self._lock:
+            self._far.push(ref)
+
+    def process_capture(self, pcm_float32):
+        """Return the capture chunk with the echo removed and noise suppressed, same length."""
+        if self._apm is None:
+            return pcm_float32
+        np = self._np
+        frame = np.asarray(pcm_float32, dtype=np.float32).reshape(-1)
+        n = self.frame_samples
+        try:
+            with self._lock:
+                self._near.push(frame)
+                while len(self._near) >= n:
+                    near = self._near.pop(n)
+                    if self.echo_cancellation:
+                        self._out.push(self._apm.process(near, self._far.pop(n)))
+                    else:
+                        self._out.push(self._apm.process(near))
+                return self._out.pop(frame.size)
+        except Exception:
+            # Never lose capture audio to a processing fault: the echo guard still runs downstream.
+            if not self._error_logged:
+                self._error_logged = True
+                log.exception("audio_engine: capture clean-up failed; passing raw audio")
+            return frame
+
+    def reset(self) -> None:
+        """Forget the echo path and all queued audio (device change or stream reopen)."""
+        with self._lock:
+            self._far.clear()
+            self._near.clear()
+            self._out.clear()
+            self._resample.reset()
+            if self._apm is not None:
+                self._apm.reset()
+            self._prime()
+
+    def _prime(self) -> None:
+        # One frame of lead so a call can always return as many samples as it was given.
+        self._out.push(self._np.zeros(self.frame_samples, dtype=self._np.float32))
+
+
 class AudioEngine:
     """One capture stream + one playback stream for the lifetime of the process.
 
@@ -122,6 +362,9 @@ class AudioEngine:
         capture_rate: int = _CAPTURE_RATE,
         playback_rate: int = _PLAYBACK_RATE,
         chunk_frames: int = _CHUNK_FRAMES,
+        echo_cancellation: bool = True,
+        noise_suppression: bool = False,
+        echo_guard: bool = True,
     ) -> None:
         self.capture_device  = capture_device
         self.playback_device = playback_device
@@ -130,10 +373,16 @@ class AudioEngine:
         self.chunk_frames    = chunk_frames
 
         self._echo_guard     = EchoGuard()
+        # False: playback never arms the time-based mute (VOXSCRIBE_VOICE_ECHO_GUARD=false).
+        self._echo_guard_on  = echo_guard
+        self._aec_options    = {"echo_cancellation": echo_cancellation,
+                                "noise_suppression": noise_suppression}
+        self._aec: AcousticEchoCanceller | None = None   # built by start()
         self._ref_capacity   = int(_PLAYBACK_REF_MS / 1000 * playback_rate)
         self._playback_ref   = _PlaybackRefRing(self._ref_capacity)
 
         self._capture_qs: list[asyncio.Queue] = []
+        self._raw_capture_qs: list[asyncio.Queue] = []   # before clean-up (device health checks)
         self._playback_q: asyncio.Queue       = asyncio.Queue(maxsize=256)
         self._capture_stream                   = None
         self._playback_stream                  = None
@@ -157,6 +406,11 @@ class AudioEngine:
     def echo_guard(self) -> EchoGuard:
         return self._echo_guard
 
+    @property
+    def aec(self) -> "AcousticEchoCanceller | None":
+        """The capture clean-up stage; None until start()."""
+        return self._aec
+
     # ------------------------------------------------------------------
     # public: playback reference
 
@@ -177,11 +431,23 @@ class AudioEngine:
         self._capture_qs.append(q)
         return q
 
+    def subscribe_raw(self) -> asyncio.Queue:
+        """Like subscribe(), but chunks arrive as the device delivered them, before clean-up.
+
+        For device health checks (the capture watchdog): noise suppression takes a quiet room
+        close to digital silence and the canceller's high-pass removes mains hum, so neither can
+        be judged on the cleaned signal. Never feed these chunks to the wake gate or ASR.
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self._raw_capture_qs.append(q)
+        return q
+
     def unsubscribe(self, q: asyncio.Queue) -> None:
-        try:
-            self._capture_qs.remove(q)
-        except ValueError:
-            pass
+        for qs in (self._capture_qs, self._raw_capture_qs):
+            try:
+                qs.remove(q)
+            except ValueError:
+                pass
 
     # ------------------------------------------------------------------
     # public: playback
@@ -239,11 +505,24 @@ class AudioEngine:
             raise RuntimeError("AudioEngine needs sounddevice and numpy") from exc
 
         loop = asyncio.get_running_loop()
+        if self._aec is None:
+            self._aec = AcousticEchoCanceller(capture_rate=self.capture_rate,
+                                              playback_rate=self.playback_rate,
+                                              **self._aec_options)
+        aec = self._aec
 
         def _capture_cb(indata, frames, t, status):
             if status:
                 log.debug("capture status: %s", status)
-            chunk = indata[:, 0].copy()
+            raw = indata[:, 0].copy()
+            for q in list(self._raw_capture_qs):
+                try:
+                    loop.call_soon_threadsafe(_offer_drop_oldest, q, raw)
+                except Exception:
+                    pass
+            # Echo cancellation and noise suppression run here, on the capture thread, so every
+            # subscriber (wake gate, session ASR, debug routes) gets the cleaned signal.
+            chunk = aec.process_capture(raw)
             for q in list(self._capture_qs):
                 try:
                     loop.call_soon_threadsafe(_offer_drop_oldest, q, chunk)
@@ -286,6 +565,8 @@ class AudioEngine:
 
             self.cancel_playback()
             self._close_streams(abort=True)
+            if self._aec is not None:
+                self._aec.reset()  # aborted output and possibly a new device: the echo path is new
             try:
                 sd._terminate()
                 sd._initialize()
@@ -356,9 +637,14 @@ class AudioEngine:
                         continue  # mid-reopen, or a reopen failed: drop the chunk, keep the loop
                     break
                 self._playback_ref.push(chunk.tolist())
+                # Before the write, not after: write() blocks until the chunk is nearly played,
+                # and the canceller must hold the reference before the echo of it is captured.
+                if self._aec is not None:
+                    self._aec.push_reference(chunk)
                 try:
                     self._playback_stream.write(chunk)
-                    self._echo_guard.notify_playback_end(monotonic_ms())
+                    if self._echo_guard_on:
+                        self._echo_guard.notify_playback_end(monotonic_ms())
                 except Exception:
                     log.exception("audio_engine: playback write error")
         except asyncio.CancelledError:

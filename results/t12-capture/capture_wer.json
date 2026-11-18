@@ -1,0 +1,89 @@
+{
+  "run_at": "2026-11-18T05:54:51.662192+00:00",
+  "fixture": "fixture-10min.wav",
+  "seconds": 681.7,
+  "model": "small.en",
+  "rows": [
+    {
+      "input": "clean",
+      "path": "raw",
+      "ref_words": 1663,
+      "hyp_words": 1689,
+      "errors": 102,
+      "wer": 0.0613,
+      "ms_per_chunk": 0.0
+    },
+    {
+      "input": "clean",
+      "path": "aec",
+      "ref_words": 1663,
+      "hyp_words": 1681,
+      "errors": 96,
+      "wer": 0.0577,
+      "ms_per_chunk": 0.176
+    },
+    {
+      "input": "clean",
+      "path": "aec_ns",
+      "ref_words": 1663,
+      "hyp_words": 1685,
+      "errors": 100,
+      "wer": 0.0601,
+      "ms_per_chunk": 0.183
+    },
+    {
+      "input": "fan20",
+      "path": "raw",
+      "ref_words": 1663,
+      "hyp_words": 1684,
+      "errors": 105,
+      "wer": 0.0631,
+      "ms_per_chunk": 0.0
+    },
+    {
+      "input": "fan20",
+      "path": "aec",
+      "ref_words": 1663,
+      "hyp_words": 1686,
+      "errors": 100,
+      "wer": 0.0601,
+      "ms_per_chunk": 0.172
+    },
+    {
+      "input": "fan20",
+      "path": "aec_ns",
+      "ref_words": 1663,
+      "hyp_words": 1685,
+      "errors": 100,
+      "wer": 0.0601,
+      "ms_per_chunk": 0.177
+    },
+    {
+      "input": "fan10",
+      "path": "raw",
+      "ref_words": 1663,
+      "hyp_words": 1687,
+      "errors": 118,
+      "wer": 0.071,
+      "ms_per_chunk": 0.0
+    },
+    {
+      "input": "fan10",
+      "path": "aec",
+      "ref_words": 1663,
+      "hyp_words": 1687,
+      "errors": 119,
+      "wer": 0.0716,
+      "ms_per_chunk": 0.165
+    },
+    {
+      "input": "fan10",
+      "path": "aec_ns",
+      "ref_words": 1663,
+      "hyp_words": 1665,
+      "errors": 128,
+      "wer": 0.077,
+      "ms_per_chunk": 0.17
+    }
+  ]
+}
