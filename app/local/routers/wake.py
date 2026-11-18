@@ -2,6 +2,7 @@
 
 GET  /v1/wake/state     → {state, model, phrase, trigger, meeting_id}
                           states: armed | listening | off | error
+GET  /v1/wake/profile   → {mode, delegate, quiet_hours_enabled}  current product profile summary
 POST /v1/wake/arm       → arm (no-op if already armed/listening)
 POST /v1/wake/disarm    → set state to off; the armed loop closes its subscription
 POST /v1/wake/trigger   → DEBUG ONLY (--debug-trigger). Bypass the wake gate, start a session
@@ -29,6 +30,19 @@ def _host(request: Request):
 
 def _value(v) -> str:
     return v.value if isinstance(v, WakeState) else str(v)
+
+
+@router.get("/profile")
+async def wake_profile(request: Request):
+    """Return a summary of the current product profile (mode and key settings)."""
+    profile = getattr(request.app.state, "profile", None)
+    if profile is None:
+        return {"mode": "personal", "delegate": "ollama", "quiet_hours_enabled": False}
+    return {
+        "mode": profile.mode,
+        "delegate": profile.reply.delegate,
+        "quiet_hours_enabled": profile.quiet_hours_enabled,
+    }
 
 
 @router.get("/state")

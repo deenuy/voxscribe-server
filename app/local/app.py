@@ -17,6 +17,9 @@ from fastapi.responses import JSONResponse
 from psycopg_pool import PoolTimeout
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from voxscribe.profile.loader import load_profile
+from voxscribe.profile.schema import ProfileValidationError
+
 from app.local import tenancy
 from app.local.errors import EngineError
 from app.local.identity import IdentityError, tenant_for
@@ -148,6 +151,17 @@ async def create_app(
     if not isinstance(settings, Config):
         raise RuntimeError("settings must be a Config object")
 
+    # Load and validate the product profile.  VOXSCRIBE_PROFILE is an optional
+    # path to a YAML file; if unset the default personal-mode profile is used.
+    profile_path = os.environ.get("VOXSCRIBE_PROFILE") or None
+    try:
+        profile = load_profile(profile_path)
+    except ProfileValidationError as exc:
+        log.error("startup aborted: invalid profile -- %s", exc)
+        sys.exit(1)
+
+    log.info("profile: mode=%s delegate=%s", profile.mode, profile.reply.delegate)
+
     # Create data directory
     data_dir = Path(settings.data_dir) if settings.data_dir else Path("/tmp/voxscribe")
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -196,6 +210,7 @@ async def create_app(
     app.state.started_at = time.time()
     app.state.wake_enabled = wake
     app.state.debug_trigger = debug_trigger
+    app.state.profile = profile
     # Tenant isolation: with an identity service configured, every request names a person and each person's data is
     # kept in a schema of their own. Without one, nothing changes (one person at a time).
     app.state.identity = None
