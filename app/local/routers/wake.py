@@ -3,7 +3,7 @@
 GET  /v1/wake/state     → {state, model, phrase}   states: armed | listening | off | error
 POST /v1/wake/arm       → arm (no-op if already armed/listening)
 POST /v1/wake/disarm    → set state to off; mic stream closes within ~32 ms
-POST /v1/wake/trigger   → DEBUG ONLY (--no-auth). Bypass OWW, start a session immediately.
+POST /v1/wake/trigger   → DEBUG ONLY (--debug-trigger). Bypass OWW, start a session immediately.
                           Returns {meeting_id}. Use for automated roomplay tests.
 """
 
@@ -54,17 +54,18 @@ async def disarm_wake(_: Request):
 async def trigger_wake_session(request: Request):
     """DEBUG ONLY: bypass OWW and start a wake session immediately.
 
-    Only reachable when the server was started with --no-auth.
+    Only reachable when the server was started with --debug-trigger. --no-auth
+    alone does not enable it: the normal launch runs with --no-auth, and any
+    local process could otherwise start a fake wake.
     Use for automated roomplay tests where TTS voice doesn't trigger OWW.
     Returns {meeting_id} immediately; session runs as a background task.
     """
+    app = request.app
+    if not getattr(app.state, "debug_trigger", False):
+        raise HTTPException(status_code=403, detail="trigger only available with --debug-trigger")
+
     from app.local.wake_loop import _run_session
     import numpy as np
-
-    app = request.app
-    auth_disabled = getattr(app.state, "auth_disabled", False)
-    if not auth_disabled:
-        raise HTTPException(status_code=403, detail="trigger only available with --no-auth")
 
     current = get_state()["state"]
     if current == WakeState.LISTENING:

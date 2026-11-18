@@ -8,6 +8,8 @@ Pipeline per turn:
   3. If gate passes: synthesize with Kokoro + play. First audio starts
      before LLM finishes generating (V1-P01 clause-level streaming).
   4. If gate refuses any sentence: cancel playback, play fixed refusal phrase.
+     If a sentence claims an action with no tool row (G7): speak the fixed
+     action-claim phrase in its place and stop the stream (decision "replace").
   5. Write rows: turns, replies, gate_decisions, latency_ledger. Behaviour log.
   6. Publish reply event over meeting_bus.
 
@@ -92,17 +94,58 @@ async def warm_phrase_cache() -> None:
     """Pre-render all fixed gate phrases at startup for zero-latency refusals (V1-P03)."""
     from app.local.tts_engine import prerender_phrase
     from app.local.gate import (
+        ACTION_CLAIM_PHRASE,
         DEFAULT_REFUSAL_PHRASE,
         CLASSROOM_REFUSAL_PHRASE,
         SENIORCARE_ESCALATION_PHRASE,
     )
     for phrase in (_THINKING_PHRASE, _FILLER_PHRASE, DEFAULT_REFUSAL_PHRASE,
-                   CLASSROOM_REFUSAL_PHRASE, SENIORCARE_ESCALATION_PHRASE):
+                   CLASSROOM_REFUSAL_PHRASE, SENIORCARE_ESCALATION_PHRASE,
+                   ACTION_CLAIM_PHRASE):
         await prerender_phrase(phrase)
 
 
 def _now_z() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+async def _session_tools(pool, meeting_id: str) -> list[str]:
+    """Tool names recorded in tool_calls for this session. Fails closed to an empty list."""
+    try:
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT DISTINCT tool FROM tool_calls WHERE meeting_id=%s", (meeting_id,),
+            )
+            rows = await cur.fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        log.exception("reply_chain: tool_calls lookup failed meeting_id=%s", meeting_id)
+        return []
+
+
+async def _action_claim_gate(pool, meeting_id: str, sentence: str) -> str | None:
+    """Gate rule G7: return the fixed phrase if the sentence claims an action with no tool row.
+
+    Runs after the content gate. The tool_calls lookup only happens when the sentence
+    contains action-completion language, so ordinary sentences pay no I/O.
+    """
+    from app.local import gate
+
+    if gate.find_action_claim(sentence) is None:
+        return None
+    decision, _ = gate.check_action_claim(sentence, await _session_tools(pool, meeting_id))
+    return gate.ACTION_CLAIM_PHRASE if decision == "replace" else None
+
+
+async def _speak_fixed(phrase: str, audio_engine) -> None:
+    """Play a fixed gate phrase, pre-rendered when the cache has it."""
+    from app.local.tts_engine import play_prerendered, prerender_phrase, synthesize_and_play
+
+    path = await prerender_phrase(phrase)
+    if path is not None:
+        await play_prerendered(path, audio_engine)
+    else:
+        await synthesize_and_play(phrase, audio_engine)
 
 
 async def run_reply(
@@ -312,6 +355,20 @@ async def run_reply(
                         if audio_engine is not None and all_sentences:
                             audio_engine.cancel_playback()
                         break
+                    replacement = await _action_claim_gate(pool, meeting_id, sentence)
+                    if replacement is not None:
+                        decision = "replace"
+                        gate_category = gate.ACTION_CLAIM_REASON
+                        all_sentences.append(replacement)
+                        if audio_engine is not None:
+                            try:
+                                await _speak_fixed(replacement, audio_engine)
+                                if tts_first_audio_ms is None:
+                                    tts_first_audio_ms = monotonic_ms()
+                            except Exception:
+                                log.exception("reply_chain: action-claim phrase failed meeting_id=%s",
+                                              meeting_id)
+                        break
                     all_sentences.append(sentence)
                     if audio_engine is not None:
                         try:
@@ -324,7 +381,7 @@ async def run_reply(
                 log.exception("reply_chain: LLM search stream failed meeting_id=%s", meeting_id)
             if not all_sentences and decision == "pass":
                 reply_text = _FALLBACK_PHRASE
-            elif decision == "pass":
+            elif decision in ("pass", "replace"):
                 reply_text = " ".join(all_sentences)
     else:
         src = "pre_stream" if pre_stream is not None else "llm"
@@ -356,6 +413,23 @@ async def run_reply(
                         audio_engine.cancel_playback()
                     break
 
+                # G7: a claimed action with no tool row is replaced by a fixed phrase, and the
+                # rest of the stream is dropped (it tends to elaborate on the false claim).
+                replacement = await _action_claim_gate(pool, meeting_id, sentence)
+                if replacement is not None:
+                    decision = "replace"
+                    gate_category = gate.ACTION_CLAIM_REASON
+                    all_sentences.append(replacement)
+                    if audio_engine is not None:
+                        try:
+                            await _speak_fixed(replacement, audio_engine)
+                            if tts_first_audio_ms is None:
+                                tts_first_audio_ms = monotonic_ms()
+                        except Exception:
+                            log.exception("reply_chain: action-claim phrase failed meeting_id=%s",
+                                          meeting_id)
+                    break
+
                 all_sentences.append(sentence)
 
                 if audio_engine is not None:
@@ -374,7 +448,7 @@ async def run_reply(
         if not all_sentences and decision == "pass":
             log.warning("reply_chain: LLM produced no sentences, using fallback")
             reply_text = _FALLBACK_PHRASE
-        elif decision == "pass":
+        elif decision in ("pass", "replace"):
             reply_text = " ".join(all_sentences)
 
     decided_z = _now_z()

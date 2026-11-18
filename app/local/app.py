@@ -118,6 +118,7 @@ async def create_app(
     auth_disabled: bool = False,
     schema: str | None = None,
     wake: bool = False,
+    debug_trigger: bool = False,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -125,6 +126,8 @@ async def create_app(
         settings: Configuration object
         auth_disabled: If True, skip authentication
         schema: Optional database schema name for test isolation
+        wake: If True, start the always-on wake word listener
+        debug_trigger: If True, enable POST /v1/wake/trigger (development only)
     """
     from app.local.config import Config
 
@@ -178,6 +181,7 @@ async def create_app(
     app.state.settings = settings
     app.state.started_at = time.time()
     app.state.wake_enabled = wake
+    app.state.debug_trigger = debug_trigger
     # Tenant isolation: with an identity service configured, every request names a person and each person's data is
     # kept in a schema of their own. Without one, nothing changes (one person at a time).
     app.state.identity = None

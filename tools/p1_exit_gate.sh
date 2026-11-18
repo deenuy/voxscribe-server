@@ -41,11 +41,11 @@ echo "report dir: $REPORT_DIR"
 echo ""
 
 # -- start engine in wake mode in background --------------------------------
-echo "[0/4] starting engine --wake --no-auth ..."
+echo "[0/4] starting engine --wake --no-auth --debug-trigger ..."
 cd "$ROOT"
 VOXSCRIBE_CAPTURE_DEVICE="MacBook Pro Microphone" \
 VOXSCRIBE_PLAYBACK_DEVICE="MacBook Pro Speakers" \
-  uv run python -m app.local.engine --wake --no-auth --port 0 \
+  uv run python -m app.local.engine --wake --no-auth --debug-trigger --port 0 \
   > "$REPORT_DIR/engine.log" 2>&1 &
 ENGINE_PID=$!
 trap "echo 'stopping engine...'; kill $ENGINE_PID 2>/dev/null; wait $ENGINE_PID 2>/dev/null || true; echo done" EXIT
