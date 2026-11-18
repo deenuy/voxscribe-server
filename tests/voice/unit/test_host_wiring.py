@@ -98,7 +98,8 @@ def test_host_imports_adapters_only_inside_builders():
         assert not any(n and n.startswith("app.") for n in names), names
     lazy = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
             and n.module and n.module.startswith("app.")]
-    assert lazy and all(m.startswith(("app.local.voice.adapters", "app.local.voice.wake_setup"))
+    assert lazy and all(m.startswith(("app.local.voice.adapters", "app.local.voice.wake_setup",
+                                       "app.local.voice.clause_splitter"))
                         for m in lazy), lazy
 
 
