@@ -14,9 +14,14 @@
 ### Bug Fixes
 - Fixed the acknowledgement chime being transcribed as the user's first words: the session now starts with the audio heard after the wake phrase and drops what the microphone captured while the chime played.
 - Fixed a rejected or noise-triggered wake playing a chime and opening a session; a rejected candidate is now silent and only recorded.
+- Fixed the voice loop writing what the person said, the speculative reply text and the stop phrase it heard into the engine log; it now logs word counts only, and speech synthesis errors log the text length instead of the text.
+- Fixed the clock answer and the "I can't look that up right now" line being spoken without a gate check; every spoken sentence now passes the gate first.
 
 ### Changed
 - Requires voxscribe-core 0.3.0 for the wake gate; the `wake` extra now includes sherpa-onnx, sentencepiece and openwakeword, and a new `train` extra holds the training-only packages.
+- Replaced the wake loop (`app/local/wake_loop.py`) with a voice host (`app/local/voice/host.py`) that wires the engine's ten session ports to adapters in `app/local/voice/adapters/` (sound device, Whisper, Kokoro, the reply chain, the rule gate, the heuristic turn detector, Postgres) and runs capture, recognize, turn, reply and playback on them. Wake, quiet hours, the capture watchdog, power events, the debug trigger, stop phrases and the speculative reply start behave as before. `/v1/wake/*` reads the host from `app.state.voice_host`; without `--wake` the state is `off` and arming changes nothing.
+- Every reply sentence now goes through voxscribe-core's reply stage: the gate checks it before the talker synthesises it, and a gate that fails speaks the fixed refusal phrase, never the candidate. `reply_chain.run_reply` is replaced by `begin_reply`, `reply_sentences` and `finish_reply`, which the Delegate and SessionStore adapters call.
+- Requires voxscribe-core 0.4.0 for the session ports and the reply stage.
 
 ## What's New in VoxScribe Server 0.8.0
 

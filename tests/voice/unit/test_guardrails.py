@@ -4,8 +4,8 @@ G1: POST /v1/wake/trigger is reachable only with --debug-trigger; --no-auth alon
 G2: a sentence claiming a completed action (reminder, alarm, timer, calendar) with no tool row
     in the session is replaced with a fixed phrase, and one gate decision row says why.
 
-No real LLM, TTS, microphone or database: the reply chain runs against a fake pool and a
-scripted token stream.
+No real LLM, TTS, microphone or database: the voice host's reply stage runs the real gate,
+store and delegate adapters against a fake pool and a scripted token stream.
 """
 
 from __future__ import annotations
@@ -18,10 +18,15 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from app.local import gate, wake_loop
+from app.local import gate
 from app.local.engine import build_parser
-from app.local.reply_chain import run_reply
 from app.local.routers import wake as wake_router
+from app.local.voice.adapters.delegate_ollama import OllamaDelegate
+from app.local.voice.adapters.gate_rule import RuleGate
+from app.local.voice.adapters.store_postgres import PostgresSessionStore
+from app.local.voice.host import VoiceConfig, VoiceHost, WakeState
+
+from .fakes import fake_ports
 
 
 # ── G1: debug trigger behind its own flag ───────────────────────────────────
@@ -52,12 +57,9 @@ async def _post_trigger(app: FastAPI) -> httpx.Response:
 
 @pytest.fixture
 def armed_wake_state():
-    saved = dict(wake_loop._state)
-    wake_loop.set_state(wake_loop.WakeState.ARMED)
-    wake_loop._state["meeting_id"] = None
-    yield
-    wake_loop._state.clear()
-    wake_loop._state.update(saved)
+    host = VoiceHost(VoiceConfig(), ports=fake_ports())
+    host.set_state(WakeState.ARMED)
+    return host
 
 
 def test_debug_trigger_flag_defaults_off():
@@ -84,14 +86,16 @@ async def test_trigger_forbidden_when_flag_state_missing(armed_wake_state):
 
 
 async def test_trigger_allowed_with_debug_flag(armed_wake_state, monkeypatch):
+    host = armed_wake_state
     started: list[float] = []
 
-    async def fake_run_session(_app, _audio_q, *, confidence, np):
-        started.append(confidence)
-        wake_loop._state["meeting_id"] = "m-trigger-test"
+    async def fake_run_session(_audio_q, *, score, **_kw):
+        started.append(score)
+        host._state["meeting_id"] = "m-trigger-test"
 
-    monkeypatch.setattr(wake_loop, "_run_session", fake_run_session)
+    monkeypatch.setattr(host, "run_session", fake_run_session)
     app = _wake_app(auth_disabled=True, debug_trigger=True)
+    app.state.voice_host = host
     resp = await _post_trigger(app)
     assert resp.status_code == 202
     body = resp.json()
@@ -188,11 +192,13 @@ async def _tokens(text: str):
 
 
 async def _run(prompt: str, model_reply: str, pool: _FakePool) -> str:
+    """One turn through the voice host's reply stage, with the real gate, store and delegate."""
     app = SimpleNamespace(state=SimpleNamespace(store=SimpleNamespace(pool=pool)))
-    return await run_reply(
-        app, meeting_id="m-g2", user_text=prompt, turn_end_ms=0,
-        pre_stream=_tokens(model_reply),
-    )
+    ports = fake_ports(gate=RuleGate(), store=PostgresSessionStore(app),
+                       delegate=OllamaDelegate(app))
+    host = VoiceHost(VoiceConfig(), ports=ports)
+    return await host.reply_turn("m-g2", 1, prompt, turn_end_ms=0,
+                                 speculation=_tokens(model_reply))
 
 
 @pytest.fixture(autouse=True)

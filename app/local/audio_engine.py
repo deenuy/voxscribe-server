@@ -15,8 +15,8 @@ Usage:
     engine.echo_guard(mic_frame)      # passthrough until R6
     await engine.stop()
 
-AudioEngine replaces the per-task sd.InputStream opened in wake_loop.py.
-wake_loop will migrate to subscribe() in R6 to keep one mic stream open.
+One mic stream per process: the voice host (app/local/voice/host.py) reads it through the
+AudioIn and AudioOut adapters in app/local/voice/adapters/audio_portaudio.py.
 
 Playback reference ring:
     engine.playback_ref()  → np.ndarray of last PLAYBACK_REF_MS milliseconds of

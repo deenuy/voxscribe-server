@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.local import wake_loop
+from app.local.voice.adapters.store_postgres import PostgresSessionStore
 from tests.conftest import make_app
 
 pytestmark = pytest.mark.integration
@@ -13,13 +13,14 @@ async def test_every_candidate_writes_a_row_with_score_and_reason(throwaway_sche
     app = await make_app(throwaway_schema)
     lifespan = app.router.lifespan_context(app)
     await lifespan.__aenter__()
+    store = PostgresSessionStore(app)
     try:
-        await wake_loop._record_wake_event(app, score=0.83, accepted=False, reject_reason="no_match",
-                                           detector="openvocab:hey_vox", speech_ratio=0.61)
-        await wake_loop._record_wake_event(app, score=0.91, accepted=False, reject_reason="no_voice",
-                                           detector="openvocab:hey_vox", speech_ratio=0.05)
-        await wake_loop._record_wake_event(app, score=1.0, accepted=True, reject_reason=None,
-                                           detector="openvocab:hey_vox", speech_ratio=0.7)
+        await store.record_wake(score=0.83, accepted=False, reject_reason="no_match",
+                                detector="openvocab:hey_vox", speech_ratio=0.61)
+        await store.record_wake(score=0.91, accepted=False, reject_reason="no_voice",
+                                detector="openvocab:hey_vox", speech_ratio=0.05)
+        await store.record_wake(score=1.0, accepted=True, reject_reason=None,
+                                detector="openvocab:hey_vox", speech_ratio=0.7)
         async with app.state.store.pool.connection() as conn:
             cur = await conn.execute(
                 "SELECT phrase, confidence, accepted, reject_reason, detector, speech_ratio, "

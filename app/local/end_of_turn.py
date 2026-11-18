@@ -1,6 +1,6 @@
 """End-of-turn detector powered by the parked S4 speech activity stack.
 
-Replaces the fixed 6-second silence counter in wake_loop._run_session with
+Replaces the fixed 6-second silence counter in the voice host's turn stage with
 turn-taking policy decisions from SpeechActivityTracker + SpeechTurnAdapter
 (voxscribe-core voice/p1-loop).
 
@@ -29,6 +29,10 @@ from __future__ import annotations
 import logging
 import struct
 
+# The engine's clock contract error, re-exported so callers that caught it here keep working and
+# a host catches one type for every Speech adapter.
+from voxscribe.session.ports import ClockDomainError
+
 log = logging.getLogger("app.local.end_of_turn")
 
 _SAMPLE_RATE  = 16_000
@@ -37,9 +41,7 @@ _BYTES_PER_FRAME = 2  # PCM16LE
 # A correct caller is within one frame of the audio it fed; a minute apart means another clock.
 _CLOCK_SKEW_LIMIT_MS = 60_000
 
-
-class ClockDomainError(RuntimeError):
-    """tick() was given a time that is not on the stream timeline of the audio fed."""
+__all__ = ["ClockDomainError", "TurnDetector"]
 
 
 class TurnDetector:

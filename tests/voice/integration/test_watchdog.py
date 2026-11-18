@@ -1,8 +1,9 @@
 """T06 acceptance at SIM level: capture recovery, power wake, quiet hours.
 
-Real time, real watchdog, real armed wake loop (`_mic_loop`), real wake router. Faked: the audio
-device (a feeder that delivers 32 ms chunks, or stops, or sends zeros), the wake model, and the
-chime. The quiet hours test writes to a throwaway schema of the local database.
+Real time, real watchdog, the voice host's real armed loop and wake gate, real wake router.
+Faked: the audio device (a feeder that delivers 32 ms chunks, or stops, or sends zeros), the
+wake detector (stage 2 of the gate is off), and the chime. The quiet hours test writes to a
+throwaway schema of the local database through the real Postgres session store.
 
     R11  stalled callback and all-zero stream each recover to armed within RECOVERY_BOUND_S
     R8   after sleep and wake (POST /v1/wake/power) the loop is armed within RECOVERY_BOUND_S
@@ -21,20 +22,22 @@ import numpy as np
 import pytest
 from fastapi import FastAPI
 
-from app.local import wake_loop
+from voxscribe.wake.gate import WakeGate
+
 from app.local.audio_engine import AudioEngine
-from app.local.config import Config, QuietHours
+from app.local.config import QuietHours
 from app.local.voice import capture_watchdog as cw
+from app.local.voice import host as host_mod
+from app.local.voice.adapters.store_postgres import PostgresSessionStore
 from app.local.voice.capture_watchdog import CaptureWatchdog
-from app.local.wake_loop import WakeState
+from app.local.voice.host import VoiceConfig, VoiceHost, WakeState
+from tests.voice.unit.fakes import fake_ports
 
 RATE = 16_000
 CHUNK = 512
 CHUNK_S = CHUNK / RATE
 RECOVERY_BOUND_S = 10.0   # R8 and R11 bar
 WAKES = 10                # R10 count
-
-pytest.importorskip("openwakeword")  # _mic_loop imports it even when the model is faked
 
 
 class FakeDevice:
@@ -79,21 +82,31 @@ class FakeDevice:
 
 
 class FakeWakeModel:
-    """Scores the first `hits` frames as a wake, everything after as nothing."""
+    """WakeDetector: scores the first `hits` frames as a wake, everything after as nothing."""
+
+    model_name = "fake:hey_vox"
+    patience_frames = 1
 
     def __init__(self, hits: int = 0) -> None:
         self.hits = hits
         self.predicts = 0
         self.resets = 0
 
-    def predict(self, _frame) -> dict:
+    def score(self, _frame) -> float:
         self.predicts += 1
-        score = 0.9 if self.predicts <= self.hits else 0.0
-        keys = {wake_loop._OWW_MODEL_NAME, getattr(wake_loop, "_OWW_KEY", wake_loop._OWW_MODEL_NAME)}
-        return {k: score for k in keys}
+        return 0.9 if self.predicts <= self.hits else 0.0
 
     def reset(self) -> None:
         self.resets += 1
+
+
+def make_host(model: FakeWakeModel, *, quiet=None, store=None) -> VoiceHost:
+    """A host whose gate is stage 1 only (no voice check, no confirm) over the fake detector."""
+    ports = fake_ports(wake=model, **({"store": store} if store is not None else {}))
+    gate = WakeGate(model, voice_ratio=None, transcribe=None)
+    host = VoiceHost(VoiceConfig(quiet_hours=quiet), ports=ports, wake_gate=gate)
+    host.set_state(WakeState.ARMED)
+    return host
 
 
 async def wait_for(cond, timeout: float, step: float = 0.05) -> bool:
@@ -106,29 +119,27 @@ async def wait_for(cond, timeout: float, step: float = 0.05) -> bool:
 
 
 @pytest.fixture
-def armed(monkeypatch):
-    """A fake device, a faked wake model, and the real armed loop and watchdog running on it."""
+def armed():
+    """A fake device, a faked wake detector, and the host's armed loop and the watchdog on it."""
     model = FakeWakeModel()
-    monkeypatch.setattr(wake_loop, "_oww_model", model)
-    monkeypatch.setattr(wake_loop, "_capture_reset_pending", False)
-    wake_loop.set_state(WakeState.ARMED)
+    host = make_host(model)
     device = FakeDevice()
     health: list = []
 
     def on_event(event):
         health.append(event)
-        wake_loop.on_capture_health(event)
+        host.on_capture_health(event)
 
     watchdog = CaptureWatchdog(device, on_event=on_event, default_input=lambda: None)
-    app = SimpleNamespace(state=SimpleNamespace(settings=Config(), store=None))
-    return SimpleNamespace(model=model, device=device, watchdog=watchdog, health=health, app=app)
+    return SimpleNamespace(model=model, device=device, watchdog=watchdog, health=health,
+                           host=host)
 
 
 async def start(env) -> list[asyncio.Task]:
     mic_q = env.device.subscribe()
     tasks = [
         asyncio.create_task(env.device.feed()),
-        asyncio.create_task(wake_loop._mic_loop(env.app, mic_q, "hey vox", np, engine=None)),
+        asyncio.create_task(env.host._armed(env.host.ports, env.host._gate, mic_q)),
     ]
     env.watchdog.start()
     assert await wait_for(lambda: env.model.predicts > 0, 2.0), "armed loop never scored a frame"
@@ -140,15 +151,15 @@ async def finish(env, tasks) -> None:
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    wake_loop.set_state(WakeState.OFF)
+    env.host.set_state(WakeState.OFF)
 
 
 async def assert_rearmed(env) -> None:
-    """After a reopen the wake model is reset and the armed loop scores fresh frames again."""
+    """After a reopen the wake gate is reset and the armed loop scores fresh frames again."""
     before = env.model.predicts
-    assert await wait_for(lambda: env.model.resets >= 1, 2.0), "wake model not reset after reopen"
+    assert await wait_for(lambda: env.model.resets >= 1, 2.0), "wake gate not reset after reopen"
     assert await wait_for(lambda: env.model.predicts > before + 5, 2.0), "no frames scored after reopen"
-    assert wake_loop.get_state()["state"] == WakeState.ARMED
+    assert env.host.state == WakeState.ARMED
 
 
 # ---------------------------------------------------------------- R11
@@ -193,6 +204,7 @@ async def test_r8_sleep_then_wake_is_armed_within_bound(armed):
     api = FastAPI()
     api.include_router(wake_router.router)
     api.state.capture_watchdog = armed.watchdog
+    api.state.voice_host = armed.host
     tasks = await start(armed)
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api),
@@ -241,37 +253,29 @@ async def test_r10_quiet_hours_ten_wakes_no_sound_ten_rows(monkeypatch, test_db_
     now = datetime.now()
     quiet = QuietHours(enabled=True, start=now.strftime("%H:%M"),
                        end=(now + timedelta(minutes=2)).strftime("%H:%M"))
-    app = SimpleNamespace(state=SimpleNamespace(settings=Config(quiet_hours=quiet), store=store))
+    app = SimpleNamespace(state=SimpleNamespace(store=store, settings=None))
 
-    sounds: list[str] = []
     sessions: list[float] = []
 
-    async def chime(path):
-        sounds.append(path)
-
     async def session(*_a, **kw):
-        sessions.append(kw.get("confidence"))
+        sessions.append(kw.get("score"))
 
-    monkeypatch.setattr(wake_loop, "_play_chime_async", chime)
-    monkeypatch.setattr(wake_loop, "_play_chime", lambda path: sounds.append(path))
-    monkeypatch.setattr(wake_loop, "_run_session", session)
-    monkeypatch.setattr(wake_loop, "_DEBOUNCE_S", 0.0)
     model = FakeWakeModel(hits=WAKES)
-    monkeypatch.setattr(wake_loop, "_oww_model", model)
-    wake_loop.set_state(WakeState.ARMED)
+    host = make_host(model, quiet=quiet, store=PostgresSessionStore(app))
+    monkeypatch.setattr(host, "run_session", session)
 
     q: asyncio.Queue = asyncio.Queue()
     rng = np.random.default_rng(2)
-    for _ in range(WAKES * 4):   # at least WAKES model frames of 1280 samples
+    for _ in range(WAKES * 4):   # at least WAKES gate frames of 1280 samples
         q.put_nowait(rng.normal(0.0, 0.01, CHUNK).astype(np.float32))
-    loop_task = asyncio.create_task(wake_loop._mic_loop(app, q, "hey vox", np, engine=None))
+    loop_task = asyncio.create_task(host._armed(host.ports, host._gate, q))
     try:
         assert await wait_for(lambda: q.empty() and model.predicts > WAKES, 10.0)
         await asyncio.sleep(0.2)
     finally:
         loop_task.cancel()
         await asyncio.gather(loop_task, return_exceptions=True)
-        wake_loop.set_state(WakeState.OFF)
+        host.set_state(WakeState.OFF)
 
     try:
         async with store.pool.connection() as conn:
@@ -281,7 +285,7 @@ async def test_r10_quiet_hours_ten_wakes_no_sound_ten_rows(monkeypatch, test_db_
     finally:
         await store.close()
 
-    assert sounds == []
+    assert host.ports.audio_out.files == []
     assert sessions == []
     assert len(rows) == WAKES
     assert all(r[0] is False and r[1] == "quiet_hours" and r[2] is None for r in rows)
@@ -291,29 +295,23 @@ async def test_outside_quiet_hours_a_wake_opens_a_session(monkeypatch):
     sessions: list[float] = []
 
     async def session(*_a, **kw):
-        sessions.append(kw.get("confidence"))
+        sessions.append(kw.get("score"))
 
-    async def chime(_path):
-        pass
-
-    monkeypatch.setattr(wake_loop, "_play_chime_async", chime)
-    monkeypatch.setattr(wake_loop, "_run_session", session)
-    monkeypatch.setattr(wake_loop, "_DEBOUNCE_S", 0.0)
     model = FakeWakeModel(hits=1)
-    monkeypatch.setattr(wake_loop, "_oww_model", model)
-    wake_loop.set_state(WakeState.ARMED)
-    app = SimpleNamespace(state=SimpleNamespace(settings=Config(), store=None))
+    host = make_host(model)
+    monkeypatch.setattr(host, "run_session", session)
+    monkeypatch.setattr(host_mod, "CHIME_DECAY_S", 0.0)
 
     q: asyncio.Queue = asyncio.Queue()
     for _ in range(4):
         q.put_nowait(np.full(CHUNK, 0.01, dtype=np.float32))
-    task = asyncio.create_task(wake_loop._mic_loop(app, q, "hey vox", np, engine=None))
+    task = asyncio.create_task(host._armed(host.ports, host._gate, q))
     try:
         assert await wait_for(lambda: sessions, 5.0)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        wake_loop.set_state(WakeState.OFF)
+        host.set_state(WakeState.OFF)
     assert len(sessions) == 1
 
 

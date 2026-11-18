@@ -1,30 +1,46 @@
-"""Wake word state API.
+"""Wake word state API, read from the voice host (app.state.voice_host).
 
-GET  /v1/wake/state     → {state, model, phrase}   states: armed | listening | off | error
+GET  /v1/wake/state     → {state, model, phrase, trigger, meeting_id}
+                          states: armed | listening | off | error
 POST /v1/wake/arm       → arm (no-op if already armed/listening)
-POST /v1/wake/disarm    → set state to off; mic stream closes within ~32 ms
-POST /v1/wake/trigger   → DEBUG ONLY (--debug-trigger). Bypass OWW, start a session immediately.
-                          Returns {meeting_id}. Use for automated roomplay tests.
+POST /v1/wake/disarm    → set state to off; the armed loop closes its subscription
+POST /v1/wake/trigger   → DEBUG ONLY (--debug-trigger). Bypass the wake gate, start a session
+                          immediately. Returns {meeting_id}. Use for automated roomplay tests.
+POST /v1/wake/power     → sleep | wake | lock | unlock from the app, for the capture watchdog
+
+Without --wake there is no voice host: the state is off and arm changes nothing.
 """
 
-import asyncio
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app.local import events
-from app.local.wake_loop import WakeState, get_state, set_state
+from app.local.voice.host import VoiceConfig, WakeState
 
 router = APIRouter(prefix="/v1/wake", tags=["wake"])
 
+_OFF_CONFIG = VoiceConfig()
+
+
+def _host(request: Request):
+    return getattr(request.app.state, "voice_host", None)
+
+
+def _value(v) -> str:
+    return v.value if isinstance(v, WakeState) else str(v)
+
 
 @router.get("/state")
-async def wake_state(_: Request):
-    s = get_state()
-    v = s["state"]
+async def wake_state(request: Request):
+    host = _host(request)
+    if host is None:
+        return {"state": WakeState.OFF.value, "model": _OFF_CONFIG.detector,
+                "phrase": _OFF_CONFIG.wake_phrase, "trigger": _OFF_CONFIG.trigger_phrase,
+                "meeting_id": None}
+    s = host.snapshot()
     return {
-        "state":      v.value if isinstance(v, WakeState) else str(v),
+        "state":      _value(s["state"]),
         "model":      s["model"],
         "phrase":     s["phrase"],
         "trigger":    s.get("trigger"),
@@ -33,73 +49,47 @@ async def wake_state(_: Request):
 
 
 @router.post("/arm", status_code=200)
-async def arm_wake(_: Request):
-    current = get_state()["state"]
-    if current in (WakeState.ARMED, WakeState.LISTENING):
-        return {"state": current.value if isinstance(current, WakeState) else str(current),
-                "changed": False}
-    set_state(WakeState.ARMED)
-    events.publish("wake_state", get_state(), broadcast=True)
-    return {"state": WakeState.ARMED.value, "changed": True}
+async def arm_wake(request: Request):
+    host = _host(request)
+    if host is None:
+        return {"state": WakeState.OFF.value, "changed": False}
+    changed = host.arm()      # the host publishes wake_state on a change
+    return {"state": _value(host.state), "changed": changed}
 
 
 @router.post("/disarm", status_code=200)
-async def disarm_wake(_: Request):
-    current = get_state()["state"]
-    if current == WakeState.OFF:
+async def disarm_wake(request: Request):
+    host = _host(request)
+    if host is None:
         return {"state": WakeState.OFF.value, "changed": False}
-    set_state(WakeState.OFF)
-    events.publish("wake_state", get_state(), broadcast=True)
-    return {"state": WakeState.OFF.value, "changed": True}
+    changed = host.disarm()
+    return {"state": WakeState.OFF.value, "changed": changed}
 
 
 @router.post("/trigger", status_code=202)
 async def trigger_wake_session(request: Request):
-    """DEBUG ONLY: bypass OWW and start a wake session immediately.
+    """DEBUG ONLY: bypass the wake gate and start a wake session immediately.
 
     Only reachable when the server was started with --debug-trigger. --no-auth
     alone does not enable it: the normal launch runs with --no-auth, and any
     local process could otherwise start a fake wake.
-    Use for automated roomplay tests where TTS voice doesn't trigger OWW.
-    Returns {meeting_id} immediately; session runs as a background task.
+    Use for automated roomplay tests where a synthetic voice does not wake the gate.
+    Returns {meeting_id} once the session has one (up to about 2 s).
     """
     app = request.app
     if not getattr(app.state, "debug_trigger", False):
         raise HTTPException(status_code=403, detail="trigger only available with --debug-trigger")
 
-    from app.local.wake_loop import _run_session
-    import numpy as np
-
-    current = get_state()["state"]
-    if current == WakeState.LISTENING:
+    host = _host(request)
+    if host is not None and host.state == WakeState.LISTENING:
         raise HTTPException(status_code=409, detail="session already in progress")
-
-    audio_engine = getattr(app.state, "audio_engine", None)
-    if audio_engine is None:
+    if getattr(app.state, "audio_engine", None) is None:
         raise HTTPException(status_code=503, detail="audio engine not running")
+    if host is None or not host.ready:
+        raise HTTPException(status_code=503, detail="voice host not ready")
 
-    # Subscribe to the AudioEngine capture stream for this session
-    audio_q = audio_engine.subscribe()
-
-    async def _session_task():
-        try:
-            await _run_session(app, audio_q, confidence=1.0, np=np)
-        finally:
-            # Mirror _mic_loop's finally: reset state so /trigger is not stuck
-            # in LISTENING forever (trigger path never goes through _mic_loop).
-            set_state(WakeState.ARMED)
-            audio_engine.unsubscribe(audio_q)
-
-    asyncio.create_task(_session_task(), name="trigger-session")
-
-    # Poll up to 2 s for meeting_id to appear in _state (set by _run_session after DB write).
-    for _ in range(20):
-        await asyncio.sleep(0.1)
-        mid = get_state().get("meeting_id")
-        if mid:
-            return {"triggered": True, "state": get_state()["state"].value, "meeting_id": mid}
-
-    return {"triggered": True, "state": get_state()["state"].value, "meeting_id": None}
+    mid = await host.trigger()
+    return {"triggered": True, "state": _value(host.state), "meeting_id": mid}
 
 
 class PowerEvent(BaseModel):
@@ -111,7 +101,7 @@ async def power_event(body: PowerEvent, request: Request):
     """Power and session events forwarded by the app (Electron powerMonitor).
 
     sleep pauses the capture watchdog; wake (or an unlock that follows a missed wake) reopens the
-    microphone stream after a short delay so the wake loop is armed on a live stream. Lock alone
+    microphone stream after a short delay so the voice host is armed on a live stream. Lock alone
     changes nothing. Returns handled=False when the engine runs without an audio engine.
     """
     watchdog = getattr(request.app.state, "capture_watchdog", None)

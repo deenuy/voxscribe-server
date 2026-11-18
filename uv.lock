@@ -2741,14 +2741,14 @@ wheels = [
 
 [[package]]
 name = "voxscribe-core"
-version = "0.3.0"
-source = { path = "wheels/voxscribe_core-0.3.0-py3-none-any.whl" }
+version = "0.4.0"
+source = { path = "wheels/voxscribe_core-0.4.0-py3-none-any.whl" }
 dependencies = [
     { name = "pyyaml" },
     { name = "tzdata" },
 ]
 wheels = [
-    { filename = "voxscribe_core-0.3.0-py3-none-any.whl", hash = "sha256:c61302588f176f4283a2861581cbca86c52ac1f725684795c0ca9c5bc8f071ae" },
+    { filename = "voxscribe_core-0.4.0-py3-none-any.whl", hash = "sha256:31770985e8f93370da7439c65557d319a5711cbd4b3ac418519b50084db1c546" },
 ]
 
 [package.optional-dependencies]
@@ -2865,11 +2865,11 @@ requires-dist = [
     { name = "sounddevice", marker = "extra == 'wake'", specifier = ">=0.4" },
     { name = "soundfile", specifier = ">=0.14.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.29" },
-    { name = "voxscribe-core", extras = ["knowledge", "wake"], path = "wheels/voxscribe_core-0.3.0-py3-none-any.whl" },
+    { name = "voxscribe-core", extras = ["knowledge", "wake"], path = "wheels/voxscribe_core-0.4.0-py3-none-any.whl" },
     { name = "voxscribe-server", extras = ["local-asr", "wake", "dev"], marker = "extra == 'all'" },
     { name = "youtube-transcript-api", specifier = ">=1.2.4" },
 ]
-provides-extras = ["local-asr", "wake", "dev", "all", "train"]
+provides-extras = ["local-asr", "wake", "dev", "train", "all"]
 
 [[package]]
 name = "watchfiles"
