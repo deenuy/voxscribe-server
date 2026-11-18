@@ -38,9 +38,13 @@ async def lifespan(app: FastAPI):
         try:
             from app.local.audio_engine import AudioEngine
             import os as _os
+            _settings = getattr(app.state, "settings", None)
             engine = AudioEngine(
                 capture_device=_os.environ.get("VOXSCRIBE_CAPTURE_DEVICE") or None,
                 playback_device=_os.environ.get("VOXSCRIBE_PLAYBACK_DEVICE") or None,
+                echo_cancellation=getattr(_settings, "aec_enabled", True),
+                noise_suppression=getattr(_settings, "noise_suppress_enabled", False),
+                echo_guard=getattr(_settings, "voice_echo_guard", True),
             )
             await engine.start()
             app.state.audio_engine = engine

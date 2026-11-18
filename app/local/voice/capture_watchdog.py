@@ -78,7 +78,8 @@ class CaptureHealth:
 class CaptureWatchdog:
     """Watches one AudioEngine's capture subscription and reopens the stream when it goes dead.
 
-    engine needs subscribe(), unsubscribe(q), async reopen_stream(reason) and capture_rate.
+    engine needs subscribe() (subscribe_raw() when it has one), unsubscribe(q), async
+    reopen_stream(reason) and capture_rate.
     on_event receives every CaptureHealth. default_input returns an identifier for the system
     default input device, or None when it cannot tell; it is only used when the engine follows
     the default device (capture_device is None).
@@ -230,7 +231,10 @@ class CaptureWatchdog:
         self._task = self._wake_task = None
 
     async def run(self) -> None:
-        q = self._engine.subscribe()
+        # The raw device signal: noise suppression would make a quiet room look like digital
+        # silence, and the echo canceller's high-pass removes the hum this watchdog reports.
+        subscribe = getattr(self._engine, "subscribe_raw", None) or self._engine.subscribe
+        q = subscribe()
         self._reset_signal_state()
         log.info("capture watchdog: running stall=%.1fs silence=%.1fs device_poll=%s",
                  STALL_TIMEOUT_S, SILENCE_CHECK_WINDOW_S,

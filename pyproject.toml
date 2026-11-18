@@ -79,6 +79,15 @@ wake = [
     "sherpa-onnx>=1.10",
     "sentencepiece>=0.2",
     "openwakeword==0.6.0",
+    "voxscribe-server[aec]",
+]
+
+# Capture clean-up for the engine microphone (T12): WebRTC AEC3 echo cancellation against the
+# playback reference, and WebRTC noise suppression. Part of `wake`; without it the engine logs
+# once and falls back to the time-based echo guard.
+aec = [
+    "pywebrtc-audio>=0.2",
+    "numpy>=1.24",
 ]
 
 # Development and testing
@@ -97,7 +106,7 @@ train = [
 
 # Everything
 all = [
-    "voxscribe-server[local-asr,wake,dev]",
+    "voxscribe-server[local-asr,wake,aec,dev]",
 ]
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,8 @@
 - Added a capture watchdog that reopens the microphone stream when it stalls, delivers only digital silence, or the default input device changes, and logs clipping, dropouts and mains hum as capture health events.
 - Added quiet hours (`VOXSCRIBE_QUIET_HOURS_ENABLED`, `VOXSCRIBE_QUIET_HOURS_START`, `VOXSCRIBE_QUIET_HOURS_END`, local time): a wake inside the window plays no sound, opens no session and is stored in `wake_events` with `accepted=false` and `reject_reason='quiet_hours'`.
 - Added `POST /v1/wake/power` (`sleep`, `wake`, `lock`, `unlock`) so the app can tell the engine about system sleep; after a wake the microphone is reopened and the wake loop is armed on a live stream.
+- Added echo cancellation on the engine microphone: every capture chunk is cleaned against what the speaker is playing (WebRTC AEC3) before the wake gate or the recognizer sees it, so the assistant no longer hears its own replies. The time-based echo guard still runs behind it. `VOXSCRIBE_AEC_ENABLED` and the existing `VOXSCRIBE_VOICE_ECHO_GUARD` turn each stage off. WebRTC noise suppression is available with `VOXSCRIBE_NOISE_SUPPRESS_ENABLED=true` and off by default, because it raised recognizer word error on the 10 dB SNR fan fixture. The capture watchdog reads the device signal before clean-up.
+- Added `tools/voice_bench/capture_wer.py`, which reports recognizer word error on the baseline fixture, clean and with fan noise, with and without the capture clean-up, and its cost per capture chunk.
 
 ### Bug Fixes
 - Fixed the acknowledgement chime being transcribed as the user's first words: the session now starts with the audio heard after the wake phrase and drops what the microphone captured while the chime played.
@@ -22,6 +24,7 @@
 - Replaced the wake loop (`app/local/wake_loop.py`) with a voice host (`app/local/voice/host.py`) that wires the engine's ten session ports to adapters in `app/local/voice/adapters/` (sound device, Whisper, Kokoro, the reply chain, the rule gate, the heuristic turn detector, Postgres) and runs capture, recognize, turn, reply and playback on them. Wake, quiet hours, the capture watchdog, power events, the debug trigger, stop phrases and the speculative reply start behave as before. `/v1/wake/*` reads the host from `app.state.voice_host`; without `--wake` the state is `off` and arming changes nothing.
 - Every reply sentence now goes through voxscribe-core's reply stage: the gate checks it before the talker synthesises it, and a gate that fails speaks the fixed refusal phrase, never the candidate. `reply_chain.run_reply` is replaced by `begin_reply`, `reply_sentences` and `finish_reply`, which the Delegate and SessionStore adapters call.
 - Requires voxscribe-core 0.4.0 for the session ports and the reply stage.
+- A new `aec` extra (pywebrtc-audio) is part of `wake`; without it the engine logs once and runs with the time-based echo guard only.
 
 ## What's New in VoxScribe Server 0.8.0
 
