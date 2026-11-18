@@ -352,7 +352,8 @@ def fake_sounddevice(monkeypatch):
 
 
 async def test_reopen_stream_replaces_both_streams_and_keeps_subscribers(fake_sounddevice):
-    engine = AudioEngine()
+    # Clean-up off: this checks the subscription survives a reopen, sample for sample.
+    engine = AudioEngine(echo_cancellation=False, noise_suppression=False)
     await engine.start()
     try:
         q = engine.subscribe()

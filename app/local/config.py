@@ -156,6 +156,13 @@ class Config:
     tts_voice: str = ""
     voice_barge_in: bool = True
     voice_echo_guard: bool = True
+    # Capture clean-up on the engine microphone (T12): echo cancellation against the playback
+    # reference (VOXSCRIBE_AEC_ENABLED) and noise suppression (VOXSCRIBE_NOISE_SUPPRESS_ENABLED).
+    # voice_echo_guard keeps the time-based mute behind them. Noise suppression is off by
+    # default: on the fan-noise fixture at 10 dB SNR it raised recognizer word error
+    # (tools/voice_bench/capture_wer.py, results/t12-capture/capture_wer.json).
+    aec_enabled: bool = True
+    noise_suppress_enabled: bool = False
     voice_max_reply_seconds: int = 20
     voice_mode: str = "default"          # default | classroom | seniorcare
     voice_reply_model: str = "llama3.2"  # 3B-4B class for spoken replies
@@ -349,6 +356,12 @@ class Config:
         voice_echo_guard = env_vars.get("VOXSCRIBE_VOICE_ECHO_GUARD", "").strip().lower()
         if voice_echo_guard:
             config_dict["voice_echo_guard"] = voice_echo_guard in ("true", "1", "yes")
+
+        for env_name, field in (("VOXSCRIBE_AEC_ENABLED", "aec_enabled"),
+                                ("VOXSCRIBE_NOISE_SUPPRESS_ENABLED", "noise_suppress_enabled")):
+            value = env_vars.get(env_name, "").strip().lower()
+            if value:
+                config_dict[field] = value in ("true", "1", "yes")
 
         config_dict["voice_max_reply_seconds"] = _parse_int(
             env_vars, "VOXSCRIBE_VOICE_MAX_REPLY_SECONDS", 20

@@ -11,7 +11,7 @@
 - Added a profile system with per-deployment configuration for wake sensitivity, reply style, guardrail level, network access, and enrollment requirements, loadable from YAML with no code changes.
 - Added `GET /v1/assistant/profile`, `PATCH /v1/assistant/profile` and `POST /v1/assistant/profile/reset` so the assistant name, wake phrase, voice, speed, and system prompt can be changed at runtime with no restart.
 - Added `GET /v1/assistant/voices` listing the available TTS voices for use in the settings screen.
-- Added acoustic echo cancellation using the WebRTC AEC3 algorithm, so the assistant no longer hears its own replies through the microphone, making self-triggered sessions significantly less likely.
+- Added acoustic echo cancellation using the WebRTC AEC3 algorithm, so the assistant no longer hears its own replies through the microphone, making self-triggered sessions significantly less likely. `VOXSCRIBE_AEC_ENABLED=true` to enable; noise suppression is `VOXSCRIBE_NOISE_SUPPRESS_ENABLED` and off by default (raises WER on fan fixture).
 - Added a background delegation lane that routes web searches and long lookups to a background task while the assistant keeps answering simpler follow-up questions immediately.
 - Added native reminder and timer support: saying "remind me to call Alex at 3pm" creates a local reminder that fires at the next turn after the scheduled time, with no false confirmation when no action was taken.
 - Added spoken controls so pacing, volume, reply length, hold, and repeat can be adjusted by voice during a session without interrupting the conversation.
@@ -32,7 +32,7 @@
 - Replaced the wake loop with a ports-and-adapters voice host that wires ten typed session ports to swappable adapters, isolating the core voice logic from sound libraries, database drivers, and platform calls.
 - Changed the debug trigger endpoint (`POST /v1/wake/trigger`) to require a `--debug-trigger` flag at startup, preventing accidental wake events from local processes in production.
 - Removed the browser-based speech recognition fallback from the app; the Python engine handles all voice input.
-- Requires voxscribe-core 0.4.0.
+- Requires voxscribe-core 0.5.0. The `wake` extra includes `pywebrtc-audio` for AEC; without it the engine runs with the time-based echo guard only.
 
 ## What's New in VoxScribe Server 0.8.0
 
