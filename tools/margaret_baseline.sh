@@ -18,13 +18,13 @@ echo "log dir: $LOG_DIR"
 echo ""
 
 # ── start engine in seniorcare mode ──────────────────────────────────────────
-echo "[0] starting engine --wake --no-auth seniorcare mode..."
+echo "[0] starting engine --wake --no-auth --debug-trigger seniorcare mode..."
 cd "$ROOT"
 VOXSCRIBE_CAPTURE_DEVICE="MacBook Pro Microphone" \
 VOXSCRIBE_PLAYBACK_DEVICE="MacBook Pro Speakers" \
 VOXSCRIBE_VOICE_MODE="seniorcare" \
 VOXSCRIBE_VOICE_REPLY_MODEL="llama3.2" \
-  uv run python -m app.local.engine --wake --no-auth --port 0 \
+  uv run python -m app.local.engine --wake --no-auth --debug-trigger --port 0 \
   > "$LOG_DIR/engine.log" 2>&1 &
 ENGINE_PID=$!
 trap "echo 'stopping engine...'; kill $ENGINE_PID 2>/dev/null; wait $ENGINE_PID 2>/dev/null || true" EXIT

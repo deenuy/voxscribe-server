@@ -76,8 +76,8 @@ def _install_app_local_handler(log_level: str) -> None:
         uv_log.setLevel(logging.WARNING)
 
 
-async def main():
-    """Main entry point."""
+def build_parser() -> argparse.ArgumentParser:
+    """Return the engine CLI parser (separate so tests can inspect the flags)."""
     parser = argparse.ArgumentParser(description="VoxScribe local engine")
     parser.add_argument("--port", type=int, default=0, help="Port to bind to (0 = pick free)")
     parser.add_argument("--data-dir", type=str, default=None, help="Data directory")
@@ -103,8 +103,18 @@ async def main():
         action="store_true",
         help="Start the always-on wake word listener (requires wakeword extras in voxscribe-core)",
     )
+    parser.add_argument(
+        "--debug-trigger",
+        action="store_true",
+        help="Enable POST /v1/wake/trigger, which starts a wake session without the wake word "
+             "(development and automated room tests only; independent of --no-auth)",
+    )
+    return parser
 
-    args = parser.parse_args()
+
+async def main():
+    """Main entry point."""
+    args = build_parser().parse_args()
 
     # Load config from CLI > env > dotenv > defaults
     # This validates the config BEFORE we do anything else
@@ -126,6 +136,7 @@ async def main():
             settings=settings,
             auth_disabled=args.no_auth,
             wake=args.wake,
+            debug_trigger=args.debug_trigger,
         )
     except Exception as e:
         print(f"Failed to create app: {e}", file=sys.stderr)
