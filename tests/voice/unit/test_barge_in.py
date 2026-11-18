@@ -320,17 +320,17 @@ async def test_reply_chain_appends_the_note_to_the_system_prompt(monkeypatch):
     monkeypatch.setattr(llm_adapter, "stream_reply", fake_stream)
     note = interruption_note("Hello, I found")
     app = SimpleNamespace(state=SimpleNamespace(settings=None))
-    src = reply_chain.reply_sentences(app, "m1", "what about tomorrow?",
-                                      history=[{"role": "assistant",
-                                                "content": "Hello, I found"}],
-                                      system_note=note)
+    src = reply_chain.talker_sentences(app, "m1", "what about tomorrow?",
+                                       history=[{"role": "assistant",
+                                                 "content": "Hello, I found"}],
+                                       system_note=note)
     assert [s async for s in src.sentences] == ["Tomorrow it opens at nine."]
     assert seen["system_prompt"].endswith(note)
     assert seen["system_prompt"].startswith("You are a helpful voice assistant.")
 
-    src = reply_chain.reply_sentences(app, "m1", "hello")
+    src = reply_chain.talker_sentences(app, "m1", "hello")
     assert [s async for s in src.sentences]
-    assert seen["system_prompt"] is None          # unchanged without a barge-in
+    assert note not in (seen["system_prompt"] or "")   # no note without barge-in
 
 
 class _StableFirst:
