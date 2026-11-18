@@ -5,8 +5,11 @@ token generation overlaps it; the host keeps or cancels it with its drift rule. 
 the turn and returns its sentences; the reply stage gates and speaks them. After a barge-in the
 host passes `system_note` (voice/barge_in.py), which reaches the reply model's system prompt.
 
-Routing, in order, all before the reply model is called (T14):
+Routing, in order, all before the reply model is called (T14/T16):
 
+  fired    any reminder whose fire_at is <= now() is spoken first, then marked fired (T16)
+  reminder "remind me to X at HH:MM" / "set a timer for N minutes": store + confirm (T16)
+  list     "what reminders do I have?": read pending reminders aloud (T16)
   rerun    a yes to last turn's stale-result offer submits the same request again
   cancel   "cancel that", "never mind": the newest open task is cancelled, "Okay, cancelled."
   change   "actually, X", "search for X instead": the newest open task is cancelled and X
@@ -36,6 +39,7 @@ from app.local.voice import delegate_lane as dl
 from app.local.voice.adapters.events_app import publish_broadcast
 from app.local.voice.adapters.store_postgres import PostgresDelegateTaskStore
 from app.local.voice.delegate_lane import DelegateLane, DelegateTask, IntentKind
+from app.local.voice import reminder_store as rs
 
 log = logging.getLogger("app.local.voice.delegate")
 
@@ -45,13 +49,16 @@ Submit = Callable[[str], DelegateTask]
 
 
 class OllamaDelegate:
-    def __init__(self, app, *, lane: DelegateLane | None = None) -> None:
+    def __init__(self, app, *, lane: DelegateLane | None = None,
+                 reminder_store=None) -> None:
         self._app = app
         self._task_store = PostgresDelegateTaskStore(app)
         self.lane = lane or DelegateLane(runner=self._think, on_change=self._task_changed)
         self._contexts: dict[str, list[dict]] = {}      # task id -> history when submitted
         self._offered: DelegateTask | None = None       # stale result offered last turn
         self._writes: set[asyncio.Task] = set()
+        self._reminder_store = (reminder_store if reminder_store is not None
+                                else rs.ReminderStore(app))
 
     @property
     def _settings(self):
@@ -87,6 +94,44 @@ class OllamaDelegate:
         text = turn_text.strip()
         hist = list(history) if history else None
 
+        # T16: check for fired reminders at the start of every turn.
+        fired_sentences = await self._collect_fired_reminders()
+
+        # T16: reminder and timer requests are handled without the LLM.
+        if rs.is_reminder_signal(text):
+            parsed = rs.parse_reminder(text)
+            if parsed is not None:
+                desc, fire_at = parsed
+                try:
+                    await self._reminder_store.add(desc, fire_at)
+                except Exception:
+                    log.exception("reminders: failed to store reminder session_id=%s",
+                                  session_id)
+                confirmation = rs.reminder_confirmation(text, desc, fire_at)
+                log.info("voice delegate: route=reminder session_id=%s", session_id)
+                return ReplyStream(
+                    sentences=_prepend_then(fired_sentences, _each([confirmation])),
+                    source="reminder",
+                    cue=reply_chain.THINKING_PHRASE if text else None,
+                    fallback=reply_chain.FALLBACK_PHRASE,
+                )
+
+        # T16: "what reminders do I have?" reads the pending list without the LLM.
+        if rs.is_reminder_list_request(text):
+            try:
+                pending = await self._reminder_store.list_pending()
+            except Exception:
+                log.exception("reminders: failed to list reminders session_id=%s", session_id)
+                pending = []
+            sentences = rs.build_reminder_list_sentences(pending)
+            log.info("voice delegate: route=reminder_list session_id=%s", session_id)
+            return ReplyStream(
+                sentences=_prepend_then(fired_sentences, _each(sentences)),
+                source="reminder",
+                cue=reply_chain.THINKING_PHRASE if text else None,
+                fallback=reply_chain.FALLBACK_PHRASE,
+            )
+
         def submit(request: str) -> DelegateTask:
             task = self.lane.submit(request, session_id=session_id, turn_id=turn_id)
             if hist and task.status in dl.ACTIVE_STATUSES:
@@ -106,7 +151,9 @@ class OllamaDelegate:
                 cancel()
             own = _each(fixed)
         log.info("voice delegate: route=%s session_id=%s", source, session_id)
-        return ReplyStream(sentences=self._with_delivery(own, deliver), source=source,
+        return ReplyStream(sentences=self._with_delivery(_prepend_then(fired_sentences, own),
+                                                         deliver),
+                           source=source,
                            cue=reply_chain.THINKING_PHRASE if text else None,
                            fallback=reply_chain.FALLBACK_PHRASE)
 
@@ -205,6 +252,33 @@ class OllamaDelegate:
         """Wait for task rows still being written (shutdown and tests)."""
         while self._writes:
             await asyncio.gather(*list(self._writes), return_exceptions=True)
+
+    # ------------------------------------------------------------------ T16 reminder helpers
+
+    async def _collect_fired_reminders(self) -> list[str]:
+        """Return spoken sentences for any reminders that are due, and mark them fired."""
+        try:
+            due = await self._reminder_store.list_due()
+        except Exception:
+            log.exception("reminders: failed to check due reminders")
+            return []
+        sentences: list[str] = []
+        for reminder in due:
+            try:
+                await self._reminder_store.mark_fired(reminder.id)
+            except Exception:
+                log.exception("reminders: failed to mark fired id=%s", reminder.id)
+            sentences.append(rs.REMINDER_FIRED_PHRASE.format(text=reminder.text))
+        return sentences
+
+
+async def _prepend_then(prefix: list[str],
+                        gen: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Yield the prefix sentences first, then everything from gen."""
+    for sentence in prefix:
+        yield sentence
+    async for sentence in gen:
+        yield sentence
 
 
 async def _each(sentences: Sequence[str]) -> AsyncIterator[str]:
