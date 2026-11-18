@@ -27,7 +27,6 @@ the audio actually fed by more than _CLOCK_SKEW_LIMIT_MS.
 from __future__ import annotations
 
 import logging
-import struct
 
 # The engine's clock contract error, re-exported so callers that caught it here keep working and
 # a host catches one type for every Speech adapter.

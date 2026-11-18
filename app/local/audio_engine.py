@@ -28,7 +28,6 @@ import asyncio
 import collections
 import logging
 import time
-from typing import Sequence
 
 log = logging.getLogger("app.local.audio_engine")
 
@@ -223,8 +222,8 @@ class AudioEngine:
         if self._started:
             return
         try:
-            import sounddevice as sd
             import numpy as np
+            import sounddevice as sd
         except ImportError as exc:
             raise RuntimeError("AudioEngine needs sounddevice and numpy") from exc
 

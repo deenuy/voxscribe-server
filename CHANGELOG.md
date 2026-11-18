@@ -1,27 +1,38 @@
 # Changelog
 
-## Unreleased
+## What's New in VoxScribe Server 0.9.0
 
 ### New Features
-- Changed the wake word to "hey vox" behind a two-stage gate: a session starts only when the detector holds the phrase for its patience, at least 30% of the last second is voice, and a short recognizer pass over the last two seconds hears "hey vox". "Hey jarvis" no longer wakes the assistant.
-- Added two wake detectors behind one interface: an open-vocabulary keyword spotter that takes the phrase as plain text (the default) and an openWakeWord model trained on synthetic "hey vox" clips. `VOXSCRIBE_WAKE_DETECTOR=oww` selects the second.
-- Added a row in `wake_events` for every wake candidate, accepted or rejected, with its score, reject reason, detector and voice ratio, and a once-a-minute `wake: peak_score=` log line so missed wakes can be counted.
-- Added `tools/fetch_wake_models.py`, `tools/wake_synth_clips.py` and a working `tools/train_wake_model.py`, and a gate mode in `tools/voice_bench/replay.py` that runs the same gate offline and reports accepts, candidates and reject reasons per fixture set.
-- Added a capture watchdog that reopens the microphone stream when it stalls, delivers only digital silence, or the default input device changes, and logs clipping, dropouts and mains hum as capture health events.
-- Added quiet hours (`VOXSCRIBE_QUIET_HOURS_ENABLED`, `VOXSCRIBE_QUIET_HOURS_START`, `VOXSCRIBE_QUIET_HOURS_END`, local time): a wake inside the window plays no sound, opens no session and is stored in `wake_events` with `accepted=false` and `reject_reason='quiet_hours'`.
-- Added `POST /v1/wake/power` (`sleep`, `wake`, `lock`, `unlock`) so the app can tell the engine about system sleep; after a wake the microphone is reopened and the wake loop is armed on a live stream.
+- Changed the wake phrase to "hey vox" behind a two-stage gate: a session starts only when the detector holds the phrase for two consecutive frames, at least 30% of the last second is voice, and a short Whisper pass confirms the phrase. "Hey jarvis" no longer wakes the assistant.
+- Added two wake detectors behind one interface: an open-vocabulary keyword spotter that takes the phrase as plain text (the default) and an openWakeWord model trained on synthetic "hey vox" clips, selectable with `VOXSCRIBE_WAKE_DETECTOR=oww`.
+- Added a capture watchdog that reopens the microphone stream when it stalls, delivers only digital silence, or the default input device changes, making the assistant recover automatically from hardware interruptions.
+- Added quiet hours so the assistant stays silent during configured overnight windows, recording each rejected wake without playing a sound or opening a session.
+- Added `POST /v1/wake/power` so the app can notify the engine of system sleep and wake events, keeping the microphone stream in sync with the device power state.
+- Added a profile system with per-deployment configuration for wake sensitivity, reply style, guardrail level, network access, and enrollment requirements, loadable from YAML with no code changes.
+- Added `GET /v1/assistant/profile`, `PATCH /v1/assistant/profile` and `POST /v1/assistant/profile/reset` so the assistant name, wake phrase, voice, speed, and system prompt can be changed at runtime with no restart.
+- Added `GET /v1/assistant/voices` listing the available TTS voices for use in the settings screen.
+- Added acoustic echo cancellation using the WebRTC AEC3 algorithm, so the assistant no longer hears its own replies through the microphone, making self-triggered sessions significantly less likely.
+- Added a background delegation lane that routes web searches and long lookups to a background task while the assistant keeps answering simpler follow-up questions immediately.
+- Added native reminder and timer support: saying "remind me to call Alex at 3pm" creates a local reminder that fires at the next turn after the scheduled time, with no false confirmation when no action was taken.
+- Added spoken controls so pacing, volume, reply length, hold, and repeat can be adjusted by voice during a session without interrupting the conversation.
+- Added a session memory store that extracts facts from each turn and injects them as context for the next reply, so the assistant can use the person's name and preferences throughout a session.
+- Added clause-level TTS streaming: synthesis of the second clause starts while the first clause is playing, reducing the gap between the end of the LLM reply and the start of the spoken answer.
+- Added a tray state indicator that updates every two seconds to show the engine state (listening, speaking, follow-up, hold, and others) as a tooltip on the menu bar icon.
+- Added an assistant settings screen in the app for changing the wake phrase, name, voice, and speed, wired to the new profile API.
 
 ### Bug Fixes
-- Fixed the acknowledgement chime being transcribed as the user's first words: the session now starts with the audio heard after the wake phrase and drops what the microphone captured while the chime played.
-- Fixed a rejected or noise-triggered wake playing a chime and opening a session; a rejected candidate is now silent and only recorded.
-- Fixed the voice loop writing what the person said, the speculative reply text and the stop phrase it heard into the engine log; it now logs word counts only, and speech synthesis errors log the text length instead of the text.
-- Fixed the clock answer and the "I can't look that up right now" line being spoken without a gate check; every spoken sentence now passes the gate first.
+- Fixed the acknowledgement chime being transcribed as the user's first words, which caused the assistant to reply to its own sound at night; the chime is now muted in the capture signal for a window after it plays.
+- Fixed sessions opening from a single noisy frame with no actual speech; the two-stage gate now requires patience, voice activity, and a phrase match before a session starts.
+- Fixed the turn detector closing turns early by measuring pause length against engine uptime instead of stream time; pauses are now measured against the audio clock, so long mid-sentence pauses no longer cut off the speaker.
+- Fixed the assistant claiming to set reminders or alarms when it had no tool for them; spoken sentences that claim to have taken an action without a matching tool call are replaced by a fixed clarification phrase.
+- Fixed the assistant speaking at night and during other quiet periods by enforcing configurable quiet hours and checking the system power state before arming.
+- Prevented sessions from persisting when no real speech was detected: a turn that the speech guard blocks on the first attempt silently discards the meeting row and returns the assistant to standby.
 
 ### Changed
-- Requires voxscribe-core 0.3.0 for the wake gate; the `wake` extra now includes sherpa-onnx, sentencepiece and openwakeword, and a new `train` extra holds the training-only packages.
-- Replaced the wake loop (`app/local/wake_loop.py`) with a voice host (`app/local/voice/host.py`) that wires the engine's ten session ports to adapters in `app/local/voice/adapters/` (sound device, Whisper, Kokoro, the reply chain, the rule gate, the heuristic turn detector, Postgres) and runs capture, recognize, turn, reply and playback on them. Wake, quiet hours, the capture watchdog, power events, the debug trigger, stop phrases and the speculative reply start behave as before. `/v1/wake/*` reads the host from `app.state.voice_host`; without `--wake` the state is `off` and arming changes nothing.
-- Every reply sentence now goes through voxscribe-core's reply stage: the gate checks it before the talker synthesises it, and a gate that fails speaks the fixed refusal phrase, never the candidate. `reply_chain.run_reply` is replaced by `begin_reply`, `reply_sentences` and `finish_reply`, which the Delegate and SessionStore adapters call.
-- Requires voxscribe-core 0.4.0 for the session ports and the reply stage.
+- Replaced the wake loop with a ports-and-adapters voice host that wires ten typed session ports to swappable adapters, isolating the core voice logic from sound libraries, database drivers, and platform calls.
+- Changed the debug trigger endpoint (`POST /v1/wake/trigger`) to require a `--debug-trigger` flag at startup, preventing accidental wake events from local processes in production.
+- Removed the browser-based speech recognition fallback from the app; the Python engine handles all voice input.
+- Requires voxscribe-core 0.4.0.
 
 ## What's New in VoxScribe Server 0.8.0
 
