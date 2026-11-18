@@ -82,7 +82,8 @@ class OllamaDelegate:
 
     async def reply(self, turn_text: str, session_id: str, *, turn_id: str | None = None,
                     history: Sequence[dict] | None = None, speculation=None,
-                    system_note: str | None = None) -> ReplyStream:
+                    system_note: str | None = None,
+                    system_prefix: str | None = None) -> ReplyStream:
         text = turn_text.strip()
         hist = list(history) if history else None
 
@@ -96,7 +97,8 @@ class OllamaDelegate:
         fixed, source, deliver = self._route(text, offered, submit)
         if fixed is None:
             src = reply_chain.talker_sentences(self._app, session_id, text, history=hist,
-                                               pre_stream=speculation, system_note=system_note)
+                                               pre_stream=speculation, system_note=system_note,
+                                               system_prefix=system_prefix)
             own, source = _without_marker(src.sentences, submit), src.source
         else:
             cancel = getattr(speculation, "cancel", None)

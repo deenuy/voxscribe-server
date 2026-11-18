@@ -202,7 +202,8 @@ class FakeDelegate:
     def __init__(self, replies: Sequence[Sequence[str]] | None = None) -> None:
         self.replies = [list(r) for r in replies] if replies else None
         self.calls: list[str] = []
-        self.notes: list[str | None] = []      # system_note per call (the barge-in note)
+        self.notes: list[str | None] = []
+        self.prefixes: list[str | None] = []
         self.histories: list[list[dict] | None] = []
 
     async def warm(self) -> None:
@@ -212,9 +213,10 @@ class FakeDelegate:
         return FakeSpeculation()
 
     async def reply(self, turn_text, session_id, *, turn_id=None, history=None,
-                    speculation=None, system_note=None) -> ReplyStream:
+                    speculation=None, system_note=None, system_prefix=None) -> ReplyStream:
         self.calls.append(turn_text)
         self.notes.append(system_note)
+        self.prefixes.append(system_prefix)
         self.histories.append([dict(m) for m in history] if history else None)
         n = len(self.calls)
         items = self.replies[n - 1] if self.replies else [f"Answer {n}."]

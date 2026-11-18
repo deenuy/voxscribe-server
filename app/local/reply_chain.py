@@ -226,7 +226,6 @@ def _voice_system_prompt(settings) -> str:
         "Keep replies under 30 words."
     )
 
-
 def talker_system_prompt(settings) -> str:
     """The talker's prompt: the voice prompt plus the instruction to hand anything that needs
     a tool to the delegate lane. The talker itself has no tools."""
@@ -243,12 +242,14 @@ def talker_sentences(
     history: list[dict] | None = None,
     pre_stream: AsyncIterator[str] | None = None,
     system_note: str | None = None,
+    system_prefix: str | None = None,
 ) -> ReplySource:
     """The talker's reply to one turn, as sentences. No tools, nothing is spoken here.
 
     The speculative stream when the host started one, else the reply model. Routing (clock
     answers, delegation to the thinker) is the Delegate adapter's job and happens before this.
-    system_note is appended to the system prompt for this turn only (the barge-in note, T13).
+    system_note  appended to the system prompt for this turn (the barge-in note, T13).
+    system_prefix  prepended to the system prompt (memory block T19 + control suffix T15).
     """
     settings = getattr(app.state, "settings", None)
     model, _mode = reply_settings(settings)
@@ -259,6 +260,8 @@ def talker_sentences(
         return ReplySource(_sentence_stream_from_tokens(pre_stream, _OLLAMA_TIMEOUT_S),
                            source="pre_stream")
     prompt = talker_system_prompt(settings)
+    if system_prefix:
+        prompt = f"{system_prefix}\n\n{prompt}"
     if system_note:
         prompt = f"{prompt} {system_note}"
     return ReplySource(_sentence_stream(user_text, model, _OLLAMA_TIMEOUT_S, history=history,
