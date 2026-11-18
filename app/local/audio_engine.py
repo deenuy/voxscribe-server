@@ -66,6 +66,17 @@ class EchoGuard:
         """Record that playback finished at end_ms; extends mute window."""
         self._mute_until_ms = end_ms + self._TAIL_MS
 
+    def notify_chime(self, duration_ms: int) -> None:
+        """Pre-arm the mute window for a chime played outside the engine playback queue.
+
+        Call immediately when the chime fires (before the hardware buffer receives it),
+        so the mic is muted while the chime plays through the room and reverberates.
+        duration_ms: total time to mute (chime length + room decay). Does not add TAIL_MS.
+        """
+        mute_until = monotonic_ms() + duration_ms
+        if mute_until > self._mute_until_ms:
+            self._mute_until_ms = mute_until
+
     def observe(self, mic_frame, playback_ref) -> object:
         """Returns ("muted", mic_frame) or ("pass", mic_frame)."""
         if monotonic_ms() <= self._mute_until_ms:

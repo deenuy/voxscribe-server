@@ -22,6 +22,7 @@ The CAPTURE / DELIVER / wake_transcript path has been removed.
 
 import asyncio
 import logging
+import os
 import re
 import subprocess
 import time
@@ -67,6 +68,28 @@ def _is_stop_phrase(text: str, wake_phrase: str) -> bool:
     norm = re.sub(r"[^\w\s]", " ", text.lower()).strip()
     return any(p in norm for p in _STOP_PHRASES.get(wake_phrase, set()))
 
+def _is_genuine_speech(text: str, audio_duration_ms: int) -> bool:
+    """Return True only if the transcript looks like genuine human speech.
+
+    Returns False if any of:
+    - stripped text matches a known chime transcript ("Beep.", "Boop.", ...)
+    - transcript contains fewer than MIN_REPLY_WORDS words
+    - non-muted audio collected was shorter than MIN_AUDIO_MS ms
+
+    asr_no_speech_prob is not checked here because LiveTranscriber does not surface
+    Whisper's no_speech_prob; this check is deferred to T10 (fast finalize).
+    """
+    stripped   = text.strip()
+    normalised = stripped.lower().rstrip(".!?,;:")
+    if normalised in CHIME_TRANSCRIPTS:
+        return False
+    if len(stripped.split()) < MIN_REPLY_WORDS:
+        return False
+    if audio_duration_ms < MIN_AUDIO_MS:
+        return False
+    return True
+
+
 def _spec_text_changed(pre: str, final: str) -> bool:
     """Return True if the final transcript adds a content word relative to pre-flush text.
 
@@ -81,7 +104,11 @@ def _spec_text_changed(pre: str, final: str) -> bool:
     added = [w for w in final_words[len(pre_words):] if w not in _FUNCTION_WORDS]
     return len(added) > 0
 
-_OWW_MODEL_NAME = "hey_jarvis"   # stand-in until owner trains "hey vox" (40 clips needed)
+# Stock "hey_jarvis" until a trained hey_vox.onnx is set in VOXSCRIBE_WAKE_MODEL.
+_OWW_MODEL_NAME = os.environ.get("VOXSCRIBE_WAKE_MODEL", "").strip() or "hey_jarvis"
+_OWW_KEY = os.path.splitext(os.path.basename(_OWW_MODEL_NAME))[0]  # OWW keys predictions by file stem
+# What a person must actually say; shown in the UI instead of the configured model name.
+_TRIGGER_PHRASE = re.sub(r"_v\d.*$", "", _OWW_KEY).replace("_", " ")
 _OWW_THRESHOLD  = 0.5            # detection threshold; tuned per device on fixture set
 _OWW_CHUNK      = 1280           # 80 ms at 16 kHz — openWakeWord requirement
 _oww_model = None                # loaded once per process
@@ -95,6 +122,16 @@ _FUNCTION_WORDS = frozenset({
     "of", "with", "by", "is", "it", "this", "that", "i", "you", "my",
     "your", "we", "me", "s", "ll", "d", "re", "ve", "m", "t",
 })
+
+# Cue muting constants (Option B: afplay chime with EchoGuard pre-arm)
+CHIME_DURATION_MS = 800   # approximate duration of the Glass chime via afplay
+CHIME_DECAY_MS    = 300   # extra mute after chime ends for room reverb
+
+# Pre-reply speech guard thresholds
+MIN_REPLY_WORDS  = 2      # transcript must contain at least this many words
+MIN_AUDIO_MS     = 500    # audio turn must be at least this many ms of non-muted frames
+# Chime transcripts produced by Whisper when the acknowledgement chime is heard
+CHIME_TRANSCRIPTS: frozenset[str] = frozenset({"beep", "boop", "bing", ""})
 
 
 class _SpeculativeStream:
@@ -153,6 +190,7 @@ _state: dict = {
     "state": WakeState.OFF,
     "model": _OWW_MODEL_NAME,
     "phrase": "hey vox",   # overwritten from VOXSCRIBE_WAKE_PHRASE at arm time
+    "trigger": _TRIGGER_PHRASE,
     "meeting_id": None,    # set for duration of active session, None when armed
 }
 
@@ -300,7 +338,7 @@ async def _mic_loop(app, audio_q: asyncio.Queue, wake_phrase: str, np, *, engine
             chunk_buf   = chunk_buf[_OWW_CHUNK:]
             oww_i16     = (oww_chunk_f * 32767).clip(-32768, 32767).astype(np.int16)
             prediction  = await asyncio.to_thread(_oww_model.predict, oww_i16)
-            score       = float(prediction.get(_OWW_MODEL_NAME, 0.0))
+            score       = float(prediction.get(_OWW_KEY, 0.0))
 
             if score < _OWW_THRESHOLD:
                 continue
@@ -315,17 +353,20 @@ async def _mic_loop(app, audio_q: asyncio.Queue, wake_phrase: str, np, *, engine
             log.info("wake-word-listener: DETECTED model=%s score=%.3f monotonic_ms=%d",
                      _OWW_MODEL_NAME, score, triggered_ms)
             chunk_buf.clear()  # discard stale audio so it cannot re-trigger
+            # OWW keeps the phrase in its feature and prediction buffers; without a reset it
+            # re-fires on resume.
+            _oww_model.reset()
 
             # B4.7: ignore trigger while already listening.
             if _state["state"] == WakeState.LISTENING:
                 log.info("wake-word-listener: already LISTENING -- ignored (B4.7)")
                 continue
 
-            await _play_chime_async(_CHIME_ACK)
-            chime_done_ms = int(time.monotonic() * 1000)
-            log.info("wake-word-listener: chime latency=%d ms", chime_done_ms - triggered_ms)
-            await asyncio.sleep(0.2)
-            _drain(audio_q)
+            # Fire ACK chime without waiting so "hey vox, how are you" in one breath reaches ASR.
+            # Pre-arm EchoGuard immediately so the room echo of the chime is muted in turn 1.
+            asyncio.create_task(_play_chime_async(_CHIME_ACK), name="wake-chime")
+            if engine is not None:
+                engine.echo_guard.notify_chime(CHIME_DURATION_MS + CHIME_DECAY_MS)
 
             _publish_wake_state(WakeState.LISTENING)
 
@@ -338,8 +379,10 @@ async def _mic_loop(app, audio_q: asyncio.Queue, wake_phrase: str, np, *, engine
             finally:
                 set_state(WakeState.ARMED)
                 _publish_wake_state(WakeState.ARMED)
-                log.info("[Vox Stopped] back to armed — say 'hey vox' to start a new conversation")
+                log.info("[Vox Stopped] back to armed — say %r to start a new conversation",
+                         _TRIGGER_PHRASE)
                 _drain(audio_q)
+                _oww_model.reset()
 
 
 async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
@@ -413,6 +456,7 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
     _reply_model = getattr(settings, "voice_reply_model", "llama3.2")
 
     turn_n = 0
+    _silent_close = False  # set True on turn 1 speech-guard block; suppresses meeting storage
     try:
         # ── conversation loop: one iteration per user turn ──────────────────
         while True:
@@ -620,6 +664,19 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
                     _pre_stream.cancel()
                 break
 
+            # Pre-reply speech guard: blocks chime echoes, sub-threshold audio,
+            # and one-word transcripts. asr_no_speech_prob check deferred to T10.
+            audio_duration_ms = total_frames * _CHUNK_FRAMES * 1000 // _SAMPLE_RATE
+            if not _is_genuine_speech(turn_text, audio_duration_ms):
+                log.info("wake: speech guard blocked reply text=%r dur_ms=%d",
+                         turn_text[:30], audio_duration_ms)
+                if _pre_stream:
+                    _pre_stream.cancel()
+                if turn_n == 1:
+                    log.info("wake: silent close -- no genuine speech in turn 1")
+                    _silent_close = True
+                break
+
             # Validate speculative stream: semantic drift gate (owner-decided 2026-10-17).
             # Cancel if flush added a content word that would change the LLM's answer.
             if _pre_stream is not None:
@@ -651,17 +708,37 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
 
     finally:
         _state["meeting_id"] = None
-        try:
-            meeting, stopped_now = await store.stop_once(meeting_id)
-        except Exception:
-            log.exception("wake: stop_once failed meeting_id=%s", meeting_id)
-            stopped_now = False
-        if stopped_now:
-            await meeting_bus.publish(meeting_id, "status", {"state": "processing"})
-            schedule_finalize(app, meeting_id)
-            log.info("wake: finalize scheduled meeting_id=%s turns=%d", meeting_id, turn_n)
+        if _silent_close:
+            # Silent close: no genuine speech heard in turn 1.
+            # Remove the meeting row (it was never a real session) and clear the FK so
+            # the wake_events row that pointed to it can be retained for audit.
+            log.info("wake: silent close cleanup meeting_id=%s", meeting_id)
+            try:
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        "UPDATE wake_events SET started_meeting_id=NULL"
+                        " WHERE started_meeting_id=%s",
+                        (meeting_id,)
+                    )
+                    await conn.execute(
+                        "DELETE FROM meetings WHERE id=%s",
+                        (meeting_id,)
+                    )
+                    await conn.commit()
+            except Exception:
+                log.exception("wake: silent close cleanup failed meeting_id=%s", meeting_id)
         else:
-            log.info("wake: session already stopped meeting_id=%s", meeting_id)
+            try:
+                meeting, stopped_now = await store.stop_once(meeting_id)
+            except Exception:
+                log.exception("wake: stop_once failed meeting_id=%s", meeting_id)
+                stopped_now = False
+            if stopped_now:
+                await meeting_bus.publish(meeting_id, "status", {"state": "processing"})
+                schedule_finalize(app, meeting_id)
+                log.info("wake: finalize scheduled meeting_id=%s turns=%d", meeting_id, turn_n)
+            else:
+                log.info("wake: session already stopped meeting_id=%s", meeting_id)
 
 
 def _publish_wake_state(state: WakeState) -> None:
