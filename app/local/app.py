@@ -1,6 +1,5 @@
 """FastAPI application setup."""
 
-import asyncio
 import hmac
 import logging
 import time
@@ -35,7 +34,6 @@ async def lifespan(app: FastAPI):
     log.info("engine startup: initializing components")
 
     # Start AudioEngine (single mic + speaker stream) when wake is enabled.
-    wake_task = None
     if getattr(app.state, "wake_enabled", False):
         try:
             from app.local.audio_engine import AudioEngine
@@ -48,7 +46,26 @@ async def lifespan(app: FastAPI):
             app.state.audio_engine = engine
             log.info("audio-engine: started (capture+playback)")
         except Exception as exc:
-            log.warning("audio-engine: could not start -- wake loop will use direct stream: %s", exc)
+            log.warning("audio-engine: could not start -- voice host will use direct stream: %s", exc)
+
+        # Voice host: the ports-and-adapters runtime for the wake word and conversations.
+        from app.local.voice.host import VoiceHost
+
+        voice_host = VoiceHost.from_app(app)
+        app.state.voice_host = voice_host
+
+        # Capture watchdog: reopens the mic stream after a stall, digital silence, a device change or a wake.
+        if getattr(app.state, "audio_engine", None) is not None:
+            try:
+                from app.local.voice.capture_watchdog import CaptureWatchdog
+
+                watchdog = CaptureWatchdog(app.state.audio_engine,
+                                           on_event=voice_host.on_capture_health)
+                watchdog.start()
+                app.state.capture_watchdog = watchdog
+                log.info("capture-watchdog: started")
+            except Exception as exc:
+                log.warning("capture-watchdog: could not start: %s", exc)
 
         try:
             from app.local.reply_chain import warm_phrase_cache
@@ -57,10 +74,9 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             log.warning("reply-chain: phrase cache warm failed: %s", exc)
 
-        from app.local.wake_loop import run_wake_loop
-        log.info("wake-word-listener: initializing -- model=whisper/tiny.en phrase=env:VOXSCRIBE_WAKE_PHRASE")
-        wake_task = asyncio.create_task(run_wake_loop(app), name="wake-loop")
-        log.info("wake-word-listener: task created, awaiting mic open")
+        log.info("voice-host: initializing detector=%s", voice_host.config.detector)
+        voice_host.start()
+        log.info("voice-host: task created, adapters load off the event loop")
 
     # Start ingestion worker if available
     if hasattr(app.state, "ingestion_worker"):
@@ -94,17 +110,15 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     log.info("engine shutdown: stopping components")
-    if wake_task is not None and not wake_task.done():
-        log.info("wake-word-listener: cancelling")
-        wake_task.cancel()
-        try:
-            await wake_task
-        except asyncio.CancelledError:
-            pass
-        log.info("wake-word-listener: stopped")
+    if getattr(app.state, "voice_host", None) is not None:
+        log.info("voice-host: stopping")
+        await app.state.voice_host.stop()
+        log.info("voice-host: stopped")
     if hasattr(app.state, "ingestion_worker"):
         await app.state.ingestion_worker.stop()
         log.info("ingestion-worker: stopped")
+    if hasattr(app.state, "capture_watchdog"):
+        await app.state.capture_watchdog.stop()
     if hasattr(app.state, "audio_engine"):
         await app.state.audio_engine.stop()
         log.info("audio-engine: stopped")
@@ -118,6 +132,7 @@ async def create_app(
     auth_disabled: bool = False,
     schema: str | None = None,
     wake: bool = False,
+    debug_trigger: bool = False,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -125,6 +140,8 @@ async def create_app(
         settings: Configuration object
         auth_disabled: If True, skip authentication
         schema: Optional database schema name for test isolation
+        wake: If True, start the always-on wake word listener
+        debug_trigger: If True, enable POST /v1/wake/trigger (development only)
     """
     from app.local.config import Config
 
@@ -178,6 +195,7 @@ async def create_app(
     app.state.settings = settings
     app.state.started_at = time.time()
     app.state.wake_enabled = wake
+    app.state.debug_trigger = debug_trigger
     # Tenant isolation: with an identity service configured, every request names a person and each person's data is
     # kept in a schema of their own. Without one, nothing changes (one person at a time).
     app.state.identity = None

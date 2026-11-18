@@ -30,6 +30,7 @@ log = logging.getLogger("app.local.tts_engine")
 _SAY_VOICE         = os.environ.get("SAY_VOICE", "Samantha")
 _KOKORO_VOICE      = os.environ.get("KOKORO_VOICE", "af_heart")
 _PLAYBACK_RATE_HZ  = 24_000
+PLAYBACK_RATE_HZ   = _PLAYBACK_RATE_HZ   # rate of every array synthesize() and load_phrase() return
 _SAY_TIMEOUT_S     = 15.0
 _KOKORO_TIMEOUT_S  = 8.0
 
@@ -105,28 +106,26 @@ async def _kokoro_synthesize(text: str, voice: str):
         )
         return samples
     except TimeoutError:
-        log.warning("tts_engine: Kokoro synthesis timed out text=%r", text[:60])
+        log.warning("tts_engine: Kokoro synthesis timed out len=%d", len(text))
         return None
     except Exception:
-        log.exception("tts_engine: Kokoro synthesis failed text=%r", text[:60])
+        log.exception("tts_engine: Kokoro synthesis failed len=%d", len(text))
         return None
 
 
-async def synthesize_and_play(
-    text: str,
-    audio_engine,
-    *,
-    voice: str = _KOKORO_VOICE,
-) -> float:
-    """Synthesize text and play through AudioEngine. Returns duration seconds."""
+async def synthesize(text: str, *, voice: str = _KOKORO_VOICE):
+    """Synthesize text to float32 mono at _PLAYBACK_RATE_HZ: Kokoro, else macOS say.
+
+    Returns None when both fail or the text is blank. Nothing is played.
+    """
     if not text.strip():
-        return 0.0
+        return None
 
     try:
         import numpy as np
     except ImportError:
         log.error("tts_engine: numpy required")
-        return 0.0
+        return None
 
     samples = await _kokoro_synthesize(text, voice)
 
@@ -138,8 +137,8 @@ async def synthesize_and_play(
             await asyncio.to_thread(_say_to_wav, text, tmppath, voice=_SAY_VOICE)
             samples = await asyncio.to_thread(_read_wav_float32, tmppath, np)
         except Exception:
-            log.exception("tts_engine: say fallback failed text=%r", text[:60])
-            return 0.0
+            log.exception("tts_engine: say fallback failed len=%d", len(text))
+            return None
         finally:
             try:
                 os.unlink(tmppath)
@@ -147,6 +146,19 @@ async def synthesize_and_play(
                 pass
 
     if samples is None or len(samples) == 0:
+        return None
+    return samples
+
+
+async def synthesize_and_play(
+    text: str,
+    audio_engine,
+    *,
+    voice: str = _KOKORO_VOICE,
+) -> float:
+    """Synthesize text and play through AudioEngine. Returns duration seconds."""
+    samples = await synthesize(text, voice=voice)
+    if samples is None:
         return 0.0
 
     duration_s = len(samples) / _PLAYBACK_RATE_HZ
@@ -218,22 +230,40 @@ async def prerender_phrase(text: str, *, voice: str = _SAY_VOICE) -> Path | None
         log.info("tts_engine: pre-rendered phrase len=%d -> %s", len(text), path.name)
         return path
     except Exception:
-        log.exception("tts_engine: prerender failed text=%r", text[:60])
+        log.exception("tts_engine: prerender failed len=%d", len(text))
         return None
 
 
-async def play_prerendered(phrase_path: Path, audio_engine) -> float:
-    """Play a pre-rendered WAV file through AudioEngine. Returns duration seconds."""
+async def load_phrase(text: str, *, voice: str = _SAY_VOICE):
+    """A fixed phrase as float32 mono at _PLAYBACK_RATE_HZ, from the pre-render cache.
+
+    Renders it on first use. Returns None when it cannot be rendered or read.
+    """
+    path = await prerender_phrase(text, voice=voice)
+    if path is None:
+        return None
+    return await _read_prerendered(path)
+
+
+async def _read_prerendered(phrase_path: Path):
     try:
         import numpy as np
     except ImportError:
-        return 0.0
+        return None
     try:
         samples = await asyncio.to_thread(_read_wav_float32, str(phrase_path), np)
     except Exception:
         log.exception("tts_engine: failed to read prerendered %s", phrase_path)
-        return 0.0
+        return None
     if samples is None or len(samples) == 0:
+        return None
+    return samples
+
+
+async def play_prerendered(phrase_path: Path, audio_engine) -> float:
+    """Play a pre-rendered WAV file through AudioEngine. Returns duration seconds."""
+    samples = await _read_prerendered(phrase_path)
+    if samples is None:
         return 0.0
     duration_s = len(samples) / _PLAYBACK_RATE_HZ
     try:

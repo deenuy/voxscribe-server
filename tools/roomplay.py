@@ -507,7 +507,7 @@ def main() -> int:
                         help="Keep generated WAV files after the run.")
     parser.add_argument("--engine-url", default="",
                         help="Base URL of running engine (e.g. http://127.0.0.1:55115). "
-                             "When set, uses /v1/wake/trigger to start sessions instead "
+                             "When set, uses /v1/wake/trigger (engine needs --debug-trigger) to start sessions instead "
                              "of relying on acoustic OWW detection. Wake phrase tagged [SIM].")
     args = parser.parse_args()
 

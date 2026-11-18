@@ -3,10 +3,10 @@
 V3-P01: AudioEngine.cancel_playback() discards all queued chunks.
 V3-P02: is_playing is True with items queued, False after cancel.
 V3-P03: playback_ref() returns snapshot of last played samples.
-V3-P04: _BARGE_RATIO constant present and correct value in wake_loop.
+V3-P04: BARGE_RATIO constant present and correct value in the voice host.
 V3-P05: cancel_playback is idempotent (safe to call on empty queue).
 V3-E01: barge-in gate math -- mic_rms > ratio * pb_rms triggers cancel.
-V3-E02: mic_rms below _RMS_FLOOR → barge-in gate not evaluated.
+V3-E02: mic_rms below RMS_FLOOR → barge-in gate not evaluated.
 V3-E03: equal rms values (mic == pb * ratio) → no trigger (strict >).
 V3-E04: pb_rms=0 → clamped to 1e-6, gate uses safe denominator.
 
@@ -69,12 +69,12 @@ def test_v3_p03_playback_ref_returns_list():
     assert ref == []
 
 
-# ── V3-P04: _BARGE_RATIO constant ────────────────────────────────────────────
+# ── V3-P04: BARGE_RATIO constant ────────────────────────────────────────────
 
 def test_v3_p04_barge_ratio_constant():
-    import app.local.wake_loop as wl
-    assert hasattr(wl, "_BARGE_RATIO"), "_BARGE_RATIO missing from wake_loop"
-    assert wl._BARGE_RATIO == 2.5
+    import app.local.voice.host as wl
+    assert hasattr(wl, "BARGE_RATIO"), "BARGE_RATIO missing from the voice host"
+    assert wl.BARGE_RATIO == 2.5
 
 
 # ── V3-P05: cancel_playback is safe on empty queue ───────────────────────────
@@ -90,9 +90,9 @@ def test_v3_p05_cancel_playback_idempotent_on_empty():
 # ── V3-E01: gate math -- mic > ratio * pb triggers ───────────────────────────
 
 def test_v3_e01_barge_gate_math_triggers_above_threshold():
-    """mic_rms > _BARGE_RATIO * pb_rms is the gate condition."""
-    import app.local.wake_loop as wl
-    ratio = wl._BARGE_RATIO
+    """mic_rms > BARGE_RATIO * pb_rms is the gate condition."""
+    import app.local.voice.host as wl
+    ratio = wl.BARGE_RATIO
     pb_rms = 0.1
     # Just above threshold
     mic_rms = ratio * pb_rms + 1e-4
@@ -100,28 +100,28 @@ def test_v3_e01_barge_gate_math_triggers_above_threshold():
 
 
 def test_v3_e01_barge_gate_math_does_not_trigger_below_threshold():
-    import app.local.wake_loop as wl
-    ratio = wl._BARGE_RATIO
+    import app.local.voice.host as wl
+    ratio = wl.BARGE_RATIO
     pb_rms = 0.1
     # Just below threshold
     mic_rms = ratio * pb_rms - 1e-4
     assert not (mic_rms > ratio * max(pb_rms, 1e-6))
 
 
-# ── V3-E02: mic below _RMS_FLOOR → gate not evaluated ─────────────────────
+# ── V3-E02: mic below RMS_FLOOR → gate not evaluated ─────────────────────
 
 def test_v3_e02_rms_floor_constant_present():
-    """_RMS_FLOOR constant gates entry into barge-in check."""
-    import app.local.wake_loop as wl
-    assert hasattr(wl, "_RMS_FLOOR"), "_RMS_FLOOR missing from wake_loop"
-    assert wl._RMS_FLOOR > 0
+    """RMS_FLOOR constant gates entry into barge-in check."""
+    import app.local.voice.host as wl
+    assert hasattr(wl, "RMS_FLOOR"), "RMS_FLOOR missing from the voice host"
+    assert wl.RMS_FLOOR > 0
 
 
 # ── V3-E03: exactly at threshold → no trigger (strict >) ─────────────────
 
 def test_v3_e03_exact_threshold_does_not_trigger():
-    import app.local.wake_loop as wl
-    ratio = wl._BARGE_RATIO
+    import app.local.voice.host as wl
+    ratio = wl.BARGE_RATIO
     pb_rms = 0.1
     mic_rms = ratio * pb_rms  # exactly equal, not strictly greater
     assert not (mic_rms > ratio * max(pb_rms, 1e-6))
@@ -131,8 +131,8 @@ def test_v3_e03_exact_threshold_does_not_trigger():
 
 def test_v3_e04_zero_pb_rms_clamped():
     """max(pb_rms, 1e-6) prevents division by zero / extreme amplification."""
-    import app.local.wake_loop as wl
-    ratio = wl._BARGE_RATIO
+    import app.local.voice.host as wl
+    ratio = wl.BARGE_RATIO
     pb_rms = 0.0
     clamped = max(pb_rms, 1e-6)
     assert clamped == 1e-6
@@ -145,7 +145,7 @@ def test_v3_e04_zero_pb_rms_clamped():
 
 def test_v3_e05_barge_gate_requires_engine():
     """Gate condition requires engine is not None before checking is_playing."""
-    # The guard: `if engine is not None and engine.is_playing and rms > _RMS_FLOOR`
+    # The guard: `if engine is not None and engine.is_playing and rms > RMS_FLOOR`
     # When engine is None the short-circuit means is_playing is never accessed.
     engine = None
     rms = 1.0  # above any threshold
@@ -210,7 +210,7 @@ def test_v3_e09_echo_guard_passthrough():
 # ── V3-E10: WakeState enum values ────────────────────────────────────────────
 
 def test_v3_e10_wake_state_values():
-    from app.local.wake_loop import WakeState
+    from app.local.voice.host import WakeState
     assert WakeState.OFF == "off"
     assert WakeState.ARMED == "armed"
     assert WakeState.LISTENING == "listening"
@@ -220,23 +220,21 @@ def test_v3_e10_wake_state_values():
 # ── V3-E11: get_state returns a copy; set_state mutates module state ──────────
 
 def test_v3_e11_get_set_state_isolation():
-    from app.local.wake_loop import WakeState, get_state, set_state
-    original = get_state()["state"]
-    snapshot = get_state()
-    set_state(WakeState.ARMED)
-    assert get_state()["state"] == WakeState.ARMED
+    from app.local.voice.host import VoiceConfig, VoiceHost, WakeState
+    host = VoiceHost(VoiceConfig(), build=lambda: None)
+    snapshot = host.snapshot()
+    host.set_state(WakeState.ARMED)
+    assert host.snapshot()["state"] == WakeState.ARMED
     # snapshot is a copy -- it doesn't change
-    assert snapshot["state"] == original or True  # get_state() copied correctly
-    # Restore
-    set_state(original)
+    assert snapshot["state"] == WakeState.OFF
 
 
-# ── V3-E12: _SILENCE_S matches extended_ms (end-of-turn gate) ────────────────
+# ── V3-E12: SILENCE_S matches extended_ms (end-of-turn gate) ────────────────
 
 def test_v3_e12_silence_s_matches_extended_ms():
-    """_SILENCE_S = 6.0 must equal PauseBandConfig extended_ms / 1000."""
-    import app.local.wake_loop as wl
-    assert wl._SILENCE_S == 6.0
+    """SILENCE_S = 6.0 must equal PauseBandConfig extended_ms / 1000."""
+    import app.local.voice.host as wl
+    assert wl.SILENCE_S == 6.0
 
 
 # ── V3-E13: subscribe() returns a distinct queue per caller ──────────────────
