@@ -2,6 +2,7 @@
 
 import logging
 import os
+import threading
 from typing import Literal
 
 from voxscribe.audio_providers import WhisperASRProvider
@@ -124,7 +125,7 @@ class LocalASRProvider:
     def _load_provider(self):
         """Lazy-load WhisperASRProvider (which loads the model)."""
         if self._provider is None:
-            self._provider = WhisperASRProvider(
+            self._provider = _NoSpeechWhisperProvider(
                 model_size=self.model_name,
                 device=self.device,
                 compute_type=self.compute_type,
@@ -153,8 +154,75 @@ class LocalASRProvider:
             provider.beam_size = target_beam
         return provider.transcribe(samples, sample_rate, session_id, initial_prompt)
 
+    def measure_no_speech(self, fn):
+        """Run fn on this thread and return (its result, Whisper's no_speech_prob for it).
+
+        The probability is the lowest over the segments the decodes inside fn produced (any
+        segment Whisper is sure is speech makes the call speech), or None when they produced
+        none. Used by the voice host's speech guard on the turn's final decode.
+        """
+        return self._load_provider().measure_no_speech(fn)
+
     async def health(self) -> bool:
         return True
+
+
+class _NoSpeechProbe(threading.local):
+    """Per-thread record of no_speech_prob, active only inside measure_no_speech."""
+
+    active = False
+    value: float | None = None
+
+
+class _NoSpeechWhisperProvider(WhisperASRProvider):
+    """WhisperASRProvider that can report faster-whisper's no_speech_prob.
+
+    Core maps Whisper segments to TranscriptChunks and drops no_speech_prob; this wraps the
+    loaded model so the segments it yields are observed on their way to core's mapping.
+    """
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self._probe = _NoSpeechProbe()
+
+    def _load(self):
+        model = super()._load()
+        if not isinstance(model, _ProbedModel):
+            model = self._model = _ProbedModel(model, self._probe)
+        return model
+
+    def measure_no_speech(self, fn):
+        probe = self._probe
+        probe.active, probe.value = True, None
+        try:
+            return fn(), probe.value
+        finally:
+            probe.active, probe.value = False, None
+
+
+class _ProbedModel:
+    """Proxy over a faster-whisper WhisperModel that records no_speech_prob while active."""
+
+    def __init__(self, model, probe: _NoSpeechProbe) -> None:
+        self._inner = model
+        self._probe = probe
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def transcribe(self, audio, **kw):
+        segments, info = self._inner.transcribe(audio, **kw)
+        if not self._probe.active:
+            return segments, info
+        return self._observe(segments), info
+
+    def _observe(self, segments):
+        probe = self._probe
+        for seg in segments:
+            p = getattr(seg, "no_speech_prob", None)
+            if p is not None and (probe.value is None or p < probe.value):
+                probe.value = float(p)
+            yield seg
 
 
 def select_providers(

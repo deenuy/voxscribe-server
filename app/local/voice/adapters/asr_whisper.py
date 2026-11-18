@@ -42,12 +42,17 @@ class WhisperRecognizer:
             vad_mode=getattr(s, "live_vad_mode", "adaptive"),
             max_segment_ms=getattr(s, "live_max_segment_ms", DEFAULT_MAX_SEGMENT_MS) or None,
             partial_update_interval_ms=PARTIAL_UPDATE_INTERVAL_MS,
-        ))
+        ), asr=self._asr)
 
 
 class _LiveStream:
-    def __init__(self, transcriber) -> None:
+    """One turn's recognizer stream. After flush(), no_speech_prob is Whisper's probability that
+    the final decode was not speech, or None when the ASR provider does not report it."""
+
+    def __init__(self, transcriber, asr=None) -> None:
         self._tr = transcriber
+        self._measure = getattr(asr, "measure_no_speech", None)
+        self.no_speech_prob: float | None = None
 
     def push(self, pcm_float32_mono: np.ndarray) -> list[TranscriptSegment]:
         pcm16 = (np.asarray(pcm_float32_mono) * INT16_SCALE).clip(-INT16_SCALE - 1, INT16_SCALE)
@@ -57,7 +62,11 @@ class _LiveStream:
         return _segments(self._tr.pop_partials())
 
     def flush(self) -> list[TranscriptSegment]:
-        return _segments(self._tr.flush())
+        if self._measure is None:
+            self.no_speech_prob = None
+            return _segments(self._tr.flush())
+        segs, self.no_speech_prob = self._measure(self._tr.flush)
+        return _segments(segs)
 
 
 def _segments(segs) -> list[TranscriptSegment]:

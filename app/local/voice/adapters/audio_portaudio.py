@@ -25,6 +25,8 @@ CHUNK_FRAMES = 512            # 32 ms at the capture rate, the AudioEngine block
 DIRECT_QUEUE_CHUNKS = 512
 CUE_TIMEOUT_S = 3
 CUE_PLAYER = "afplay"
+CHIME_DURATION_MS = 800       # the longest system cue the host plays (Glass), via afplay
+CHIME_DECAY_MS = 300          # room reverb after the cue ends, still muted from capture
 
 
 class PortAudioIn:
@@ -90,7 +92,11 @@ class PortAudioOut:
         await self._engine.play(pcm_float32_mono, block=True)
 
     async def play_file(self, path: str) -> None:
-        # TODO(T03): play cues through the AudioEngine so the echo guard mutes them from capture.
+        # The cue plays through afplay, outside the engine's playback queue, so the echo guard
+        # is pre-armed for it here, before the device hears it: capture is muted for the cue and
+        # its room decay, and the cue never reaches the recognizer or the wake gate.
+        if self._engine is not None:
+            self._engine.echo_guard.notify_chime(CHIME_DURATION_MS + CHIME_DECAY_MS)
         try:
             await asyncio.to_thread(subprocess.run, [CUE_PLAYER, path], check=False,
                                     timeout=CUE_TIMEOUT_S)

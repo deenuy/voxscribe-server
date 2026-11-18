@@ -17,6 +17,13 @@ machine (off, armed, listening, error) and the five-stage cascade:
 This is the only module in app/local/voice that knows which adapter backs each port, and it
 imports them only in build_ports(). Everything else goes through the Protocols.
 
+After turn close (T10): the end cue plays as a background task and the final decode starts at once,
+bounded by FINALIZE_TIMEOUT_MS; past it the reply starts on the turn's stable partial (drift gated)
+and the late decode is stored before the session closes. Before any reply the speech guard (T03)
+drops chime echoes, one-word turns, too little audio and decodes Whisper scores as not speech; on
+turn 1 that is a silent close and no meeting is left behind. Cues are muted from capture by the
+AudioOut adapter, except the pre-roll, which predates the acknowledgement chime.
+
 Also carried over: quiet hours (a wake inside the window is recorded as rejected and nothing is
 played or opened), the capture watchdog hook (after a stream reopen the gate is reset on the next
 frame), the debug trigger (behind --debug-trigger, see routers/wake.py), barge-in while armed,
@@ -32,7 +39,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
@@ -79,7 +86,21 @@ INT16_SCALE = 32767
 CHIME_ACK = "/System/Library/Sounds/Glass.aiff"
 CHIME_END = "/System/Library/Sounds/Pop.aiff"
 CHIME_ERR = "/System/Library/Sounds/Basso.aiff"
-CHIME_DECAY_S = 0.3             # after the acknowledgement chime ends, before capture resumes
+
+# Fast finalize (T10): the end cue never blocks the final decode, and the final decode is given
+# this long after turn close; past it the turn's stable partial is used and the final decode is
+# stored when it lands.
+FINALIZE_TIMEOUT_MS = 2000
+# A partial is stable when it revises at most this share of the words the previous partial had
+# (words appended after them are new speech, not drift).
+DRIFT_GATE_THRESHOLD = 0.15
+
+# Speech guard (T03): a turn is answered only if it looks like a person spoke. Whisper hears the
+# acknowledgement chime as one of CHIME_TRANSCRIPTS.
+CHIME_TRANSCRIPTS = frozenset({"beep", "boop", "bing", ""})
+MIN_REPLY_WORDS = 2
+MIN_AUDIO_MS = 500              # unmuted audio the turn must hold
+MAX_NO_SPEECH_PROB = 0.6        # Whisper's own no-speech threshold
 
 TRIGGER_DETECTOR = "trigger"    # wake_events.detector for the debug trigger route
 QUIET_HOURS_REASON = "quiet_hours"
@@ -119,6 +140,59 @@ def spec_text_changed(pre: str, final: str) -> bool:
     if final_words[:len(pre_words)] != pre_words:
         return True
     return any(w not in FUNCTION_WORDS for w in final_words[len(pre_words):])
+
+
+def _words(text: str) -> list[str]:
+    return re.sub(r"[^\w\s]", " ", text.lower()).split()
+
+
+def partial_drift(previous: str, latest: str) -> float:
+    """Word error of the latest partial against the previous one, over the previous one's words.
+
+    Words the latest partial appends after them are new speech and do not count as drift."""
+    ref = _words(previous)
+    if not ref:
+        return 0.0
+    hyp = _words(latest)[:len(ref)]
+    row = list(range(len(hyp) + 1))
+    for i, r in enumerate(ref, 1):
+        prev_diag, row[0] = row[0], i
+        for j, h in enumerate(hyp, 1):
+            prev_diag, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev_diag + (r != h))
+    return row[-1] / len(ref)
+
+
+def is_genuine_speech(text: str, audio_duration_ms: int,
+                      no_speech_prob: float | None = None) -> bool:
+    """False for a chime transcript, fewer than MIN_REPLY_WORDS words, under MIN_AUDIO_MS of
+    unmuted audio, or a final decode Whisper itself scores as not speech."""
+    stripped = text.strip()
+    if stripped.lower().rstrip(".!?,;:") in CHIME_TRANSCRIPTS:
+        return False
+    if len(stripped.split()) < MIN_REPLY_WORDS:
+        return False
+    if audio_duration_ms < MIN_AUDIO_MS:
+        return False
+    if no_speech_prob is not None and no_speech_prob > MAX_NO_SPEECH_PROB:
+        return False
+    return True
+
+
+class StablePartial:
+    """The open utterance's last stable partial, the fallback when the final decode is late."""
+
+    def __init__(self) -> None:
+        self._previous = ""
+        self.text = ""
+
+    def update(self, partial: str) -> None:
+        if not self._previous or partial_drift(self._previous, partial) <= DRIFT_GATE_THRESHOLD:
+            self.text = partial
+        self._previous = partial
+
+    def clear(self) -> None:
+        """A stable segment ended the utterance: its text is in the turn's stable texts now."""
+        self._previous = self.text = ""
 
 
 class WakeState(str, Enum):
@@ -220,21 +294,29 @@ def make_wake_gate(ports: VoicePorts, phrase: str = ASR_CONFIRM_PHRASE) -> WakeG
 
 
 class PreRollQueue:
-    """A session's audio source: the audio heard after the wake phrase, then live capture."""
+    """A session's audio source: the audio heard after the wake phrase, then live capture.
+
+    `from_pre_roll` is True while the last chunk handed out was pre-roll: that audio predates
+    the acknowledgement chime, so the chime's capture mute does not apply to it."""
 
     def __init__(self, pre_roll, live, chunk_frames: int = CHUNK_FRAMES) -> None:
         self._pre = deque(pre_roll[i: i + chunk_frames]
                           for i in range(0, len(pre_roll), chunk_frames))
         self._live = live
+        self.from_pre_roll = False
 
     async def get(self):
         if self._pre:
+            self.from_pre_roll = True
             return self._pre.popleft()
+        self.from_pre_roll = False
         return await self._live.get()
 
     def get_nowait(self):
         if self._pre:
+            self.from_pre_roll = True
             return self._pre.popleft()
+        self.from_pre_roll = False
         return self._live.get_nowait()
 
     def empty(self) -> bool:
@@ -247,11 +329,17 @@ class _TurnRing:
     def __init__(self, capacity_chunks: int) -> None:
         self._q: asyncio.Queue = asyncio.Queue(maxsize=max(1, capacity_chunks) + 1)
         self._cap = max(1, capacity_chunks)
+        self.pushed_samples = 0         # unmuted audio this turn, for the speech guard
+
+    @property
+    def pushed_ms(self) -> int:
+        return self.pushed_samples * 1000 // SAMPLE_RATE
 
     def push(self, chunk) -> None:
         if self._q.qsize() >= self._cap:
             self._q.get_nowait()
         self._q.put_nowait(chunk)
+        self.pushed_samples += len(chunk)
 
     def close(self) -> None:
         self._q.put_nowait(None)
@@ -282,6 +370,16 @@ def _no_events(_kind: str, _data: dict) -> None:
     pass
 
 
+@dataclass
+class _Session:
+    """One conversation's state across its turns."""
+
+    session_id: str
+    history: list[dict] = field(default_factory=list)
+    late_finals: list[asyncio.Task] = field(default_factory=list)   # final decodes past the window
+    silent: bool = False            # turn 1 heard no genuine speech: leave no meeting behind
+
+
 class VoiceHost:
     """Builds the ports (once, off the loop), then runs armed, listening, armed, ..."""
 
@@ -297,6 +395,7 @@ class VoiceHost:
         self._gate = wake_gate
         self._publish = publish or _no_events
         self._task: asyncio.Task | None = None
+        self._cues: set[asyncio.Task] = set()      # cues playing off the hot path
         self._capture_reset_pending = False
         self._state: dict = {
             "state": WakeState.OFF,
@@ -345,6 +444,14 @@ class VoiceHost:
 
     def _publish_state(self, state: WakeState) -> None:
         self._publish("wake_state", self.snapshot() | {"state": state.value})
+
+    def _play_cue(self, path: str) -> asyncio.Task:
+        """Play a cue as a background task. The AudioOut adapter mutes capture for the cue and
+        its decay (EchoGuard.notify_chime), so nothing waits for it to finish."""
+        task = asyncio.create_task(self.ports.audio_out.play_file(path), name="voice-cue")
+        self._cues.add(task)
+        task.add_done_callback(self._cues.discard)
+        return task
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -500,15 +607,13 @@ class VoiceHost:
 
                 # Keep "hey vox, how are you" in one breath: the audio after the phrase, what is
                 # left in the frame buffer and what queued during the confirm all predate the
-                # chime. Then chime and drop what the mic captured while it played and decayed.
-                # TODO(T03): play cues through the audio engine, muted from capture, and add the
-                # speech guard and silent close.
+                # chime and go to the session as pre-roll. The chime then fires without being
+                # awaited; capture is muted for it and its decay (the adapter pre-arms the echo
+                # guard), so the session drops what the mic hears of it.
                 pre_roll = np.concatenate([decision.pre_roll, frame_buf,
                                            *_take_queued(audio_q)])
                 frame_buf = np.zeros(0, dtype=np.float32)
-                await out.play_file(CHIME_ACK)
-                await asyncio.sleep(CHIME_DECAY_S)
-                _drain(audio_q)
+                self._play_cue(CHIME_ACK)
 
                 self._publish_state(WakeState.LISTENING)
                 try:
@@ -531,7 +636,10 @@ class VoiceHost:
 
     async def run_session(self, audio_q, *, score: float, detector: str = TRIGGER_DETECTOR,
                           speech_ratio: float | None = None) -> None:
-        """One conversation: many turns until a stop phrase, an empty turn or idle timeout."""
+        """One conversation: many turns until a stop phrase, an empty turn or idle timeout.
+
+        Silent close (T03): when turn 1 hears no genuine speech the meeting row is deleted (the
+        wake_events row is kept for audit with its link cleared) and nothing is stored."""
         p = await self._ready()
         self.set_state(WakeState.LISTENING)
         try:
@@ -542,31 +650,43 @@ class VoiceHost:
             use_turns = False
             log.info("voice host: turn detector unavailable, falling back to silence counter")
 
-        session_id = await p.store.create_session(score, detector=detector,
-                                                  speech_ratio=speech_ratio)
+        session = _Session(await p.store.create_session(score, detector=detector,
+                                                        speech_ratio=speech_ratio))
+        session_id = session.session_id
         self._state["meeting_id"] = session_id
         log.info("[Vox Initialized] meeting_id=%s", session_id)
 
-        history: list[dict] = []
         turn_n = 0
         try:
             while True:
                 turn_n += 1
-                if not await self._turn(p, audio_q, session_id, turn_n, use_turns, history):
+                if not await self._turn(p, audio_q, session, turn_n, use_turns):
                     break
         finally:
             self._state["meeting_id"] = None
-            await p.store.close_session(session_id)
-            log.info("voice host: session closed meeting_id=%s turns=%d", session_id, turn_n)
+            await self._await_late_finals(session)
+            if session.silent:
+                log.info("wake: silent close -- no genuine speech in turn 1 meeting_id=%s",
+                         session_id)
+                # discard_session extends the SessionStore port in this server; a store
+                # without it closes the session normally.
+                discard = getattr(p.store, "discard_session", p.store.close_session)
+                await discard(session_id)
+            else:
+                await p.store.close_session(session_id)
+                log.info("voice host: session closed meeting_id=%s turns=%d",
+                         session_id, turn_n)
 
-    async def _turn(self, p: VoicePorts, audio_q, session_id: str, turn_n: int,
-                    use_turns: bool, history: list[dict]) -> bool:
+    async def _turn(self, p: VoicePorts, audio_q, session: _Session, turn_n: int,
+                    use_turns: bool) -> bool:
         """One turn: listen, recognise, reply. False when the conversation is over."""
+        session_id, history = session.session_id, session.history
         stream = p.recognizer.open_stream(session_id)
         ring = _TurnRing(int(TURN_RING_S * SAMPLE_RATE / CHUNK_FRAMES))
         texts: list[str] = []
+        partial = StablePartial()
         recognize = asyncio.create_task(
-            self._recognize(p, ring, stream, session_id, turn_n, texts, use_turns),
+            self._recognize(p, ring, stream, session_id, turn_n, texts, partial, use_turns),
             name="voice-recognize")
 
         if await self._listen(p, audio_q, ring, turn_n, use_turns):
@@ -574,6 +694,7 @@ class VoiceHost:
                 log.info("[Vox Stopped] idle timeout after %d turn(s)", turn_n - 1)
             else:
                 log.info("[Vox Stopped] first-turn audio timeout")
+                session.silent = True
             ring.close()
             recognize.cancel()
             return False
@@ -581,7 +702,7 @@ class VoiceHost:
         turn_end_ms = p.clock.mono_ms()
 
         # Start the reply model on the text recognised so far, so generation overlaps the
-        # final flush; kept only if the flush adds function words (spec_text_changed).
+        # final decode; kept only if the decode adds function words (spec_text_changed).
         prefetch = " ".join(texts).strip()
         speculation = None
         if (len(prefetch.split()) >= SPEC_MIN_WORDS
@@ -589,31 +710,45 @@ class VoiceHost:
             speculation = p.delegate.speculate(prefetch, history or None)
             log.info("voice host: speculative reply started words=%d", len(prefetch.split()))
 
-        await p.audio_out.play_file(CHIME_END)
-        ring.close()
+        # Fast finalize (T10): the end cue plays off the hot path and the final decode starts
+        # at once on the audio buffered at close. It gets FINALIZE_TIMEOUT_MS; past that the
+        # stable partial stands in, and the decode keeps running and is stored when it lands.
+        self._play_cue(CHIME_END)
+        final = asyncio.create_task(
+            self._finalize(p, ring, recognize, stream, session_id, turn_n, texts),
+            name="voice-finalize")
         try:
-            await asyncio.wait_for(recognize, timeout=RECOGNIZE_DRAIN_TIMEOUT_S)
+            no_speech_prob = await asyncio.wait_for(asyncio.shield(final),
+                                                    timeout=FINALIZE_TIMEOUT_MS / 1000)
+            turn_text = " ".join(texts).strip()
+            source = "final"
         except asyncio.TimeoutError:
-            recognize.cancel()
-            log.warning("voice host: recognizer drain timeout turn=%d", turn_n)
-
-        if stream is not None:
-            try:
-                for seg in await asyncio.to_thread(stream.flush):
-                    await self._segment(p, session_id, turn_n, seg, texts)
-            except Exception:
-                log.warning("voice host: flush failed turn=%d", turn_n)
-
+            session.late_finals.append(final)
+            no_speech_prob = None
+            turn_text = " ".join([*texts, partial.text]).strip()
+            source = "partial"
         asr_final_ms = p.clock.mono_ms()
-        turn_text = " ".join(texts).strip()
+        log.info("voice host: asr final +%d ms from turn end source=%s turn=%d",
+                 asr_final_ms - turn_end_ms, source, turn_n)
 
         if not turn_text:
             log.info("[Vox Stopped] empty turn, no speech detected (turn=%d)", turn_n)
+            session.silent = turn_n == 1
             if speculation is not None:
                 speculation.cancel()
             return False
         if is_stop_phrase(turn_text, self.config.wake_phrase):
             log.info("[Vox Stopped] stop phrase detected (turn=%d)", turn_n)
+            if speculation is not None:
+                speculation.cancel()
+            return False
+        # Speech guard (T03): chime echoes, sub-threshold audio, one-word transcripts and
+        # decodes Whisper scores as not speech get no reply.
+        if not is_genuine_speech(turn_text, ring.pushed_ms, no_speech_prob):
+            log.info("wake: speech guard blocked turn=%d words=%d audio_ms=%d no_speech=%s",
+                     turn_n, len(turn_text.split()), ring.pushed_ms,
+                     "n/a" if no_speech_prob is None else f"{no_speech_prob:.2f}")
+            session.silent = turn_n == 1
             if speculation is not None:
                 speculation.cancel()
             return False
@@ -639,6 +774,37 @@ class VoiceHost:
             history.append({"role": "assistant", "content": reply_text})
         _drain(audio_q)   # what the mic heard of our own reply
         return True
+
+    async def _finalize(self, p: VoicePorts, ring: _TurnRing, recognize: asyncio.Task, stream,
+                        session_id: str, turn_n: int, texts: list[str]) -> float | None:
+        """Drain the recognizer task, then the final decode of what it still buffers. Stores
+        and appends the final segments; returns the decode's no_speech_prob when known."""
+        ring.close()
+        try:
+            await asyncio.wait_for(recognize, timeout=RECOGNIZE_DRAIN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            recognize.cancel()
+            log.warning("voice host: recognizer drain timeout turn=%d", turn_n)
+        if stream is None:
+            return None
+        try:
+            for seg in await asyncio.to_thread(stream.flush):
+                await self._segment(p, session_id, turn_n, seg, texts)
+        except Exception:
+            log.warning("voice host: final decode failed turn=%d", turn_n)
+            return None
+        return getattr(stream, "no_speech_prob", None)
+
+    async def _await_late_finals(self, session: _Session) -> None:
+        """Final decodes that passed the finalize window land before the session closes."""
+        if not session.late_finals:
+            return
+        done, pending = await asyncio.wait(session.late_finals,
+                                           timeout=RECOGNIZE_DRAIN_TIMEOUT_S)
+        for task in pending:
+            task.cancel()
+        log.info("voice host: late final decodes stored=%d dropped=%d meeting_id=%s",
+                 len(done), len(pending), session.session_id)
 
     async def _listen(self, p: VoicePorts, audio_q, ring: _TurnRing, turn_n: int,
                       use_turns: bool) -> bool:
@@ -671,8 +837,9 @@ class VoiceHost:
                 if turn_n > 1 and rms > RMS_FLOOR * IDLE_SPEECH_RMS_FACTOR:
                     idle_deadline = time.monotonic() + CONV_IDLE_S
 
-                # Echo guard: our own playback and its tail never reach the recognizer.
-                if p.audio_in.capture_muted():
+                # Echo guard: our own playback, cues and their tails never reach the recognizer.
+                # Pre-roll predates the acknowledgement chime and is never muted.
+                if p.audio_in.capture_muted() and not getattr(audio_q, "from_pre_roll", False):
                     silence_run = 0
                     continue
 
@@ -709,8 +876,10 @@ class VoiceHost:
             return True
 
     async def _recognize(self, p: VoicePorts, ring: _TurnRing, stream, session_id: str,
-                         turn_n: int, texts: list[str], use_turns: bool) -> None:
-        """Stage recognize during a turn: stable segments are stored and fed to the policy."""
+                         turn_n: int, texts: list[str], partial: StablePartial,
+                         use_turns: bool) -> None:
+        """Stage recognize during a turn: stable segments are stored and fed to the policy;
+        partials are published and tracked for the fast-finalize fallback."""
         while True:
             chunk = await ring.pop()
             if chunk is None:
@@ -721,8 +890,12 @@ class VoiceHost:
                 stable = await asyncio.to_thread(stream.push, chunk)
                 for seg in stable:
                     self._publish_segment(session_id, turn_n, seg)
+                if stable:
+                    partial.clear()
                 for seg in stream.pop_partials():
                     self._publish_segment(session_id, turn_n, seg)
+                    if seg.text:
+                        partial.update(seg.text)
                 for seg in stable:
                     await p.store.add_segment(session_id, seg)
                     if seg.text:
