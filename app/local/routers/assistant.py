@@ -61,7 +61,7 @@ async def patch_profile(request: Request):
         PATCH /v1/assistant/profile
         {"assistant": {"name": "aria", "wake_phrase": "hey aria", "speed": 1.2}}
     """
-    from voxscribe.profile.loader import ProfileValidationError
+    from app.local.voice.profile_store import ProfileValidationError
 
     store = _get_store(request)
     try:

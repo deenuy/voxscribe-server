@@ -18,8 +18,40 @@ from __future__ import annotations
 import copy
 import logging
 import threading
+from dataclasses import dataclass, field
 
 log = logging.getLogger("app.local.voice.profile_store")
+
+_SPEED_MIN = 0.5
+_SPEED_MAX = 2.0
+
+
+class ProfileValidationError(ValueError):
+    """Raised when a profile field fails validation."""
+
+
+@dataclass
+class AssistantConfig:
+    """Runtime-mutable assistant configuration.
+
+    Stored separately from voxscribe-core's Profile because core's schema
+    does not expose voice_id / speed / persona fields in this wheel version.
+    """
+
+    name: str = "vox"
+    wake_phrase: str = "hey vox"
+    end_phrases: tuple[str, ...] = ("goodbye", "stop listening")
+    voice_id: str = ""
+    speed: float = 1.0
+    system_prompt: str = ""
+    persona_label: str = "assistant"
+
+
+class _ProfileView:
+    """Thin wrapper that exposes profile.assistant for the router and adapters."""
+
+    def __init__(self, assistant: AssistantConfig) -> None:
+        self.assistant = assistant
 
 
 class AssistantProfileStore:
@@ -29,69 +61,69 @@ class AssistantProfileStore:
     so callers cannot modify the stored profile directly.
     """
 
-    def __init__(self, startup) -> None:
-        from voxscribe.profile.schema import Profile
-
-        if not isinstance(startup, Profile):
-            raise TypeError(f"startup must be a Profile, got {type(startup)}")
-        self._startup: "Profile" = copy.deepcopy(startup)
-        self._current: "Profile" = copy.deepcopy(startup)
+    def __init__(self, startup=None) -> None:
+        self._startup: AssistantConfig = AssistantConfig()
+        self._current: AssistantConfig = copy.deepcopy(self._startup)
         self._lock = threading.RLock()
 
-    def get(self):
-        """Return a copy of the current profile."""
+    def get(self) -> _ProfileView:
+        """Return a view of the current profile (copy)."""
         with self._lock:
-            return copy.deepcopy(self._current)
+            return _ProfileView(copy.deepcopy(self._current))
 
-    def patch(self, partial: dict):
-        """Merge partial dict over the current profile. Validates after merge.
+    def patch(self, partial: dict) -> _ProfileView:
+        """Merge partial dict over the current assistant config.
 
-        Only keys present in partial are changed; all other fields keep their
-        current values. Raises ProfileValidationError on invalid combination.
-
-        Returns a copy of the updated profile.
+        Only keys present in partial are changed. Raises ValueError on
+        out-of-range speed.
         """
-        from voxscribe.profile.loader import ProfileValidationError, validate_profile
-        from voxscribe.profile.schema import AssistantConfig, Profile
-
         with self._lock:
-            current = copy.deepcopy(self._current)
-            assistant_partial = partial.get("assistant", {})
-            if not isinstance(assistant_partial, dict):
-                assistant_partial = {}
+            cfg = copy.deepcopy(self._current)
+            ap = partial.get("assistant", {})
+            if not isinstance(ap, dict):
+                ap = {}
 
-            if assistant_partial:
-                old_phrase = current.assistant.wake_phrase
-                cfg = current.assistant
+            if ap:
+                old_phrase = cfg.wake_phrase
+                if "name" in ap:
+                    name = str(ap["name"]).strip()
+                    if not name:
+                        raise ProfileValidationError("name must not be empty")
+                    cfg.name = name
+                if "wake_phrase" in ap:
+                    phrase = str(ap["wake_phrase"]).strip()
+                    if len(phrase.split()) < 2:
+                        raise ProfileValidationError(
+                            "wake_phrase must contain at least two words"
+                        )
+                    cfg.wake_phrase = phrase
+                if "end_phrases" in ap:
+                    cfg.end_phrases = tuple(ap["end_phrases"])
+                if "voice_id" in ap:
+                    cfg.voice_id = str(ap["voice_id"])
+                if "speed" in ap:
+                    speed = float(ap["speed"])
+                    if not (_SPEED_MIN <= speed <= _SPEED_MAX):
+                        raise ProfileValidationError(
+                            f"speed {speed} out of range [{_SPEED_MIN}, {_SPEED_MAX}]"
+                        )
+                    cfg.speed = speed
+                if "system_prompt" in ap:
+                    cfg.system_prompt = str(ap["system_prompt"])
+                if "persona_label" in ap:
+                    cfg.persona_label = str(ap["persona_label"])
 
-                updated_cfg = AssistantConfig(
-                    name=assistant_partial.get("name", cfg.name),
-                    wake_phrase=assistant_partial.get("wake_phrase", cfg.wake_phrase),
-                    end_phrases=tuple(
-                        assistant_partial.get("end_phrases", list(cfg.end_phrases))
-                    ),
-                    voice_id=assistant_partial.get("voice_id", cfg.voice_id),
-                    speed=float(assistant_partial.get("speed", cfg.speed)),
-                    system_prompt=assistant_partial.get("system_prompt", cfg.system_prompt),
-                    persona_label=assistant_partial.get("persona_label", cfg.persona_label),
-                )
-                updated = Profile(assistant=updated_cfg)
-                validate_profile(updated)
+                if cfg.wake_phrase != old_phrase:
+                    log.info("wake: wake phrase updated from=%r to=%r",
+                             old_phrase, cfg.wake_phrase)
 
-                new_phrase = updated_cfg.wake_phrase
-                if new_phrase != old_phrase:
-                    log.info(
-                        "wake: wake phrase updated from=%r to=%r", old_phrase, new_phrase
-                    )
+                self._current = cfg
 
-                self._current = updated
-                return copy.deepcopy(self._current)
+            return _ProfileView(copy.deepcopy(self._current))
 
-            return copy.deepcopy(current)
-
-    def reset(self):
-        """Revert to the startup profile. Returns a copy of the startup profile."""
+    def reset(self) -> _ProfileView:
+        """Revert to the startup profile. Returns a view of the startup profile."""
         with self._lock:
             self._current = copy.deepcopy(self._startup)
             log.info("profile_store: reverted to startup profile")
-            return copy.deepcopy(self._current)
+            return _ProfileView(copy.deepcopy(self._current))
