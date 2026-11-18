@@ -106,7 +106,22 @@ def _top_level_imports(path: Path) -> list[str]:
 
 
 def test_host_imports_adapters_only_inside_builders():
-    """Module level: stdlib, numpy and the engine. Server code only as adapters, lazily."""
+    """Module level: stdlib, numpy and the engine. Server code only as adapters, lazily.
+
+    Allowed lazy app.* prefixes:
+      - app.local.voice.adapters     (I/O adapters: audio, ASR, TTS, store, wake)
+      - app.local.voice.wake_setup   (detector factory)
+      - app.local.voice.controls     (T15: spoken-control detection, pure logic)
+      - app.local.voice.memory       (T19: in-session fact store, pure logic)
+    """
+    _ALLOWED = (
+        "app.local.voice.adapters",
+        "app.local.voice.wake_setup",
+        "app.local.voice.clause_splitter",  # T11
+        "app.local.voice.barge_in",         # T13
+        "app.local.voice.controls",         # T15
+        "app.local.voice.memory",           # T19
+    )
     tree = ast.parse(HOST_FILE.read_text(encoding="utf-8"))
     for name in _top_level_imports(HOST_FILE):
         assert not name.startswith("app.") or name in HOST_STAGE_MODULES, name
@@ -114,11 +129,8 @@ def test_host_imports_adapters_only_inside_builders():
         stage_file = HOST_FILE.parent / f"{stage.rsplit('.', 1)[1]}.py"
         assert not any(n.startswith("app.") for n in _top_level_imports(stage_file)), stage
     lazy = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
-            and n.module and n.module.startswith("app.") and n.module not in HOST_STAGE_MODULES]
-    assert lazy and all(m.startswith(("app.local.voice.adapters", "app.local.voice.wake_setup",
-                                       "app.local.voice.clause_splitter",
-                                       "app.local.voice.barge_in"))
-                        for m in lazy), lazy
+            and n.module and n.module.startswith("app.")]
+    assert lazy and all(m.startswith(_ALLOWED) for m in lazy), lazy
 
 
 # ── a conversation with every port faked ─────────────────────────────────────

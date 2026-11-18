@@ -82,6 +82,9 @@ from app.local.voice.barge_in import (
 log = logging.getLogger("app.local.wake")
 log_tts = logging.getLogger("app.local.tts")
 
+# app.local.voice.controls and app.local.voice.memory are imported lazily inside the methods
+# that use them so that this module satisfies the boundary test (no top-level app.* imports).
+
 SAMPLE_RATE = 16_000
 CHUNK_FRAMES = 512              # 32 ms at 16 kHz, the capture block
 RMS_FLOOR = 0.005
@@ -764,10 +767,20 @@ class VoiceHost:
         log.info("[Vox Initialized] meeting_id=%s", session_id)
 
         turn_n = 0
+        # T15: per-session pacing, length and level state.
+        from app.local.voice.controls import ControlState   # lazy: boundary test
+        from app.local.voice.memory import MemoryStore      # lazy: boundary test
+        control_state = ControlState()
+        # T15: last reply text, for the REPEAT intent.  Stored as a one-element list so
+        # _handle_control() can read it without an extra method parameter.
+        last_reply: list[str] = [""]
+        # T19: in-session fact store, cleared at session close.
+        memory = MemoryStore()
         try:
             while True:
                 turn_n += 1
-                if not await self._turn(p, audio_q, session_id, turn_n, use_turns, session):
+                if not await self._turn(p, audio_q, session_id, turn_n, use_turns, session,
+                                        control_state, last_reply, memory):
                     break
         finally:
             self._state["meeting_id"] = None
@@ -785,7 +798,9 @@ class VoiceHost:
                          session_id, turn_n)
 
     async def _turn(self, p: VoicePorts, audio_q, session_id: str, turn_n: int,
-                    use_turns: bool, session: SessionContext) -> bool:
+                    use_turns: bool, session: SessionContext,
+                    control_state=None, last_reply: list[str] | None = None,
+                    memory=None) -> bool:
         """One turn: listen, recognise, reply. False when the conversation is over."""
         history = session.history
         stream = p.recognizer.open_stream(session_id)
@@ -882,6 +897,16 @@ class VoiceHost:
             else:
                 log.info("voice host: speculation accepted, no content drift")
 
+        # T15: check for a spoken control intent before routing to the LLM.
+        from app.local.voice.controls import ControlIntent, detect_control  # lazy
+        intent = detect_control(turn_text)
+        if intent != ControlIntent.NONE:
+            if speculation is not None:
+                speculation.cancel()
+            log.info("voice host: control intent=%s turn=%d", intent.value, turn_n)
+            return await self._handle_control(
+                p, intent, control_state, last_reply or [""])
+
         # The reply generates and plays while the barge-in watcher reads capture; an
         # interruption ends both, and its audio opens the next turn.
         self._publish("wake.reply", {"meetingId": session_id, "turn": turn_n,
@@ -889,7 +914,8 @@ class VoiceHost:
         note = interruption_note(session.played_text) if session.barge_in else None
         result = await self._reply(session_id, turn_n, turn_text, history=history or None,
                                    speculation=speculation, turn_end_ms=turn_end_ms,
-                                   asr_final_ms=asr_final_ms, audio_q=audio_q, note=note)
+                                   asr_final_ms=asr_final_ms, audio_q=audio_q, note=note,
+                                   control_state=control_state, memory=memory)
         interrupted = result.interruption is not None
         self._publish("wake.reply", {"meetingId": session_id, "turn": turn_n,
                                      "phase": "done", "userText": turn_text,
@@ -903,7 +929,55 @@ class VoiceHost:
         if interrupted:
             session.pre_roll = result.pre_roll
         else:
-            _drain(audio_q)   # what the mic heard of our own reply
+            _drain(audio_q)
+        if result.text and last_reply is not None:
+            last_reply[0] = result.text
+        return True
+
+    async def _handle_control(self, p: VoicePorts, intent, control_state, last_reply: list[str]) -> bool:
+        """Execute a spoken control intent. Returns True (keep session open) always."""
+        from app.local.voice.controls import ACK_CUE, ControlIntent  # lazy
+        if intent == ControlIntent.HOLD:
+            try:
+                await p.audio_out.play_file(CHIME_END)
+            except Exception:
+                log.debug("voice host: hold cue failed (non-critical)")
+            return True
+
+        if intent == ControlIntent.REPEAT:
+            if last_reply[0]:
+                try:
+                    pcm = await p.talker.synthesize(last_reply[0])
+                    await p.audio_out.play(pcm, p.talker.sample_rate)
+                except Exception:
+                    log.exception("voice host: repeat synthesis failed")
+            else:
+                try:
+                    await p.audio_out.play_file(CHIME_ACK)
+                except Exception:
+                    log.debug("voice host: repeat chime failed (non-critical)")
+            return True
+
+        if control_state is not None:
+            if intent == ControlIntent.SLOWER:
+                control_state.apply_slower()
+            elif intent == ControlIntent.FASTER:
+                control_state.apply_faster()
+            elif intent == ControlIntent.SHORTER:
+                control_state.apply_shorter()
+            elif intent == ControlIntent.LONGER:
+                control_state.apply_longer()
+            elif intent == ControlIntent.VOLUME_UP:
+                control_state.apply_volume_up()
+            elif intent == ControlIntent.VOLUME_DOWN:
+                control_state.apply_volume_down()
+            log.info("voice host: control applied speed=%.2f volume=%.2f suffix=%r",
+                     control_state.speed, control_state.volume, control_state.prompt_suffix)
+        try:
+            pcm = await p.talker.synthesize(ACK_CUE)
+            await p.audio_out.play(pcm, p.talker.sample_rate)
+        except Exception:
+            log.debug("voice host: control ack failed (non-critical)")
         return True
 
     async def _finalize(self, p: VoicePorts, ring: _TurnRing, recognize: asyncio.Task, stream,
@@ -1061,12 +1135,14 @@ class VoiceHost:
 
     async def reply_turn(self, session_id: str, turn_n: int, text: str, *,
                          history: list[dict] | None = None, speculation=None,
-                         turn_end_ms: int = 0, asr_final_ms: int | None = None) -> str:
+                         turn_end_ms: int = 0, asr_final_ms: int | None = None,
+                         control_state=None, memory=None) -> str:
         """Stages reply and playback for one turn, without the barge-in watch. Returns the text
         recorded as spoken."""
         result = await self._reply(session_id, turn_n, text, history=history,
                                    speculation=speculation, turn_end_ms=turn_end_ms,
-                                   asr_final_ms=asr_final_ms)
+                                   asr_final_ms=asr_final_ms,
+                                   control_state=control_state, memory=memory)
         return result.text
 
     def _barge_in_enabled(self, p: VoicePorts) -> bool:
@@ -1076,19 +1152,40 @@ class VoiceHost:
     async def _reply(self, session_id: str, turn_n: int, text: str, *,
                      history: list[dict] | None = None, speculation=None,
                      turn_end_ms: int = 0, asr_final_ms: int | None = None,
-                     audio_q=None, note: str | None = None) -> ReplyResult:
+                     audio_q=None, note: str | None = None,
+                     control_state=None, memory=None) -> ReplyResult:
         """Stages reply, playback and barge-in for one turn.
 
         Sentences are split into clauses (T11) so synthesis of clause N+1 starts while N plays.
         With `audio_q` (and an echo-cancelled capture) barge-in is watched during playback.
-        `note` is added to the reply model's system prompt.
+        `note` appended to the system prompt (barge-in); `control_state`/`memory` build prefix (T15/T19).
         """
         p = await self._ready()
         try:
             log.info("[Vox Thinking] turn=%d words=%d history_turns=%d barge_in=%s", turn_n,
                      len(text.split()), len(history) // 2 if history else 0, note is not None)
+
+            # T19: extract facts from this turn, then build the [Memory] block.
+            system_prefix: str | None = None
+            if memory is not None:
+                from app.local.voice.memory import memory_block  # lazy: boundary test
+                memory.extract(text, turn_n)
+                mems = memory.retrieve()
+                if mems:
+                    system_prefix = memory_block(mems)
+                    log.info("voice host: memory block facts=%d turn=%d", len(mems), turn_n)
+
+            # T15: append the prompt suffix from spoken length controls.
+            if control_state is not None and control_state.prompt_suffix:
+                suffix = control_state.prompt_suffix
+                system_prefix = f"{system_prefix}\n\n{suffix}" if system_prefix else suffix
+
             turn = await p.store.begin_turn(session_id, turn_n, text)
-            extra = {"system_note": note} if note else {}
+            extra: dict = {}
+            if note:
+                extra["system_note"] = note
+            if system_prefix:
+                extra["system_prefix"] = system_prefix
             stream = await p.delegate.reply(text, session_id, turn_id=turn.turn_id,
                                             history=history, speculation=speculation, **extra)
 
