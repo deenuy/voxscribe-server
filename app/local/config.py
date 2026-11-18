@@ -4,9 +4,13 @@ Loads from environment variables, then from a dotenv file (if VOXSCRIBE_ENV_FILE
 then from built-in defaults. Environment variables take precedence.
 """
 
+import dataclasses
 import os
+import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import time as dtime
 from pathlib import Path
 from typing import Literal
 
@@ -33,6 +37,43 @@ def live_vad_mode_unavailable(mode: str) -> str | None:
 
         return SileroDetector.unavailable_reason()
     return None
+
+
+_HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _hhmm(value: str) -> dtime:
+    match = _HHMM.match(value)
+    if not match:
+        raise ValueError(f"expected HH:MM in 24-hour local time, got {value!r}")
+    return dtime(int(match.group(1)), int(match.group(2)))
+
+
+@dataclass(frozen=True)
+class QuietHours:
+    """A daily window of local time in which the assistant stays silent (no sound, no session).
+
+    The window may cross midnight ("22:00" to "07:00"). start equal to end is an empty window.
+    """
+
+    enabled: bool = False
+    start: str = "22:00"
+    end: str = "07:00"
+
+    def __post_init__(self) -> None:
+        _hhmm(self.start)
+        _hhmm(self.end)
+
+    def active(self, now: datetime | None = None) -> bool:
+        if not self.enabled:
+            return False
+        t = (now or datetime.now()).time().replace(second=0, microsecond=0)
+        start, end = _hhmm(self.start), _hhmm(self.end)
+        if start == end:
+            return False
+        if start < end:
+            return start <= t < end
+        return t >= start or t < end
 
 
 @dataclass
@@ -121,6 +162,10 @@ class Config:
 
     # Wake word — any phrase, no model training required (VOXSCRIBE_WAKE_PHRASE)
     wake_phrase: str = "hey vox"
+
+    # Quiet hours (VOXSCRIBE_QUIET_HOURS_ENABLED, _START, _END; local time, HH:MM): a wake inside the
+    # window is recorded as rejected and nothing is played.
+    quiet_hours: QuietHours = dataclasses.field(default_factory=QuietHours)
 
     # Context header injected into every reply turn
     vox_timezone: str = "UTC"
@@ -322,6 +367,22 @@ class Config:
         wake_phrase = env_vars.get("VOXSCRIBE_WAKE_PHRASE", "").strip().lower()
         if wake_phrase:
             config_dict["wake_phrase"] = wake_phrase
+
+        quiet_kw: dict = {}
+        quiet_enabled = env_vars.get("VOXSCRIBE_QUIET_HOURS_ENABLED", "").strip().lower()
+        if quiet_enabled:
+            quiet_kw["enabled"] = quiet_enabled in ("true", "1", "yes")
+        for env_name, key in (("VOXSCRIBE_QUIET_HOURS_START", "start"),
+                              ("VOXSCRIBE_QUIET_HOURS_END", "end")):
+            value = env_vars.get(env_name, "").strip()
+            if value:
+                try:
+                    _hhmm(value)
+                except ValueError as exc:
+                    _fail(env_name, str(exc))
+                quiet_kw[key] = value
+        if quiet_kw:
+            config_dict["quiet_hours"] = QuietHours(**quiet_kw)
 
         # Context header — read VOX_* from .env or os.environ
         for env_key, field in (

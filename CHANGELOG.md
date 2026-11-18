@@ -7,6 +7,9 @@
 - Added two wake detectors behind one interface: an open-vocabulary keyword spotter that takes the phrase as plain text (the default) and an openWakeWord model trained on synthetic "hey vox" clips. `VOXSCRIBE_WAKE_DETECTOR=oww` selects the second.
 - Added a row in `wake_events` for every wake candidate, accepted or rejected, with its score, reject reason, detector and voice ratio, and a once-a-minute `wake: peak_score=` log line so missed wakes can be counted.
 - Added `tools/fetch_wake_models.py`, `tools/wake_synth_clips.py` and a working `tools/train_wake_model.py`, and a gate mode in `tools/voice_bench/replay.py` that runs the same gate offline and reports accepts, candidates and reject reasons per fixture set.
+- Added a capture watchdog that reopens the microphone stream when it stalls, delivers only digital silence, or the default input device changes, and logs clipping, dropouts and mains hum as capture health events.
+- Added quiet hours (`VOXSCRIBE_QUIET_HOURS_ENABLED`, `VOXSCRIBE_QUIET_HOURS_START`, `VOXSCRIBE_QUIET_HOURS_END`, local time): a wake inside the window plays no sound, opens no session and is stored in `wake_events` with `accepted=false` and `reject_reason='quiet_hours'`.
+- Added `POST /v1/wake/power` (`sleep`, `wake`, `lock`, `unlock`) so the app can tell the engine about system sleep; after a wake the microphone is reopened and the wake loop is armed on a live stream.
 
 ### Bug Fixes
 - Fixed the acknowledgement chime being transcribed as the user's first words: the session now starts with the audio heard after the wake phrase and drops what the microphone captured while the chime played.

@@ -50,6 +50,19 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             log.warning("audio-engine: could not start -- wake loop will use direct stream: %s", exc)
 
+        # Capture watchdog: reopens the mic stream after a stall, digital silence, a device change or a wake.
+        if getattr(app.state, "audio_engine", None) is not None:
+            try:
+                from app.local.voice.capture_watchdog import CaptureWatchdog
+                from app.local.wake_loop import on_capture_health
+
+                watchdog = CaptureWatchdog(app.state.audio_engine, on_event=on_capture_health)
+                watchdog.start()
+                app.state.capture_watchdog = watchdog
+                log.info("capture-watchdog: started")
+            except Exception as exc:
+                log.warning("capture-watchdog: could not start: %s", exc)
+
         try:
             from app.local.reply_chain import warm_phrase_cache
             await warm_phrase_cache()
@@ -105,6 +118,8 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "ingestion_worker"):
         await app.state.ingestion_worker.stop()
         log.info("ingestion-worker: stopped")
+    if hasattr(app.state, "capture_watchdog"):
+        await app.state.capture_watchdog.stop()
     if hasattr(app.state, "audio_engine"):
         await app.state.audio_engine.stop()
         log.info("audio-engine: stopped")
