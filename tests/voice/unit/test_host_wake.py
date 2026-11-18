@@ -15,7 +15,6 @@ import numpy as np
 import pytest
 from voxscribe.wake.gate import FRAME_SAMPLES, RejectReason, TelemetryWindow, WakeDecision
 
-from app.local.voice import host as host_mod
 from app.local.voice.adapters.store_postgres import PostgresSessionStore
 from app.local.voice.host import (
     CHIME_ACK,
@@ -88,7 +87,6 @@ def env(monkeypatch):
 
     monkeypatch.setattr(ports.audio_out, "play_file", chime)
     monkeypatch.setattr(host, "run_session", fake_session)
-    monkeypatch.setattr(host_mod, "CHIME_DECAY_S", 0.0)
     host.set_state(WakeState.ARMED)
     yield SimpleNamespace(host=host, ports=ports, q=audio_q, sessions=sessions)
     host.set_state(WakeState.OFF)

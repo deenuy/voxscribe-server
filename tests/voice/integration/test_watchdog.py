@@ -27,7 +27,6 @@ from voxscribe.wake.gate import WakeGate
 from app.local.audio_engine import AudioEngine
 from app.local.config import QuietHours
 from app.local.voice import capture_watchdog as cw
-from app.local.voice import host as host_mod
 from app.local.voice.adapters.store_postgres import PostgresSessionStore
 from app.local.voice.capture_watchdog import CaptureWatchdog
 from app.local.voice.host import VoiceConfig, VoiceHost, WakeState
@@ -300,7 +299,6 @@ async def test_outside_quiet_hours_a_wake_opens_a_session(monkeypatch):
     model = FakeWakeModel(hits=1)
     host = make_host(model)
     monkeypatch.setattr(host, "run_session", session)
-    monkeypatch.setattr(host_mod, "CHIME_DECAY_S", 0.0)
 
     q: asyncio.Queue = asyncio.Queue()
     for _ in range(4):

@@ -17,11 +17,20 @@ from voxscribe.session.ports import (
     TurnRecord,
 )
 
-from app.local.voice.host import CHUNK_FRAMES, SAMPLE_RATE, StreamClock, VoicePorts
+from app.local.voice.host import (
+    CHUNK_FRAMES,
+    MIN_AUDIO_MS,
+    SAMPLE_RATE,
+    TICK_EVERY_FRAMES,
+    StreamClock,
+    VoicePorts,
+)
 
 TALKER_RATE = 24_000
 SAMPLES_PER_CHAR = 10
-FRAMES_PER_TURN = 8          # FakeSpeech closes a turn after this many chunks
+# FakeSpeech closes a turn after this many chunks: enough audio for the speech guard, plus one
+# turn-detector tick of margin.
+FRAMES_PER_TURN = -(-MIN_AUDIO_MS * SAMPLE_RATE // (1000 * CHUNK_FRAMES)) + TICK_EVERY_FRAMES
 TEN_HOURS_MS = 10 * 3600 * 1000
 
 
@@ -264,6 +273,7 @@ class FakeStore:
         self.segments: list[tuple[str, str]] = []
         self.turns: list[tuple[int, ReplyOutcome]] = []
         self.closed: list[str] = []
+        self.discarded: list[str] = []
 
     async def record_wake(self, **kw) -> None:
         self.wakes.append(kw)
@@ -289,6 +299,15 @@ class FakeStore:
 
     async def close_session(self, session_id) -> None:
         self.closed.append(session_id)
+
+    async def discard_session(self, session_id) -> None:
+        """Silent close: the meeting row and its segments go, the wake row stays unlinked."""
+        self.discarded.append(session_id)
+        self.sessions.remove(session_id)
+        self.segments = [s for s in self.segments if s[0] != session_id]
+        for w in self.wakes:
+            if w.get("session_id") == session_id:
+                w["session_id"] = None
 
 
 def fake_ports(**over) -> VoicePorts:

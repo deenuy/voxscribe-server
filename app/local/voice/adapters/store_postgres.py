@@ -105,6 +105,21 @@ class PostgresSessionStore:
             llm_request_sent_ms=outcome.started_ms, llm_first_token_ms=outcome.first_sentence_ms,
             tts_first_audio_ms=outcome.first_audio_ms, playback_end_ms=outcome.playback_end_ms)
 
+    async def discard_session(self, session_id: str) -> None:
+        """Silent close: the session heard no genuine speech in turn 1, so it was never a real
+        meeting. Its wake_events row is kept for audit with the link cleared; the meeting row
+        and everything hanging off it (segments) are deleted. Never raises."""
+        try:
+            async with self._pool.connection() as conn:
+                await conn.execute(
+                    "UPDATE wake_events SET started_meeting_id=NULL WHERE started_meeting_id=%s",
+                    (session_id,))
+                await conn.execute("DELETE FROM meetings WHERE id=%s", (session_id,))
+                await conn.commit()
+            log.info("voice store: silent close, meeting deleted meeting_id=%s", session_id)
+        except Exception:
+            log.exception("voice store: silent close cleanup failed meeting_id=%s", session_id)
+
     async def close_session(self, session_id: str) -> None:
         """stop_once, then finalise exactly as the WebSocket path does."""
         from app.local import meeting_bus

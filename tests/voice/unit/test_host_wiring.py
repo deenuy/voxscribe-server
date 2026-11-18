@@ -221,7 +221,6 @@ async def test_quiet_hours_blocks_session():
 
 
 async def test_outside_quiet_hours_the_same_wake_opens_a_session(monkeypatch):
-    monkeypatch.setattr(host_mod, "CHIME_DECAY_S", 0.0)
     ports = fake_ports()
     host = _host(ports)
     await _drive_armed(host, _OneDecisionGate(), n_chunks=10)
