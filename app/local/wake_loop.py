@@ -481,6 +481,9 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
 
             silence_run  = 0
             total_frames = 0
+            # Turn detector clock: samples fed to it since reset(). Its speech events are stamped on
+            # this stream timeline, so tick() must be too; engine uptime made every pause look hours long.
+            stream_samples = 0
 
             # Inter-turn idle deadline: first turn uses a quick watchdog; subsequent
             # turns give the user _CONV_IDLE_S seconds to speak again.
@@ -505,7 +508,6 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
                         timed_out = True
                         break
 
-                    now_ms = _mono_ms()
                     rms    = float((chunk ** 2).mean() ** 0.5)
 
                     # Reset the idle clock whenever audio above noise floor is heard.
@@ -524,9 +526,11 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
                     total_frames += 1
 
                     if use_turn_detector:
-                        d = turn_detector.push_pcm16(pcm16_bytes, now_ms)
+                        stream_samples += len(pcm16)
+                        stream_ms = stream_samples * 1000 // _SAMPLE_RATE
+                        d = turn_detector.push_pcm16(pcm16_bytes, stream_ms)
                         if total_frames % 5 == 0:
-                            d = turn_detector.tick(now_ms) or d
+                            d = turn_detector.tick(stream_ms) or d
                         if d is not None and d.closes_turn:
                             log.info("wake: turn %d closed action=%s silence_ms=%d",
                                      turn_n, d.action, d.silence_ms)
