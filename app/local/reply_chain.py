@@ -211,6 +211,7 @@ def reply_sentences(
     turn_id: str | None = None,
     history: list[dict] | None = None,
     pre_stream: AsyncIterator[str] | None = None,
+    system_note: str | None = None,
 ) -> ReplySource:
     """Route one turn and return its sentence source. Nothing is spoken here.
 
@@ -218,6 +219,9 @@ def reply_sentences(
     search  "Let me check." as the lead-in, then a web search (tool_calls row written) and the
             reply model grounded on the results, or a fixed line when search is unavailable
     llm     the speculative stream when the host started one, else the reply model
+
+    system_note is appended to the system prompt for this turn (the barge-in note, T13). The
+    host never starts a speculative stream on such a turn, since that stream has no prompt.
     """
     from app.local import pre_router
     from app.local.context import current_context_header
@@ -234,6 +238,10 @@ def reply_sentences(
         "Be direct and conversational. No markdown, no lists, no headers. "
         "Keep replies under 30 words."
     ).strip() if ctx_header else None
+    if system_note:
+        from app.local.llm_adapter import _build_system_prompt
+
+        system_prompt = f"{system_prompt or _build_system_prompt()} {system_note}"
 
     route = pre_router.route(user_text or "", settings) if settings else None
     if route and route[0] == "clock":
@@ -321,27 +329,37 @@ async def finish_reply(
     llm_first_token_ms: int | None = None,
     tts_first_audio_ms: int | None = None,
     playback_end_ms: int | None = None,
+    played_text: str | None = None,
+    full_text: str | None = None,
 ) -> None:
-    """Record what the reply stage decided and spoke. Errors are logged, never raised."""
+    """Record what the reply stage decided and spoke. Errors are logged, never raised.
+
+    After a barge-in (T13) reply_text is what was heard, and played_text and full_text are
+    written beside it with replies.barge_in set; both are None for a reply that played out.
+    """
     from app.local import gate, meeting_bus
 
     meeting_id = rec.meeting_id
     decided_z = _now_z()
-    log.info("reply_chain: reply_len=%d decision=%s meeting_id=%s",
-             len(reply_text), decision, meeting_id)
+    barge_in = played_text is not None
+    log.info("reply_chain: reply_len=%d decision=%s barge_in=%s meeting_id=%s",
+             len(reply_text), decision, barge_in, meeting_id)
     try:
         async with pool.connection() as conn:
             if rec.reply_pre_written:
                 await conn.execute(
-                    "UPDATE replies SET text=%s, model=%s, gate_category=%s, created_at=%s WHERE id=%s",
-                    (reply_text, rec.model, category, decided_z, rec.reply_id),
+                    "UPDATE replies SET text=%s, model=%s, gate_category=%s, created_at=%s,"
+                    " barge_in=%s, played_text=%s, full_text=%s WHERE id=%s",
+                    (reply_text, rec.model, category, decided_z, barge_in, played_text,
+                     full_text, rec.reply_id),
                 )
             else:
                 await conn.execute(
-                    "INSERT INTO replies (id, meeting_id, turn_n, text, model, gate_category, created_at)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    "INSERT INTO replies (id, meeting_id, turn_n, text, model, gate_category,"
+                    " created_at, barge_in, played_text, full_text)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (rec.reply_id, meeting_id, rec.turn_n, reply_text, rec.model, category,
-                     decided_z),
+                     decided_z, barge_in, played_text, full_text),
                 )
             if rec.gate_pre_written:
                 await conn.execute(
@@ -392,6 +410,7 @@ async def finish_reply(
             "turn_n": rec.turn_n,
             "gate": decision,
             "category": category,
+            "bargeIn": barge_in,
         })
     except Exception:
         log.warning("reply_chain: failed to publish reply event meeting_id=%s", meeting_id)

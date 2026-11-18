@@ -13,14 +13,20 @@ machine (off, armed, listening, error) and the five-stage cascade:
              before the Talker synthesises it
   playback   AudioOut plays the audio; while it plays (and for the echo guard tail) capture is
              muted from the turn stage and the wake gate does not run
+  barge-in   while a reply generates and plays, capture energy (echo-cancelled, T12) is read by
+             the BargeInDetector: an interruption stops playback and generation, the stored turn
+             and the history keep only the clauses that were heard, the interjection becomes the
+             next turn, and that turn's prompt says not to repeat the heard part. A backchannel
+             keeps the floor. Off when capture is not echo-cancelled (see voice/barge_in.py)
 
 This is the only module in app/local/voice that knows which adapter backs each port, and it
 imports them only in build_ports(). Everything else goes through the Protocols.
 
 Also carried over: quiet hours (a wake inside the window is recorded as rejected and nothing is
 played or opened), the capture watchdog hook (after a stream reopen the gate is reset on the next
-frame), the debug trigger (behind --debug-trigger, see routers/wake.py), barge-in while armed,
-multi-turn conversations with stop phrases, and the speculative reply start with its drift rule.
+frame), the debug trigger (behind --debug-trigger, see routers/wake.py), barge-in while armed
+(the playback-ratio rule, BARGE_RATIO), multi-turn conversations with stop phrases, and the
+speculative reply start with its drift rule.
 No transcript text, audio or prompt is logged.
 """
 from __future__ import annotations
@@ -32,7 +38,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
@@ -52,6 +58,18 @@ from voxscribe.session.ports import (
 )
 from voxscribe.session.stages.reply import speak_reply
 from voxscribe.wake.gate import ASR_CONFIRM_PHRASE, FRAME_SAMPLES, GateConfig, WakeGate
+
+from app.local.voice.barge_in import (
+    BACKCHANNEL,
+    BARGE_IN,
+    BARGE_IN_POLL_S,
+    BARGE_IN_PRE_ROLL_MS,
+    OVERLAP,
+    BargeInDetector,
+    HeardReply,
+    Interruption,
+    interruption_note,
+)
 
 log = logging.getLogger("app.local.wake")
 
@@ -220,12 +238,17 @@ def make_wake_gate(ports: VoicePorts, phrase: str = ASR_CONFIRM_PHRASE) -> WakeG
 
 
 class PreRollQueue:
-    """A session's audio source: the audio heard after the wake phrase, then live capture."""
+    """A session's audio source: audio already heard (after the wake phrase, or the start of an
+    interjection that interrupted a reply), then live capture."""
 
     def __init__(self, pre_roll, live, chunk_frames: int = CHUNK_FRAMES) -> None:
         self._pre = deque(pre_roll[i: i + chunk_frames]
                           for i in range(0, len(pre_roll), chunk_frames))
         self._live = live
+
+    def pre_roll_pending(self) -> bool:
+        """True while the next chunk is pre-roll: it predates any mute and is never muted."""
+        return bool(self._pre)
 
     async def get(self):
         if self._pre:
@@ -280,6 +303,24 @@ def _drain(q) -> None:
 
 def _no_events(_kind: str, _data: dict) -> None:
     pass
+
+
+@dataclass
+class SessionContext:
+    """What one turn hands the next within a conversation."""
+
+    history: list[dict] = field(default_factory=list)
+    barge_in: bool = False         # the user interrupted the previous reply
+    played_text: str = ""          # what the user heard of it
+    pre_roll: np.ndarray | None = None   # the interjection's start, captured during the reply
+    held_empty: bool = False       # one wordless turn after a barge-in did not end the session
+
+
+@dataclass
+class ReplyResult:
+    text: str                      # recorded as spoken: the heard text after an interruption
+    interruption: Interruption | None = None
+    pre_roll: np.ndarray | None = None
 
 
 class VoiceHost:
@@ -547,12 +588,12 @@ class VoiceHost:
         self._state["meeting_id"] = session_id
         log.info("[Vox Initialized] meeting_id=%s", session_id)
 
-        history: list[dict] = []
+        session = SessionContext()
         turn_n = 0
         try:
             while True:
                 turn_n += 1
-                if not await self._turn(p, audio_q, session_id, turn_n, use_turns, history):
+                if not await self._turn(p, audio_q, session_id, turn_n, use_turns, session):
                     break
         finally:
             self._state["meeting_id"] = None
@@ -560,8 +601,9 @@ class VoiceHost:
             log.info("voice host: session closed meeting_id=%s turns=%d", session_id, turn_n)
 
     async def _turn(self, p: VoicePorts, audio_q, session_id: str, turn_n: int,
-                    use_turns: bool, history: list[dict]) -> bool:
+                    use_turns: bool, session: SessionContext) -> bool:
         """One turn: listen, recognise, reply. False when the conversation is over."""
+        history = session.history
         stream = p.recognizer.open_stream(session_id)
         ring = _TurnRing(int(TURN_RING_S * SAMPLE_RATE / CHUNK_FRAMES))
         texts: list[str] = []
@@ -569,7 +611,14 @@ class VoiceHost:
             self._recognize(p, ring, stream, session_id, turn_n, texts, use_turns),
             name="voice-recognize")
 
-        if await self._listen(p, audio_q, ring, turn_n, use_turns):
+        # After a barge-in the interjection has already started: its first audio was captured
+        # while the reply played, and opens this turn.
+        listen_q = audio_q
+        if session.pre_roll is not None and session.pre_roll.size:
+            listen_q = PreRollQueue(session.pre_roll, audio_q)
+        session.pre_roll = None
+
+        if await self._listen(p, listen_q, ring, turn_n, use_turns):
             if turn_n > 1:
                 log.info("[Vox Stopped] idle timeout after %d turn(s)", turn_n - 1)
             else:
@@ -582,9 +631,11 @@ class VoiceHost:
 
         # Start the reply model on the text recognised so far, so generation overlaps the
         # final flush; kept only if the flush adds function words (spec_text_changed).
+        # Not after a barge-in: the speculative stream has no system prompt to carry the
+        # interruption note.
         prefetch = " ".join(texts).strip()
         speculation = None
-        if (len(prefetch.split()) >= SPEC_MIN_WORDS
+        if (not session.barge_in and len(prefetch.split()) >= SPEC_MIN_WORDS
                 and not is_stop_phrase(prefetch, self.config.wake_phrase)):
             speculation = p.delegate.speculate(prefetch, history or None)
             log.info("voice host: speculative reply started words=%d", len(prefetch.split()))
@@ -607,6 +658,12 @@ class VoiceHost:
         asr_final_ms = p.clock.mono_ms()
         turn_text = " ".join(texts).strip()
 
+        if not turn_text and session.barge_in and not session.held_empty:
+            # A cough or a door can interrupt a reply; it should not also end the conversation.
+            session.held_empty = True
+            log.info("[Vox Listening] the interruption held no words (turn=%d); listening on",
+                     turn_n)
+            return True
         if not turn_text:
             log.info("[Vox Stopped] empty turn, no speech detected (turn=%d)", turn_n)
             if speculation is not None:
@@ -625,19 +682,28 @@ class VoiceHost:
             else:
                 log.info("voice host: speculation accepted, no content drift")
 
-        # The reply plays to the end before the next turn listens (no barge-in mid-session).
+        # The reply generates and plays while the barge-in watcher reads capture; an
+        # interruption ends both, and its audio opens the next turn.
         self._publish("wake.reply", {"meetingId": session_id, "turn": turn_n,
                                      "phase": "thinking", "userText": turn_text, "text": ""})
-        reply_text = await self.reply_turn(session_id, turn_n, turn_text,
-                                           history=history or None, speculation=speculation,
-                                           turn_end_ms=turn_end_ms, asr_final_ms=asr_final_ms)
+        note = interruption_note(session.played_text) if session.barge_in else None
+        result = await self._reply(session_id, turn_n, turn_text, history=history or None,
+                                   speculation=speculation, turn_end_ms=turn_end_ms,
+                                   asr_final_ms=asr_final_ms, audio_q=audio_q, note=note)
+        interrupted = result.interruption is not None
         self._publish("wake.reply", {"meetingId": session_id, "turn": turn_n,
                                      "phase": "done", "userText": turn_text,
-                                     "text": reply_text})
+                                     "text": result.text, "interrupted": interrupted})
         history.append({"role": "user", "content": turn_text})
-        if reply_text:
-            history.append({"role": "assistant", "content": reply_text})
-        _drain(audio_q)   # what the mic heard of our own reply
+        if result.text:
+            history.append({"role": "assistant", "content": result.text})
+        session.barge_in = interrupted
+        session.played_text = result.text if interrupted else ""
+        session.held_empty = False
+        if interrupted:
+            session.pre_roll = result.pre_roll
+        else:
+            _drain(audio_q)   # what the mic heard of our own reply
         return True
 
     async def _listen(self, p: VoicePorts, audio_q, ring: _TurnRing, turn_n: int,
@@ -655,12 +721,14 @@ class VoiceHost:
         silence_run = 0
         chunks = 0
         clock_error_logged = False
+        pre_roll_pending = getattr(audio_q, "pre_roll_pending", lambda: False)
         log.info("[Vox Listening] turn=%d (say your question, or %r to stop)", turn_n, STOP_HINT)
         try:
             while True:
                 remaining = idle_deadline - time.monotonic()
                 if remaining <= 0:
                     return True
+                from_pre_roll = pre_roll_pending()
                 try:
                     chunk = await asyncio.wait_for(audio_q.get(),
                                                    timeout=min(remaining, QUEUE_POLL_S))
@@ -672,7 +740,7 @@ class VoiceHost:
                     idle_deadline = time.monotonic() + CONV_IDLE_S
 
                 # Echo guard: our own playback and its tail never reach the recognizer.
-                if p.audio_in.capture_muted():
+                if not from_pre_roll and p.audio_in.capture_muted():
                     silence_run = 0
                     continue
 
@@ -756,27 +824,117 @@ class VoiceHost:
     async def reply_turn(self, session_id: str, turn_n: int, text: str, *,
                          history: list[dict] | None = None, speculation=None,
                          turn_end_ms: int = 0, asr_final_ms: int | None = None) -> str:
-        """Stages reply and playback for one turn. Returns the text recorded as spoken."""
+        """Stages reply and playback for one turn, without the barge-in watch. Returns the text
+        recorded as spoken."""
+        result = await self._reply(session_id, turn_n, text, history=history,
+                                   speculation=speculation, turn_end_ms=turn_end_ms,
+                                   asr_final_ms=asr_final_ms)
+        return result.text
+
+    def _barge_in_enabled(self, p: VoicePorts) -> bool:
+        # Capture energy is the user's voice only when the speaker is cancelled out of it.
+        return bool(getattr(p.audio_in, "echo_cancelled", False))
+
+    async def _reply(self, session_id: str, turn_n: int, text: str, *,
+                     history: list[dict] | None = None, speculation=None,
+                     turn_end_ms: int = 0, asr_final_ms: int | None = None,
+                     audio_q=None, note: str | None = None) -> ReplyResult:
+        """Stages reply, playback and barge-in for one turn.
+
+        With `audio_q` (and an echo-cancelled capture) capture is watched while the reply
+        generates and plays. An interruption stops playback at once, cancels the reply stage and
+        closes the sentence source (which ends generation), and records only the clauses that
+        finished playing. `note` is added to the reply model's system prompt.
+        """
         p = await self._ready()
         try:
-            log.info("[Vox Thinking] turn=%d words=%d history_turns=%d", turn_n,
-                     len(text.split()), len(history) // 2 if history else 0)
+            log.info("[Vox Thinking] turn=%d words=%d history_turns=%d barge_in=%s", turn_n,
+                     len(text.split()), len(history) // 2 if history else 0, note is not None)
             turn = await p.store.begin_turn(session_id, turn_n, text)
+            extra = {"system_note": note} if note else {}
             stream = await p.delegate.reply(text, session_id, turn_id=turn.turn_id,
-                                            history=history, speculation=speculation)
-            outcome = await speak_reply(
-                stream, gate=p.gate, talker=p.talker, audio_out=p.audio_out, clock=p.clock,
-                user_text=text, session_tools=lambda: p.store.session_tools(session_id))
+                                            history=history, speculation=speculation, **extra)
+            heard = HeardReply(p.clock, scripted=(stream.cue, stream.lead_in))
+            sentences = heard.sentences(stream.sentences)
+            stream.sentences = sentences
+            speak = asyncio.create_task(speak_reply(
+                stream, gate=heard.gate(p.gate), talker=heard.talker(p.talker),
+                audio_out=heard.audio_out(p.audio_out), clock=p.clock, user_text=text,
+                session_tools=lambda: p.store.session_tools(session_id)),
+                name="voice-reply")
+
+            pre_roll = None
+            try:
+                if audio_q is not None and self._barge_in_enabled(p):
+                    pre_roll = await self._watch_barge_in(p, audio_q, speak)
+                completed = await self._settle(speak, interrupted=pre_roll is not None)
+            finally:
+                if not speak.done():     # the session itself was cancelled mid-reply
+                    speak.cancel()
+
+            interruption = None
+            if pre_roll is not None:
+                await sentences.aclose()
+                if speculation is not None:
+                    speculation.cancel()
+                interruption = heard.interruption()
+                outcome = heard.outcome(completed, end_ms=p.clock.mono_ms())
+                log.info("[Vox Interrupted] turn=%d heard=%d of %d clause(s)", turn_n,
+                         len(heard.played_clauses), len(heard.released))
+            else:
+                outcome = completed
             if outcome.first_audio_ms is not None:
                 log.info("voice host: first audio +%d ms from turn end",
                          outcome.first_audio_ms - turn_end_ms)
+            extra_turn = {"interruption": interruption} if interruption is not None else {}
             await p.store.add_turn(turn, outcome, turn_end_ms=turn_end_ms,
-                                   asr_final_ms=asr_final_ms)
-            log.info("[Vox Ready] turn=%d reply complete decision=%s", turn_n, outcome.decision)
-            return outcome.text
+                                   asr_final_ms=asr_final_ms, **extra_turn)
+            log.info("[Vox Ready] turn=%d reply %s decision=%s", turn_n,
+                     "interrupted" if interruption else "complete", outcome.decision)
+            return ReplyResult(text=outcome.text, interruption=interruption,
+                               pre_roll=pre_roll)
         except Exception:
             log.exception("voice host: reply failed meeting_id=%s", session_id)
-            return ""
+            return ReplyResult(text="")
+
+    @staticmethod
+    async def _settle(speak: asyncio.Task, *, interrupted: bool):
+        """The reply stage's outcome; after an interruption the stage is cancelled if it is still
+        running, and None is returned for it."""
+        if interrupted and not speak.done():
+            speak.cancel()
+        try:
+            return await speak
+        except asyncio.CancelledError:
+            if not interrupted:
+                raise
+            return None
+
+    async def _watch_barge_in(self, p: VoicePorts, audio_q, speak: asyncio.Task):
+        """Stage barge-in: read capture until the reply has been generated and played.
+
+        Returns the capture held from just before the interruption (the start of the
+        interjection, for the next turn), or None when the reply played to its end.
+        Playback is stopped here, on the frame that decides, before anything else runs.
+        """
+        out = p.audio_out
+        detector = BargeInDetector(SAMPLE_RATE)
+        held: deque = deque(maxlen=max(1, BARGE_IN_PRE_ROLL_MS * SAMPLE_RATE
+                                       // (1000 * CHUNK_FRAMES)))
+        while not (speak.done() and not out.is_playing):
+            try:
+                chunk = await asyncio.wait_for(audio_q.get(), timeout=BARGE_IN_POLL_S)
+            except asyncio.TimeoutError:
+                continue
+            held.append(chunk)
+            for event in detector.feed(chunk, playing=out.is_playing):
+                if event == BARGE_IN:
+                    out.stop_playback()
+                    log.info("voice host: barge-in, playback stopped")
+                    return np.concatenate([np.asarray(c, dtype=np.float32) for c in held])
+                if event in (BACKCHANNEL, OVERLAP):
+                    log.info("voice host: %s during reply, keeping the floor", event)
+        return None
 
     # ------------------------------------------------------------------ hooks
 
