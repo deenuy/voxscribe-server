@@ -5,6 +5,10 @@ reopens it), so with an engine `start()` and `stop()` do nothing. When the engin
 start, `PortAudioIn` opens its own capture stream between `start()` and `stop()` (the old wake
 loop's fallback) and `PortAudioOut` is unavailable: replies are not synthesised, cues still play.
 `monotonic_ms` is the engine's clock, shared with the echo guard; the host's Clock uses it.
+
+Barge-in (T13): `PortAudioIn.echo_cancelled` tells the host whether capture is cleaned against
+playback, which is what lets it read capture energy during a reply as the user's voice, and
+`PortAudioOut.play(..., on_played=)` reports when a sentence has been played to its end.
 """
 from __future__ import annotations
 
@@ -72,6 +76,12 @@ class PortAudioIn:
         elif queue in self._direct_qs:
             self._direct_qs.remove(queue)
 
+    @property
+    def echo_cancelled(self) -> bool:
+        """True when the engine's canceller removes the assistant's voice from capture."""
+        aec = getattr(self._engine, "aec", None) if self._engine is not None else None
+        return bool(aec is not None and aec.echo_cancellation)
+
     def capture_muted(self) -> bool:
         # EchoGuard: time-based mute for the playback plus its tail. No engine, no playback.
         if self._engine is None:
@@ -80,16 +90,19 @@ class PortAudioIn:
 
 
 class PortAudioOut:
+    reports_played = True      # play() takes on_played (see voice/barge_in.py)
+
     def __init__(self, engine=None) -> None:
         self._engine = engine
         self.available = engine is not None
 
-    async def play(self, pcm_float32_mono, sample_rate: int) -> None:
+    async def play(self, pcm_float32_mono, sample_rate: int, *, on_played=None) -> None:
+        """Queue audio; returns once queued. on_played runs when all of it has been played."""
         if self._engine is None:
             return
         if sample_rate != self._engine.playback_rate:
             raise ValueError(f"playback runs at {self._engine.playback_rate} Hz, got {sample_rate}")
-        await self._engine.play(pcm_float32_mono, block=True)
+        await self._engine.play(pcm_float32_mono, block=True, on_played=on_played)
 
     async def play_file(self, path: str) -> None:
         # The cue plays through afplay, outside the engine's playback queue, so the echo guard

@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from voxscribe.session.ports import ReplyOutcome, TranscriptSegment, TurnRecord
 
 from app.local import reply_chain
+from app.local.voice.barge_in import Interruption
 
 log = logging.getLogger("app.local.voice.store")
 
@@ -98,12 +99,17 @@ class PostgresSessionStore:
         return await reply_chain.session_tools(self._pool, session_id)
 
     async def add_turn(self, turn: TurnRecord, outcome: ReplyOutcome, *, turn_end_ms: int,
-                       asr_final_ms: int | None = None) -> None:
+                       asr_final_ms: int | None = None,
+                       interruption: Interruption | None = None) -> None:
+        """interruption: set when a barge-in cut the reply short (T13); outcome.text is then
+        what was heard, and the heard and full texts are written beside it."""
         await reply_chain.finish_reply(
             self._pool, turn.handle, reply_text=outcome.text, decision=outcome.decision,
             category=outcome.category, turn_end_ms=turn_end_ms, asr_final_ms=asr_final_ms,
             llm_request_sent_ms=outcome.started_ms, llm_first_token_ms=outcome.first_sentence_ms,
-            tts_first_audio_ms=outcome.first_audio_ms, playback_end_ms=outcome.playback_end_ms)
+            tts_first_audio_ms=outcome.first_audio_ms, playback_end_ms=outcome.playback_end_ms,
+            played_text=interruption.played_text if interruption else None,
+            full_text=interruption.full_text if interruption else None)
 
     async def discard_session(self, session_id: str) -> None:
         """Silent close: the session heard no genuine speech in turn 1, so it was never a real
