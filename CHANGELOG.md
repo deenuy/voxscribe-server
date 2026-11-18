@@ -20,6 +20,10 @@
 - Added a tray state indicator that updates every two seconds to show the engine state (listening, speaking, follow-up, hold, and others) as a tooltip on the menu bar icon.
 - Added an assistant settings screen in the app for changing the wake phrase, name, voice, and speed, wired to the new profile API.
 
+- Added a delegate lane (`app/local/voice/delegate_lane.py`): a request that needs a web search is answered with "I'm looking that up, it'll take a moment" and runs as a background task, so the next question is answered while the search is still going. The result is spoken after the reply to a later turn, or when asked "what did you find?". A result that has waited longer than the stale limit (`STALE_RESULT_S`) is offered ("want me to run it again?") instead of read out.
+- Added spoken cancel and change for a background task: "cancel that", "never mind", "forget it" and "stop searching" stop it and nothing is spoken later; "actually, ..." and "search for ... instead" replace it and only the new result is spoken.
+- Added the `delegate_tasks` table (migration 017), one row per background task with its status and result, and a `task_id` column on `tool_calls` so every tool call names the task that made it.
+
 ### Bug Fixes
 - Fixed the acknowledgement chime being transcribed as the user's first words, which caused the assistant to reply to its own sound at night; the chime is now muted in the capture signal for a window after it plays.
 - Fixed sessions opening from a single noisy frame with no actual speech; the two-stage gate now requires patience, voice activity, and a phrase match before a session starts.
@@ -33,6 +37,7 @@
 - Changed the debug trigger endpoint (`POST /v1/wake/trigger`) to require a `--debug-trigger` flag at startup, preventing accidental wake events from local processes in production.
 - Removed the browser-based speech recognition fallback from the app; the Python engine handles all voice input.
 - Requires voxscribe-core 0.5.0. The `wake` extra includes `pywebrtc-audio` for AEC; without it the engine runs with the time-based echo guard only.
+- The reply model no longer has a tool path: web search moved from the reply turn to the delegate lane's thinker. The reply model's prompt asks it to emit `[DELEGATE: <request>]` for questions it cannot answer without a search; the marker is never spoken.
 
 ## What's New in VoxScribe Server 0.8.0
 

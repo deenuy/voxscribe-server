@@ -1,15 +1,17 @@
-"""Reply chain: the reply model, the search route and the reply bookkeeping for wake sessions.
+"""Reply chain: the reply model, the thinker's search and the reply bookkeeping for wake sessions.
 
 The voice host's reply stage (voxscribe.session.stages.reply) does the speaking: it gates every
 sentence before synthesis and plays what passed. This module supplies the two ends of it,
 through the Delegate and SessionStore adapters in app/local/voice/adapters:
 
-  begin_reply()      write the turns row, pre-write replies + gate_decisions (G1: the gate row
-                     exists before anything is played)
-  reply_sentences()  route the turn (clock answer, web search, or the reply model) and stream
-                     its sentences, split at punctuation; a search writes its tool_calls row
-  finish_reply()     write the gate outcome, the behaviour log (G6), played_at and the latency
-                     ledger, then publish the reply event over meeting_bus
+  begin_reply()       write the turns row, pre-write replies + gate_decisions (G1: the gate
+                      row exists before anything is played)
+  talker_sentences()  the talker: the reply model's sentences for one turn, split at
+                      punctuation. It has no tools
+  search_answer()     the thinker: a web search on the delegate lane (app/local/voice/
+                      delegate_lane.py); writes its tool_calls row with the task id
+  finish_reply()      write the gate outcome, the behaviour log (G6), played_at and the latency
+                      ledger, then publish the reply event over meeting_bus
 
 Latency budget (idle MacBook): turn_end to first_audio under 1.5 s.
 TTS: Kokoro-ONNX primary, macOS say fallback (see tts_engine.py).
@@ -32,9 +34,7 @@ log = logging.getLogger("app.local.reply_chain")
 _OLLAMA_TIMEOUT_S  = 30.0   # llama3.2 first-token <3s warm, ~8s cold; 30s covers first-time load
 _FALLBACK_PHRASE   = "I'm sorry, I didn't catch that. Could you say it again?"
 _THINKING_PHRASE   = "hm"
-_FILLER_PHRASE     = "Let me check."
 _SEARCH_UNAVAILABLE_PHRASE = "I can't look that up right now."
-_SEARCH_TIMEOUT_S  = 4.0
 THINKING_PHRASE    = _THINKING_PHRASE   # spoken as the reply's cue
 FALLBACK_PHRASE    = _FALLBACK_PHRASE   # recorded when the reply model yields nothing
 _SENTENCE_RE       = re.compile(r'[.!?]["\')\]]*\s+')
@@ -103,7 +103,7 @@ async def warm_phrase_cache() -> None:
         CLASSROOM_REFUSAL_PHRASE,
         SENIORCARE_ESCALATION_PHRASE,
     )
-    for phrase in (_THINKING_PHRASE, _FILLER_PHRASE, DEFAULT_REFUSAL_PHRASE,
+    for phrase in (_THINKING_PHRASE, DEFAULT_REFUSAL_PHRASE,
                    CLASSROOM_REFUSAL_PHRASE, SENIORCARE_ESCALATION_PHRASE,
                    ACTION_CLAIM_PHRASE):
         await prerender_phrase(phrase)
@@ -196,124 +196,164 @@ async def begin_reply(pool, meeting_id: str, turn_n: int, user_text: str, *,
 
 @dataclass
 class ReplySource:
-    """What reply_sentences() returns; the Delegate adapter turns it into a ReplyStream."""
+    """What talker_sentences() returns; the Delegate adapter turns it into a ReplyStream."""
 
     sentences: AsyncIterator[str]
     source: str
-    lead_in: str | None = None
 
 
-def reply_sentences(
-    app,
-    meeting_id: str,
-    user_text: str,
-    *,
-    turn_id: str | None = None,
-    history: list[dict] | None = None,
-    pre_stream: AsyncIterator[str] | None = None,
-    system_note: str | None = None,
-) -> ReplySource:
-    """Route one turn and return its sentence source. Nothing is spoken here.
-
-    clock   the pre-router's answer, one sentence
-    search  "Let me check." as the lead-in, then a web search (tool_calls row written) and the
-            reply model grounded on the results, or a fixed line when search is unavailable
-    llm     the speculative stream when the host started one, else the reply model
-
-    system_note is appended to the system prompt for this turn (the barge-in note, T13). The
-    host never starts a speculative stream on such a turn, since that stream has no prompt.
-    """
+def route_turn(settings, user_text: str) -> tuple[str, str] | None:
+    """The pre-router's verdict: ("clock", answer), ("search", query) or None."""
     from app.local import pre_router
+
+    return pre_router.route(user_text or "", settings) if settings else None
+
+
+def _voice_system_prompt(settings) -> str:
+    """The context header from the OS clock at turn start (not session start), then the voice
+    rules."""
     from app.local.context import current_context_header
+    from app.local.llm_adapter import _build_system_prompt
 
-    settings = getattr(app.state, "settings", None)
-    model, _mode = reply_settings(settings)
-
-    # Context header from the OS clock at turn start (not session start).
     ctx_header = current_context_header(settings) if settings else ""
-    system_prompt = (
+    if not ctx_header:
+        return _build_system_prompt()
+    return (
         f"{ctx_header} "
         "You are a helpful voice assistant. "
         "Reply in 1-2 short sentences only. "
         "Be direct and conversational. No markdown, no lists, no headers. "
         "Keep replies under 30 words."
-    ).strip() if ctx_header else None
-    if system_note:
-        from app.local.llm_adapter import _build_system_prompt
+    )
 
-        system_prompt = f"{system_prompt or _build_system_prompt()} {system_note}"
 
-    route = pre_router.route(user_text or "", settings) if settings else None
-    if route and route[0] == "clock":
-        log.info("reply_chain: pre-router clock answer meeting_id=%s", meeting_id)
-        return ReplySource(_one(route[1]), source="clock")
-    if route and route[0] == "search":
-        return ReplySource(
-            _search_sentences(app, meeting_id, user_text, route[1], turn_id=turn_id,
-                              model=model, history=history, system_prompt=system_prompt),
-            source="search", lead_in=_FILLER_PHRASE)
+def talker_system_prompt(settings) -> str:
+    """The talker's prompt: the voice prompt plus the instruction to hand anything that needs
+    a tool to the delegate lane. The talker itself has no tools."""
+    from app.local.voice.delegate_lane import TALKER_DELEGATE_INSTRUCTION
 
+    return f"{_voice_system_prompt(settings)} {TALKER_DELEGATE_INSTRUCTION}"
+
+
+def talker_sentences(
+    app,
+    meeting_id: str,
+    user_text: str,
+    *,
+    history: list[dict] | None = None,
+    pre_stream: AsyncIterator[str] | None = None,
+    system_note: str | None = None,
+) -> ReplySource:
+    """The talker's reply to one turn, as sentences. No tools, nothing is spoken here.
+
+    The speculative stream when the host started one, else the reply model. Routing (clock
+    answers, delegation to the thinker) is the Delegate adapter's job and happens before this.
+    system_note is appended to the system prompt for this turn only (the barge-in note, T13).
+    """
+    settings = getattr(app.state, "settings", None)
+    model, _mode = reply_settings(settings)
     log.info("reply_chain: querying %s model=%s history_turns=%d meeting_id=%s",
              "pre_stream" if pre_stream is not None else "llm", model,
              len(history) // 2 if history else 0, meeting_id)
     if pre_stream is not None:
         return ReplySource(_sentence_stream_from_tokens(pre_stream, _OLLAMA_TIMEOUT_S),
                            source="pre_stream")
+    prompt = talker_system_prompt(settings)
+    if system_note:
+        prompt = f"{prompt} {system_note}"
     return ReplySource(_sentence_stream(user_text, model, _OLLAMA_TIMEOUT_S, history=history,
-                                        system_prompt=system_prompt), source="llm")
+                                        system_prompt=prompt),
+                       source="llm")
 
 
-async def _one(sentence: str) -> AsyncIterator[str]:
-    yield sentence
+def split_sentences(text: str) -> list[str]:
+    """A finished text as the sentences the reply stage gates one by one."""
+    parts, buf = [], text.strip()
+    while True:
+        m = _SENTENCE_RE.search(buf)
+        if not m:
+            break
+        parts.append(buf[: m.end()].strip())
+        buf = buf[m.end():]
+    if buf.strip():
+        parts.append(buf.strip())
+    return [p for p in parts if p]
 
 
-async def _search_sentences(app, meeting_id: str, user_text: str, query: str, *,
-                            turn_id: str | None, model: str, history: list[dict] | None,
-                            system_prompt: str | None) -> AsyncIterator[str]:
-    from app.local.tools.web_search import search as web_search
-
-    pool = app.state.store.pool
-    log.info("reply_chain: search route meeting_id=%s", meeting_id)
-    t_search = time.monotonic()
-    search_result = ""
-    search_error: str | None = None
-    try:
-        async with asyncio.timeout(_SEARCH_TIMEOUT_S):
-            search_result = await web_search(query)
-    except Exception as exc:
-        search_error = str(exc)
-        log.warning("reply_chain: web_search failed: %s", type(exc).__name__)
-    search_dur_ms = int((time.monotonic() - t_search) * 1000)
-
+async def record_tool_call(pool, *, task_id: str, turn_id: str | None, meeting_id: str | None,
+                           tool: str, query: str, engine: str | None, result_count: int,
+                           duration_ms: int, error: str | None) -> None:
+    """One tool_calls row. Every row carries the delegate task that made the call (A5)."""
     try:
         async with pool.connection() as conn:
             await conn.execute(
                 "INSERT INTO tool_calls"
                 " (id, turn_id, meeting_id, tool, query, engine, result_count,"
-                "  duration_ms, error, called_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                "  duration_ms, error, called_at, task_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT DO NOTHING",
-                (str(uuid.uuid4()), turn_id, meeting_id, "web_search", query,
-                 "searxng", len([ln for ln in search_result.splitlines() if ln.startswith("1.")
-                                 or ln[:2] in ("2.", "3.", "4.", "5.")]),
-                 search_dur_ms, search_error, _now_z()),
+                (str(uuid.uuid4()), turn_id, meeting_id, tool, query, engine, result_count,
+                 duration_ms, error, _now_z(), task_id),
             )
             await conn.commit()
     except Exception:
-        log.debug("reply_chain: tool_calls insert failed (non-critical)")
+        log.exception("reply_chain: tool_calls insert failed task_id=%s", task_id)
+
+
+def _count_results(search_result: str) -> int:
+    return len([ln for ln in search_result.splitlines()
+                if ln.startswith("1.") or ln[:2] in ("2.", "3.", "4.", "5.")])
+
+
+async def search_answer(app, meeting_id: str | None, request: str, query: str, *,
+                        task_id: str, turn_id: str | None = None,
+                        history: list[dict] | None = None) -> str:
+    """The thinker's web search: search, write the tool_calls row, then have the reply model
+    summarise the results in one or two sentences. Runs on the delegate lane, never in a turn.
+
+    Returns the text to deliver. The lane bounds the whole call with THINKER_TIMEOUT_S; the
+    search tool bounds its own request.
+    """
+    from app.local.tools.web_search import search as web_search
+
+    settings = getattr(app.state, "settings", None)
+    model, _mode = reply_settings(settings)
+    pool = app.state.store.pool
+    log.info("reply_chain: thinker search task_id=%s meeting_id=%s", task_id, meeting_id)
+    t_search = time.monotonic()
+    search_result = ""
+    search_error: str | None = None
+    cancelled = False
+    try:
+        search_result = await web_search(query)
+    except asyncio.CancelledError:
+        search_error, cancelled = "cancelled", True
+    except Exception as exc:
+        search_error = str(exc)
+        log.warning("reply_chain: web_search failed: %s", type(exc).__name__)
+
+    row = record_tool_call(
+        pool, task_id=task_id, turn_id=turn_id, meeting_id=meeting_id, tool="web_search",
+        query=query, engine="searxng", result_count=_count_results(search_result),
+        duration_ms=int((time.monotonic() - t_search) * 1000), error=search_error)
+    if cancelled:
+        # The call was made, so the row is still written; then the cancel carries on.
+        await asyncio.shield(row)
+        raise asyncio.CancelledError
+    await row
 
     if search_error or "[web_search: unavailable" in search_result:
-        yield _SEARCH_UNAVAILABLE_PHRASE
-        return
+        return _SEARCH_UNAVAILABLE_PHRASE
     search_system = (
-        f"{system_prompt or ''}\n\n"
+        f"{_voice_system_prompt(settings)}\n\n"
         f"Use the following search results to answer the user's question. "
         f"Do not reproduce URLs. Summarise in 1-2 sentences.\n\n"
         f"{search_result}"
     ).strip()
-    async for sentence in _sentence_stream(user_text, model, _OLLAMA_TIMEOUT_S,
-                                           history=history, system_prompt=search_system):
-        yield sentence
+    sentences = [s async for s in _sentence_stream(request, model, _OLLAMA_TIMEOUT_S,
+                                                   history=history,
+                                                   system_prompt=search_system)]
+    return " ".join(sentences)
 
 
 async def finish_reply(

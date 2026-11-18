@@ -1,4 +1,5 @@
 """SessionStore over Postgres: wake_events, meetings, segments and the reply chain's turn rows.
+Also the delegate lane's task rows (delegate_tasks), written by PostgresDelegateTaskStore.
 
 A voice session is a meeting with origin "wake", created and stopped through the same
 MeetingStore calls the mic button uses, then finalised like any other meeting. Segments are
@@ -6,6 +7,7 @@ upserted and published on meeting_bus as transcript.stable, as the live WebSocke
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -14,6 +16,7 @@ from voxscribe.session.ports import ReplyOutcome, TranscriptSegment, TurnRecord
 
 from app.local import reply_chain
 from app.local.voice.barge_in import Interruption
+from app.local.voice.delegate_lane import DelegateTask, TaskStatus
 
 log = logging.getLogger("app.local.voice.store")
 
@@ -142,3 +145,31 @@ class PostgresSessionStore:
             log.info("voice store: finalize scheduled meeting_id=%s", session_id)
         else:
             log.info("voice store: session already stopped meeting_id=%s", session_id)
+
+
+class PostgresDelegateTaskStore:
+    """One delegate_tasks row per lane task, rewritten on every state change. Never raises."""
+
+    def __init__(self, app) -> None:
+        self._app = app
+        self._order = asyncio.Lock()     # writes land in the order the changes happened
+
+    async def save(self, task: DelegateTask) -> None:
+        delivered = task.status is TaskStatus.DELIVERED
+        async with self._order:
+            try:
+                async with self._app.state.store.pool.connection() as conn:
+                    await conn.execute(
+                        "INSERT INTO delegate_tasks"
+                        " (id, session_id, request, status, result, delivered_at, task_id)"
+                        " VALUES (%s, %s, %s, %s, %s, CASE WHEN %s THEN now() END, %s)"
+                        " ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status,"
+                        " result = EXCLUDED.result, delivered_at ="
+                        " COALESCE(delegate_tasks.delivered_at, EXCLUDED.delivered_at)",
+                        (task.task_id, task.session_id, task.request, task.status.value,
+                         task.result, delivered, task.task_id),
+                    )
+                    await conn.commit()
+            except Exception:
+                log.exception("voice store: failed to write delegate task=%s status=%s",
+                              task.task_id, task.status.value)
