@@ -1,171 +1,230 @@
 # voxscribe-server
 
-The LLM processing backend for IdeaScribe, packaged to run in Docker on a Mac.
+The local voice assistant engine for VoxScribe products. Runs on-device, never sends audio to the cloud.
 
-## What runs where
+Say **"hey vox"** and the assistant wakes, listens, replies by voice, and goes back to standby -- all from one local process, one PostgreSQL database.
 
-Recording happens in the Electron React Native client, which holds microphone
-consent. Docker hosts this backend for processing only: it never touches the
-mic. The client uploads the recorded session; this service queues it and a
-worker pool runs ASR and LLM extraction, then serves the IdeaScribe API
-contract (ideas, sessions, SSE).
+## What it does
+
+- **Wakes on "hey vox"** -- a two-stage gate (keyword detector + Silero VAD + Whisper confirm) so random speech, background noise, and other wake phrases never open a session.
+- **Understands natural speech** -- Whisper ASR, turn detection with pause-band patience, barge-in during replies.
+- **Replies by voice** -- Kokoro TTS with clause-level streaming (second clause starts synthesizing while the first plays).
+- **Never speaks uninvited** -- every spoken output passes a speech guard; chime transcripts, sub-500ms turns, and low-ASR-confidence audio are discarded silently.
+- **Background tasks** -- searches and long lookups run in a delegate lane while the assistant keeps answering simpler follow-ups.
+- **Reminders and timers** -- "remind me at 3pm" creates a local reminder; no false confirmation when no tool backs it.
+- **Spoken controls** -- pacing, volume, hold, repeat, shorter/longer by voice.
+- **Session memory** -- names and preferences extracted from each turn, injected into the next reply.
+- **Runtime-mutable profile** -- name, wake phrase, voice, speed, and system prompt change at runtime with no restart.
+- **Echo cancellation** -- WebRTC AEC3 so the assistant does not hear its own replies through the mic.
+
+## Architecture
+
+A ports-and-adapters voice host (`app/local/voice/host.py`) wires ten typed session ports to swappable adapters. The host runs a five-stage cascade:
 
 ```
-Electron / iPhone client (mic + consent)        Docker container (this service)
-   record locally  -- submit audio + metadata -->  enqueue -> worker -> ASR -> extract
-   subscribe SSE   <----- progress events --------  serve /v1 contract
+Capture → Recognize → Turn → Reply → Playback
 ```
 
-## Why a queue
+No audio library, database driver, or platform call appears above the port boundary. Swap any adapter without touching the cascade logic.
 
-Submission is decoupled from processing. When the user ends a capture, the
-client uploads it, the backend enqueues a job and returns at once, and the user
-can start the next capture immediately without waiting for the LLM. Workers
-drain the queue in the background, so submit lag is tiny.
+```
+Microphone
+    │
+    ▼
+ PortAudioCapture  (pyaudio ring buffer, AEC reference signal)
+    │  raw PCM frames
+    ▼
+ WhisperRecognize  (faster-whisper, finalize timeout, partial fallback)
+    │  TranscriptChunk
+    ▼
+ TurnDetector      (pause bands, speech guard, silent close, barge-in)
+    │  TurnResult
+    ▼
+ OllamaReply       (spoken controls, delegation routing, memory injection)
+    │  reply text
+    ▼
+ KokoroPlayback    (clause streaming, end cue off hot path, echo guard)
+```
 
-Day one this is an in-process worker pool, durable through the SQLite jobs
-table. The `JobQueue` protocol in `app/queue.py` is the seam: a Kafka or
-Temporal adapter implements the same three methods and the routers and the
-processing handler do not change. Flip `QUEUE_BACKEND` to switch.
+## Quick start
 
-Production behavior built in:
+```bash
+# Install (Python 3.13 recommended, 3.10+ supported)
+uv sync --extra wake --extra dev
 
-- durability: jobs are persisted before they run and re-enqueued on startup if
-  the process died mid-flight
-- retries: transient failures retry with exponential backoff up to
-  `QUEUE_MAX_ATTEMPTS`
-- dead-letter: after the max attempts the job is marked dead and the failure is
-  pushed to the client over SSE rather than hanging
-- idempotency: one job per session, so duplicate submits are no-ops
+# Fetch the wake detector model (once)
+uv run tools/fetch_wake_models.py
 
-## One recording per device, independent across devices
+# Start the engine with the voice assistant
+uv run --extra wake python -m app.local.engine --wake
 
-A device may hold one active recording at a time, enforced by a per-device
-lock keyed on tenant and `X-Device-Id`. Starting a second recording on the same
-device returns 409 `device_busy`. The same user on another device (iPhone while
-the Mac records) is fully independent. Finalizing or cancelling releases the
-device, and a stale claim past `RECORDING_TTL_SECONDS` is reclaimed so a crashed
-client never blocks a device permanently. The one-shot upload path does not
-claim a device, since the recording already finished client-side.
+# Development (no auth, debug trigger enabled)
+uv run --extra wake python -m app.local.engine --wake --no-auth --debug-trigger
+```
+
+The engine listens on a free port (printed at startup). Connect ideascribe-app to it via `VOXSCRIBE_ENGINE_URL` in the app's `.env`.
+
+## Running with the app
+
+```bash
+cd ../ideascribe-app
+make start          # starts PostgreSQL, API, engine and app together
+make health         # checks all components can reach each other
+make logs           # follows all logs
+make stop
+```
+
+## Key configuration
+
+```bash
+# Wake detector: open-vocabulary keyword spotter (default) or trained OWW model
+VOXSCRIBE_WAKE_DETECTOR=openvocab     # or: oww
+VOXSCRIBE_WAKE_PHRASE="hey vox"       # phrase for the open-vocabulary detector
+
+# Two-stage gate thresholds
+VOXSCRIBE_WAKE_PATIENCE=2             # consecutive frames required
+VOXSCRIBE_WAKE_VAD_THRESHOLD=0.3      # Silero speech ratio in 1s pre-roll
+VOXSCRIBE_WAKE_CONFIRM_DURATION_S=2.0 # Whisper confirm window
+
+# Echo cancellation (requires pywebrtc-audio)
+VOXSCRIBE_AEC_ENABLED=false           # true to enable WebRTC AEC3
+VOXSCRIBE_NOISE_SUPPRESS_ENABLED=false # noise suppression (raises WER on fan fixture)
+
+# Finalize timing
+FINALIZE_TIMEOUT_MS=2000              # max wait for Whisper final pass
+
+# Barge-in (only active when AEC is on)
+BARGE_IN_ENERGY_THRESHOLD=0.03
+BARGE_IN_MIN_FRAMES=4                 # 160ms
+
+# Background delegation
+STALE_RESULT_S=300                    # how long a delegate result stays fresh
+THINKER_TIMEOUT_S=30                  # max time for a background thinker
+
+# Reminders
+REMINDER_LOOKAHEAD_H=24               # how far ahead to scan for due reminders
+
+# Clause streaming
+MIN_CLAUSE_WORDS=4
+MAX_CLAUSE_WORDS=25
+
+# Quiet hours (comma-separated HH:MM ranges, engine timezone)
+VOXSCRIBE_QUIET_HOURS="22:00-07:00"
+
+# Auth
+VOXSCRIBE_NO_AUTH=false               # true in development to skip JWT
+VOXSCRIBE_DEBUG_TRIGGER=false         # true to allow POST /v1/wake/trigger
+```
+
+Full reference: `app/local/config.py` (server-level) and `voxscribe/profile/schema.py` (assistant profile).
+
+## API
+
+### Voice assistant
+
+```
+GET  /v1/assistant/profile          read the current assistant profile
+PATCH /v1/assistant/profile         update name, wake phrase, voice, speed, system prompt, end phrases
+POST /v1/assistant/profile/reset    reset to defaults
+GET  /v1/assistant/voices           list available TTS voice IDs
+
+GET  /v1/wake/state                 current engine state (armed / session / hold / …)
+POST /v1/wake/power                 notify of system sleep/wake events
+POST /v1/wake/trigger               open a debug session (requires --debug-trigger)
+```
+
+### Meetings / scribes
+
+```
+POST /v1/meetings/start             begin a meeting (voice session)
+POST /v1/meetings/{id}/stop         end a meeting
+GET  /v1/meetings                   list meetings
+GET  /v1/meetings/{id}              one meeting with transcript, summary, tasks
+PATCH /v1/meetings/{id}             edit title, notes, project
+POST /v1/meetings/{id}/edits        atomic edit commit (transcript + summary + tasks)
+POST /v1/meetings/from-file         import audio, text, or YouTube URL
+```
+
+### Live transcription
+
+```
+WS  /v1/live                        WebSocket; streams ASR chunks and voice events
+GET /v1/health                      engine status, model states, speech activity
+```
+
+Errors return `{ error, detail }` with correct HTTP status. The database name, internal paths, and stack traces are never included.
+
+## Database
+
+PostgreSQL 16. The engine manages its own schema via numbered migration scripts.
+
+```bash
+make db-migrate    # apply all pending migrations
+make db-shell      # psql into the development database
+```
+
+Migrations: `app/local/migrations/001_init.sql` through `019_reminders.sql`. See `CHANGELOG.md` for which sprint introduced each.
+
+Locally: `ideascribe_dev`. Production: set `DATABASE_URL`.
 
 ## voxscribe-core dependency
 
-This server depends on voxscribe-core, the shared intelligence kernel. The
-dependency is pinned to an exact version and resolved from a wheel that is
-tracked in this repository at `wheels/voxscribe_core-0.1.1-py3-none-any.whl`.
-The path is relative to `pyproject.toml` and `uv.lock` records the wheel's
-sha256, so any checkout builds the same way with no sibling repository needed.
-The `knowledge` extra (pypdf, openpyxl) is requested, so PDF and spreadsheet
-ingestion work.
-
-To rebuild the wheel from a core release tag (after a core update):
+The server depends on `voxscribe-core`, the shared intelligence kernel. The dependency is pinned to an exact version and resolved from a wheel tracked in `wheels/`.
 
 ```bash
-make core-wheel                       # builds from ../voxscribe-core at tag v0.1.1
-make core-wheel CORE_TAG=v0.1.2       # or another tag; CORE_DIR=... for another checkout
-# if the version changed, update the pin and the file name in pyproject.toml, then:
-uv lock --upgrade-package voxscribe-core && git add wheels pyproject.toml uv.lock
+make core-wheel                        # rebuild from ../voxscribe-core at the current tag
+make core-wheel CORE_TAG=v0.5.1        # or a specific tag
+make core-dev                          # switch to editable sibling for core development
+make core-pinned                       # switch back to the tracked wheel
 ```
 
-Rebuilding from the same tag gives the same bytes (the build uses the tag's commit
-time), so the hash only changes when core's content changes. If you swap the wheel
-without refreshing the lock, `uv sync --frozen` refuses it because the hash no longer
-matches. That is the pin doing its job.
+Current pin: `voxscribe-core==0.5.0` (`wheels/voxscribe_core-0.5.0-py3-none-any.whl`).
 
-### Development: switch between the pinned wheel and the sibling core
-
-To work on voxscribe-core while running this server:
+## Tests
 
 ```bash
-make core-dev            # installs ../voxscribe-core in editable mode
-# ... change ../voxscribe-core; changes are picked up on the next import ...
-make core-pinned         # back to the pinned wheel
+uv run --extra dev pytest tests/voice/unit/ -q     # 301 unit tests, no mic, no DB
+uv run --extra dev pytest tests/ -q                # full suite
+uv run --extra dev ruff check app/                 # lint
 ```
 
-Switching back uses `uv sync --frozen --extra dev --reinstall-package voxscribe-core`.
-While you are working against the sibling core, do not run a plain `uv sync`: it
-reinstalls the pinned wheel and, without `--extra dev`, removes pytest and the other
-dev tools.
+No test touches a real microphone, real database, or the network. Every adapter has a fake.
 
-### About the wheel in git
-
-`wheels/*.whl` is a binary (about 240 KB) that lives in git history, so each distinct
-rebuild adds a blob. Rebuild only when core has a new release tag, and squash
-intermediate rebuilds before merging. When a private package index exists, replace
-the tracked wheel with it.
-
-## Run it
-
-```bash
-make up        # builds the image and starts the service on :8000
-make health    # shows queue, worker count, extractor, asr
-make smoke     # upload a transcript and watch the progress stream
-make logs
-make down
-```
-
-Local without Docker: `make dev`. OpenAPI docs at http://localhost:8000/docs.
-
-## Processing backends
-
-Default to the lightest option so the image boots with no model and no key.
-
-| Var | Default | Options |
-|---|---|---|
-| `QUEUE_BACKEND` | `memory` | `kafka`, `temporal` (future adapters) |
-| `WORKER_CONCURRENCY` | `2` | sessions processed in parallel |
-| `EXTRACTOR` | `simulated` | `ollama` (local), `claude` (cloud) |
-| `ASR_BACKEND` | `stub` | `faster_whisper` (local), `openai` (cloud) |
-
-## Integration flow
-
-Headers on every request: `X-Tenant-Id`, `X-Workspace-Id`, `X-Device-Id`
-(defaults applied in dev until JWT lands).
-
-Pre-allocated (lets the UI show progress while recording):
+## Project structure
 
 ```
-POST /v1/sessions/start  { title, participants, context, projectId }
-  -> { sessionId, ideaId, status: "recording" }     # 409 if this device is busy
-# client records locally, then on end sends the query parameters with the file:
-POST /v1/sessions/{sessionId}/from-file?title=...&participants=...&projectId=...
-  multipart: file=<recording>
-  -> { sessionId, ideaId, status: "processing" }     # returns immediately
-GET  /v1/sessions/{sessionId}/progress               # SSE: {step, pct, done, error?}
-GET  /v1/sessions/{sessionId}                         # session, idea, processingStatus, jobStatus
+app/
+  local/
+    engine.py              CLI entry point (--wake, --no-auth, --debug-trigger)
+    app.py                 FastAPI application factory
+    voice/
+      host.py              Five-stage cascade, ten session ports
+      barge_in.py          Barge-in detector, HeardReply, interruption_note
+      clause_splitter.py   Clause-level TTS streaming
+      controls.py          Spoken controls (ControlIntent, speed, volume)
+      delegate_lane.py     Background delegation (DelegateLane, TaskStatus)
+      memory.py            Session memory (MemoryStore, 7 extraction patterns)
+      reminder_store.py    Reminders and timers
+      profile_store.py     AssistantProfileStore (thread-safe)
+    routers/
+      assistant.py         GET/PATCH /v1/assistant/profile, GET /v1/assistant/voices
+      wake.py              GET /v1/wake/state, POST /v1/wake/power, POST /v1/wake/trigger
+      meetings.py          /v1/meetings/*
+      live.py              WebSocket /v1/live
+    migrations/            001_init.sql … 019_reminders.sql
+tools/
+  fetch_wake_models.py     Download keyword spotter and OWW models (run once)
+  train_wake_model.py      Train a custom OWW model on synthetic clips
+  wake_synth_clips.py      Synthesize "hey vox" training clips
+  voice_bench/             Latency and WER benchmarking harness
+tests/
+  voice/unit/              301 unit tests (no hardware)
+  voice/room/              ROOM-level hardware verification scenarios (25 owed)
+wheels/                    Tracked voxscribe-core wheel
+results/archive/           Sprint evaluation artifacts
+tools/archive/             Pre-sprint tool scripts
 ```
 
-One-shot (upload at the end, no device claim):
+## Changelog
 
-```
-POST /v1/sessions/from-file?title=...&participants=...&projectId=...
-  multipart: file=<recording>
-  -> { sessionId, ideaId, status: "processing" }
-```
-
-Metadata is accepted as both multipart form fields and query parameters.
-
-## Endpoints
-
-Ideas: `GET /v1/ideas` (status, type, projectId, scoreMin, scoreMax, ownerId,
-hasLineage, search, sortBy, sortDir, page, pageSize), `GET /v1/ideas/{id}`,
-`POST /v1/ideas`, `PATCH /v1/ideas/{id}`, `GET /v1/ideas/next-id`.
-
-Sessions: `POST /v1/sessions/start`, `POST /v1/sessions/from-file`,
-`POST /v1/sessions/{id}/from-file`, `POST /v1/sessions/from-url`,
-`GET /v1/sessions`, `GET /v1/sessions/{id}`, `GET /v1/sessions/{id}/progress`.
-
-Errors return clean JSON `{ error, detail }` with the right status: 409
-`device_busy`, 404 `not_found`, 422 `validation_failed`, 503 `queue_unavailable`,
-500 `internal_error` (no stack trace leaked).
-
-## Storage and limits
-
-SQLite plus uploaded files under `./data` (mounted into the container). Ideas,
-sessions, jobs, and device claims are tenant scoped through a single store
-helper. Backend ids start at `idea-0053` so they do not collide with the client
-seed range.
-
-Single uvicorn worker keeps the in-memory queue and SSE hub correct. Scaling to
-multiple processes is exactly what the Kafka or Temporal adapter is for: move
-the queue and the progress hub onto a shared bus, then run many workers.
+See `CHANGELOG.md`. Current version: **0.9.0** (voice assistant GA, T00-T21).
