@@ -44,7 +44,7 @@ class ControlIntent(Enum):
 # Longer / more specific phrases must come before shorter ones to avoid false substring matches.
 _TRIGGERS: list[tuple[ControlIntent, list[str]]] = [
     (ControlIntent.HOLD, [
-        "hold on", "one moment", "give me a second", "wait",
+        "hold on", "one moment", "give me a second", "wait a moment", "just wait",
     ]),
     (ControlIntent.SLOWER, [
         "slow down", "speak slower", "too fast",
