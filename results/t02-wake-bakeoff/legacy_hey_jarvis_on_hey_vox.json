@@ -1,0 +1,26 @@
+{
+  "wake": {
+    "model": "hey_jarvis_v0.1",
+    "threshold": 0.5,
+    "positive": {
+      "files": 3,
+      "detected": 0,
+      "recall_pct": 0.0,
+      "scores": {
+        "hey_vox_daniel.aiff": 0.0036,
+        "hey_vox_moira.aiff": 0.0048,
+        "hey_vox_samantha.aiff": 0.0005
+      },
+      "min_score": 0.0005,
+      "max_score": 0.0048
+    },
+    "negative": {
+      "files": 73,
+      "detected": 1,
+      "duration_s": 206.1,
+      "fa_per_hour": 17.47,
+      "max_score": 0.9729
+    }
+  },
+  "turn": {}
+}

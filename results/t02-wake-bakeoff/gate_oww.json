@@ -1,0 +1,1254 @@
+{
+  "wake": {
+    "model": "oww:hey_vox",
+    "patience_frames": 2,
+    "stages": "stage1+voice+confirm",
+    "threshold": 0.5,
+    "positive": {
+      "files": 3,
+      "accepted_files": 3,
+      "accepted_events": 3,
+      "candidates": 3,
+      "reasons": {
+        "accepted": 3
+      },
+      "rows": [
+        {
+          "file": "hey_vox_daniel.aiff",
+          "accepted": 1,
+          "candidates": 1,
+          "reasons": [
+            "accepted"
+          ],
+          "peak_score": 0.9955,
+          "speech_ratio": 0.71,
+          "accept_after_clip_end_ms": -140,
+          "duration_s": 0.98
+        },
+        {
+          "file": "hey_vox_moira.aiff",
+          "accepted": 1,
+          "candidates": 1,
+          "reasons": [
+            "accepted"
+          ],
+          "peak_score": 0.9988,
+          "speech_ratio": 0.742,
+          "accept_after_clip_end_ms": -108,
+          "duration_s": 0.95
+        },
+        {
+          "file": "hey_vox_samantha.aiff",
+          "accepted": 1,
+          "candidates": 1,
+          "reasons": [
+            "accepted"
+          ],
+          "peak_score": 0.9894,
+          "speech_ratio": 0.677,
+          "accept_after_clip_end_ms": -141,
+          "duration_s": 0.9
+        }
+      ],
+      "recall_pct": 100.0,
+      "dir": "/Users/deenuy/Documents/Workspace/Projects/voxscribe/ideascribe-app/docs/PRD/fixtures"
+    },
+    "negative": {
+      "files": 73,
+      "accepted_files": 0,
+      "accepted_events": 0,
+      "candidates": 4,
+      "reasons": {
+        "no_match": 2,
+        "patience": 2
+      },
+      "rows": [
+        {
+          "file": "c10_q1.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1215,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.32
+        },
+        {
+          "file": "c11_q1.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0901,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.26
+        },
+        {
+          "file": "c1_q1.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0616,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.32
+        },
+        {
+          "file": "c1_q2.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.2435,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.96
+        },
+        {
+          "file": "c2_t1.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1945,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.37
+        },
+        {
+          "file": "c2_t2.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0512,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.62
+        },
+        {
+          "file": "c2_t3.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1422,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.03
+        },
+        {
+          "file": "c2_t4.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1234,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.07
+        },
+        {
+          "file": "c2_t5.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0637,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.54
+        },
+        {
+          "file": "c3_dictation.wav",
+          "accepted": 0,
+          "candidates": 1,
+          "reasons": [
+            "no_match"
+          ],
+          "peak_score": 0.9796,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 68.17
+        },
+        {
+          "file": "c3_summary_request.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0746,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.6
+        },
+        {
+          "file": "c6_inject_01.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1042,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 3.18
+        },
+        {
+          "file": "c6_inject_02.wav",
+          "accepted": 0,
+          "candidates": 1,
+          "reasons": [
+            "patience"
+          ],
+          "peak_score": 0.6627,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 3.24
+        },
+        {
+          "file": "c6_inject_03.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0786,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 3.46
+        },
+        {
+          "file": "c6_inject_04.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0795,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.58
+        },
+        {
+          "file": "c6_inject_05.wav",
+          "accepted": 0,
+          "candidates": 1,
+          "reasons": [
+            "no_match"
+          ],
+          "peak_score": 0.6335,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 3.31
+        },
+        {
+          "file": "c7_q1.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1133,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.73
+        },
+        {
+          "file": "c7_q2.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1535,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.41
+        },
+        {
+          "file": "c7_q3.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1421,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.33
+        },
+        {
+          "file": "c7_q4.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.08,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.39
+        },
+        {
+          "file": "c7_q5.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1257,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 3.09
+        },
+        {
+          "file": "c9_q1.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1306,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.05
+        },
+        {
+          "file": "l7b_resume_01.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.099,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 3.46
+        },
+        {
+          "file": "l7b_resume_02.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0419,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 3.05
+        },
+        {
+          "file": "l7b_resume_03.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1338,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.26
+        },
+        {
+          "file": "l7b_resume_04.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0696,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.73
+        },
+        {
+          "file": "l7b_resume_05.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1668,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.71
+        },
+        {
+          "file": "l7b_resume_06.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0876,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.41
+        },
+        {
+          "file": "l7b_resume_07.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0528,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.6
+        },
+        {
+          "file": "l7b_resume_08.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0902,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.3
+        },
+        {
+          "file": "l7b_resume_09.wav",
+          "accepted": 0,
+          "candidates": 1,
+          "reasons": [
+            "patience"
+          ],
+          "peak_score": 0.5042,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.43
+        },
+        {
+          "file": "l7b_resume_10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.3177,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.33
+        },
+        {
+          "file": "l_q0.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0454,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.09
+        },
+        {
+          "file": "l_q1.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.152,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.19
+        },
+        {
+          "file": "l_q2.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.3185,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.73
+        },
+        {
+          "file": "l_q3.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0582,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.24
+        },
+        {
+          "file": "l_q4.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1466,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.49
+        },
+        {
+          "file": "l_q5.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0737,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.49
+        },
+        {
+          "file": "l_q6.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1594,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.07
+        },
+        {
+          "file": "l_q7.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1913,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.47
+        },
+        {
+          "file": "l_q8.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0549,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.56
+        },
+        {
+          "file": "l_q9.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0952,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.79
+        },
+        {
+          "file": "t7_back_01.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0668,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.77
+        },
+        {
+          "file": "t7_back_02.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0546,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.62
+        },
+        {
+          "file": "t7_back_03.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0583,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.75
+        },
+        {
+          "file": "t7_back_04.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0467,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.6
+        },
+        {
+          "file": "t7_back_05.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.4321,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.79
+        },
+        {
+          "file": "t7_back_06.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1195,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.68
+        },
+        {
+          "file": "t7_back_07.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0606,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.81
+        },
+        {
+          "file": "t7_back_08.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1525,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.77
+        },
+        {
+          "file": "t7_back_09.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1148,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.96
+        },
+        {
+          "file": "t7_back_10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0718,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.94
+        },
+        {
+          "file": "t7_clear_01.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1766,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.58
+        },
+        {
+          "file": "t7_clear_02.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.204,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.81
+        },
+        {
+          "file": "t7_clear_03.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0575,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.77
+        },
+        {
+          "file": "t7_clear_04.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1678,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.18
+        },
+        {
+          "file": "t7_clear_05.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1048,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.34
+        },
+        {
+          "file": "t7_clear_06.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.2755,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.13
+        },
+        {
+          "file": "t7_clear_07.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.065,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.62
+        },
+        {
+          "file": "t7_clear_08.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1235,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.6
+        },
+        {
+          "file": "t7_clear_09.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.3843,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.03
+        },
+        {
+          "file": "t7_clear_10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1254,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.47
+        },
+        {
+          "file": "t7_filler_01.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1441,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.03
+        },
+        {
+          "file": "t7_filler_02.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.2462,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.22
+        },
+        {
+          "file": "t7_filler_03.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0957,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.15
+        },
+        {
+          "file": "t7_filler_04.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1915,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.62
+        },
+        {
+          "file": "t7_filler_05.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1384,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.11
+        },
+        {
+          "file": "t7_filler_06.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0874,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.41
+        },
+        {
+          "file": "t7_filler_07.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0941,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.92
+        },
+        {
+          "file": "t7_filler_08.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1445,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.24
+        },
+        {
+          "file": "t7_filler_09.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.3263,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 2.6
+        },
+        {
+          "file": "t7_filler_10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1132,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 3.05
+        },
+        {
+          "file": "wake_tts_0.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.3492,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.09
+        }
+      ],
+      "recall_pct": 0.0,
+      "duration_s": 206.1,
+      "fa_per_hour": 0.0,
+      "dir": "/Users/deenuy/Documents/Workspace/Projects/voxscribe/scratch/voicebench/fixtures"
+    },
+    "heldout": {
+      "files": 20,
+      "accepted_files": 5,
+      "accepted_events": 5,
+      "candidates": 8,
+      "reasons": {
+        "patience": 2,
+        "accepted": 5,
+        "no_match": 1
+      },
+      "rows": [
+        {
+          "file": "hey_vox_albert_r0.95.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0611,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.71
+        },
+        {
+          "file": "hey_vox_albert_r1.15.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0546,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.65
+        },
+        {
+          "file": "hey_vox_eddy_r0.95.wav",
+          "accepted": 0,
+          "candidates": 1,
+          "reasons": [
+            "patience"
+          ],
+          "peak_score": 0.6689,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.26
+        },
+        {
+          "file": "hey_vox_eddy_r1.15.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.4534,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.12
+        },
+        {
+          "file": "hey_vox_flo_r0.95.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.2409,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.18
+        },
+        {
+          "file": "hey_vox_flo_r1.15.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.2872,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.05
+        },
+        {
+          "file": "hey_vox_fred_r0.95.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.3336,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.71
+        },
+        {
+          "file": "hey_vox_fred_r1.15.wav",
+          "accepted": 0,
+          "candidates": 1,
+          "reasons": [
+            "patience"
+          ],
+          "peak_score": 0.5788,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.65
+        },
+        {
+          "file": "hey_vox_karen_r0.95.wav",
+          "accepted": 1,
+          "candidates": 1,
+          "reasons": [
+            "accepted"
+          ],
+          "peak_score": 0.9931,
+          "speech_ratio": 0.645,
+          "accept_after_clip_end_ms": 33,
+          "duration_s": 0.89
+        },
+        {
+          "file": "hey_vox_karen_r1.15.wav",
+          "accepted": 1,
+          "candidates": 1,
+          "reasons": [
+            "accepted"
+          ],
+          "peak_score": 0.9142,
+          "speech_ratio": 0.581,
+          "accept_after_clip_end_ms": 43,
+          "duration_s": 0.8
+        },
+        {
+          "file": "hey_vox_kathy_r0.95.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.2336,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.71
+        },
+        {
+          "file": "hey_vox_kathy_r1.15.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.3598,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.65
+        },
+        {
+          "file": "hey_vox_ralph_r0.95.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1644,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.71
+        },
+        {
+          "file": "hey_vox_ralph_r1.15.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.2499,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.65
+        },
+        {
+          "file": "hey_vox_reed_r0.95.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1293,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.18
+        },
+        {
+          "file": "hey_vox_reed_r1.15.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.2642,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.05
+        },
+        {
+          "file": "hey_vox_rishi_r0.95.wav",
+          "accepted": 1,
+          "candidates": 1,
+          "reasons": [
+            "accepted"
+          ],
+          "peak_score": 0.734,
+          "speech_ratio": 0.613,
+          "accept_after_clip_end_ms": 55,
+          "duration_s": 0.86
+        },
+        {
+          "file": "hey_vox_rishi_r1.15.wav",
+          "accepted": 1,
+          "candidates": 1,
+          "reasons": [
+            "accepted"
+          ],
+          "peak_score": 0.9024,
+          "speech_ratio": 0.548,
+          "accept_after_clip_end_ms": -2,
+          "duration_s": 0.76
+        },
+        {
+          "file": "hey_vox_shelley_r0.95.wav",
+          "accepted": 0,
+          "candidates": 1,
+          "reasons": [
+            "no_match"
+          ],
+          "peak_score": 0.9705,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.26
+        },
+        {
+          "file": "hey_vox_shelley_r1.15.wav",
+          "accepted": 1,
+          "candidates": 1,
+          "reasons": [
+            "accepted"
+          ],
+          "peak_score": 0.9546,
+          "speech_ratio": 0.645,
+          "accept_after_clip_end_ms": -280,
+          "duration_s": 1.12
+        }
+      ],
+      "recall_pct": 25.0,
+      "dir": "/Users/deenuy/Documents/Workspace/Projects/voxscribe/scratch/wake/heldout"
+    },
+    "reject": {
+      "files": 20,
+      "accepted_files": 0,
+      "accepted_events": 0,
+      "candidates": 0,
+      "reasons": {},
+      "rows": [
+        {
+          "file": "hey_jarvis_albert_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0744,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.85
+        },
+        {
+          "file": "hey_jarvis_albert_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0879,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.76
+        },
+        {
+          "file": "hey_jarvis_daniel_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1108,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.08
+        },
+        {
+          "file": "hey_jarvis_daniel_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1315,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.01
+        },
+        {
+          "file": "hey_jarvis_eddy_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0974,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.41
+        },
+        {
+          "file": "hey_jarvis_eddy_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0484,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.25
+        },
+        {
+          "file": "hey_jarvis_fred_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1233,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.85
+        },
+        {
+          "file": "hey_jarvis_fred_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0557,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.76
+        },
+        {
+          "file": "hey_jarvis_karen_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0392,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.06
+        },
+        {
+          "file": "hey_jarvis_karen_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0459,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.98
+        },
+        {
+          "file": "hey_jarvis_kathy_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0844,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.85
+        },
+        {
+          "file": "hey_jarvis_kathy_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1201,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.76
+        },
+        {
+          "file": "hey_jarvis_moira_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1278,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.08
+        },
+        {
+          "file": "hey_jarvis_moira_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0746,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.0
+        },
+        {
+          "file": "hey_jarvis_ralph_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0944,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.85
+        },
+        {
+          "file": "hey_jarvis_ralph_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1755,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.76
+        },
+        {
+          "file": "hey_jarvis_rishi_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.075,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.08
+        },
+        {
+          "file": "hey_jarvis_rishi_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1048,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 1.01
+        },
+        {
+          "file": "hey_jarvis_samantha_r0.90.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.1041,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.98
+        },
+        {
+          "file": "hey_jarvis_samantha_r1.10.wav",
+          "accepted": 0,
+          "candidates": 0,
+          "reasons": [],
+          "peak_score": 0.0703,
+          "speech_ratio": null,
+          "accept_after_clip_end_ms": null,
+          "duration_s": 0.9
+        }
+      ],
+      "recall_pct": 0.0,
+      "dir": "/Users/deenuy/Documents/Workspace/Projects/voxscribe/scratch/wake/hey_jarvis"
+    }
+  },
+  "turn": {}
+}

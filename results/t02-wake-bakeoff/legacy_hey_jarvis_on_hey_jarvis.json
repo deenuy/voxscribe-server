@@ -1,0 +1,43 @@
+{
+  "wake": {
+    "model": "hey_jarvis_v0.1",
+    "threshold": 0.5,
+    "positive": {
+      "files": 20,
+      "detected": 14,
+      "recall_pct": 70.0,
+      "scores": {
+        "hey_jarvis_albert_r0.90.wav": 0.0373,
+        "hey_jarvis_albert_r1.10.wav": 0.0212,
+        "hey_jarvis_daniel_r0.90.wav": 0.9754,
+        "hey_jarvis_daniel_r1.10.wav": 0.9043,
+        "hey_jarvis_eddy_r0.90.wav": 0.9974,
+        "hey_jarvis_eddy_r1.10.wav": 0.9989,
+        "hey_jarvis_fred_r0.90.wav": 0.7103,
+        "hey_jarvis_fred_r1.10.wav": 0.4433,
+        "hey_jarvis_karen_r0.90.wav": 0.9956,
+        "hey_jarvis_karen_r1.10.wav": 0.9834,
+        "hey_jarvis_kathy_r0.90.wav": 0.5615,
+        "hey_jarvis_kathy_r1.10.wav": 0.0711,
+        "hey_jarvis_moira_r0.90.wav": 0.9981,
+        "hey_jarvis_moira_r1.10.wav": 0.9982,
+        "hey_jarvis_ralph_r0.90.wav": 0.0154,
+        "hey_jarvis_ralph_r1.10.wav": 0.0123,
+        "hey_jarvis_rishi_r0.90.wav": 0.9377,
+        "hey_jarvis_rishi_r1.10.wav": 0.8646,
+        "hey_jarvis_samantha_r0.90.wav": 0.998,
+        "hey_jarvis_samantha_r1.10.wav": 0.998
+      },
+      "min_score": 0.0123,
+      "max_score": 0.9989
+    },
+    "negative": {
+      "files": 73,
+      "detected": 1,
+      "duration_s": 206.1,
+      "fa_per_hour": 17.47,
+      "max_score": 0.977
+    }
+  },
+  "turn": {}
+}

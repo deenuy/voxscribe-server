@@ -3,7 +3,11 @@
 Enabled with --wake. Owns the mic stream for the lifetime of the process.
 State machine: off → armed → listening → armed.
 
-On trigger the loop:
+While armed, every 80 ms frame goes through the two-stage wake gate (voxscribe.wake.gate):
+detector patience, a voice check, then a recognizer confirm on "hey vox". Each candidate is
+recorded in wake_events, accepted or with its reject reason; only an accepted one goes on.
+
+On an accepted wake the loop:
   1. Records a row in wake_events.
   2. Creates a meeting via store.create_meeting (same call the mic button uses).
   3. Starts the meeting via store.start_meeting (consent captured by arming).
@@ -22,6 +26,7 @@ The CAPTURE / DELIVER / wake_transcript path has been removed.
 
 import asyncio
 import logging
+import os
 import re
 import subprocess
 import time
@@ -29,6 +34,8 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from enum import Enum
+
+from voxscribe.wake.gate import ASR_CONFIRM_PHRASE, FRAME_SAMPLES
 
 log = logging.getLogger("app.local.wake")
 
@@ -38,7 +45,6 @@ _RMS_FLOOR        = 0.005
 _SILENCE_S        = 6.0         # end-of-turn silence in seconds
 _CAP_S            = 300.0       # hard 5-minute cap per session
 _CONSENT_VER      = "wake-v1"
-_DEBOUNCE_S       = 2.0         # min seconds between consecutive triggers
 
 _CHIME_ACK     = "/System/Library/Sounds/Glass.aiff"
 _CHIME_END     = "/System/Library/Sounds/Pop.aiff"
@@ -81,10 +87,16 @@ def _spec_text_changed(pre: str, final: str) -> bool:
     added = [w for w in final_words[len(pre_words):] if w not in _FUNCTION_WORDS]
     return len(added) > 0
 
-_OWW_MODEL_NAME = "hey_jarvis"   # stand-in until owner trains "hey vox" (40 clips needed)
-_OWW_THRESHOLD  = 0.5            # detection threshold; tuned per device on fixture set
-_OWW_CHUNK      = 1280           # 80 ms at 16 kHz — openWakeWord requirement
-_oww_model = None                # loaded once per process
+# Two-stage "hey vox" gate (T02): the detector named by VOXSCRIBE_WAKE_DETECTOR (default the
+# open-vocabulary spotter), then a voice check and a recognizer confirm. Built once per process
+# by app/local/voice/wake_setup.py; the gate itself is voxscribe.wake.gate.
+# What a person must actually say; shown in the UI instead of the configured wake_phrase.
+_TRIGGER_PHRASE = ASR_CONFIRM_PHRASE
+_WAKE_EVENT_PHRASE = _TRIGGER_PHRASE.replace(" ", "_")   # wake_events.phrase, as before T02
+_DETECTOR_NAME = os.environ.get("VOXSCRIBE_WAKE_DETECTOR", "").strip() or "openvocab"
+_TRIGGER_DETECTOR = "trigger"    # wake_events.detector for the debug trigger route
+_CHIME_DECAY_S  = 0.3            # after the acknowledgement chime ends, before capture resumes
+_gate = None                     # WakeGate, built once per process
 
 _SPEC_MIN_WORDS = 4   # don't speculate if the turn is fewer than this many words
 
@@ -151,8 +163,9 @@ class WakeState(str, Enum):
 # Module-level state — written by the loop, read by the router.
 _state: dict = {
     "state": WakeState.OFF,
-    "model": _OWW_MODEL_NAME,
+    "model": _DETECTOR_NAME,       # replaced by the detector's model_name once the gate is built
     "phrase": "hey vox",   # overwritten from VOXSCRIBE_WAKE_PHRASE at arm time
+    "trigger": _TRIGGER_PHRASE,
     "meeting_id": None,    # set for duration of active session, None when armed
 }
 
@@ -203,10 +216,12 @@ async def _inner(app) -> None:
     wake_phrase = getattr(settings, "wake_phrase", "hey vox").lower().strip()
 
     _state["phrase"] = wake_phrase
-    _state["model"]  = _OWW_MODEL_NAME
+    gate = await _get_gate()
+    _state["model"]  = gate.detector.model_name
     set_state(WakeState.ARMED)
-    log.info("[Vox Initialized] armed phrase=%r detector=%s threshold=%.2f — say the phrase to start",
-             wake_phrase, _OWW_MODEL_NAME, _OWW_THRESHOLD)
+    log.info("[Vox Initialized] armed detector=%s patience=%d threshold=%.2f; say %r to start",
+             gate.detector.model_name, gate.detector.patience_frames, gate.config.threshold,
+             _TRIGGER_PHRASE)
     _publish_wake_state(WakeState.ARMED)
 
     # Pre-warm reply model and Kokoro so first wake turn hits resident models.
@@ -250,26 +265,88 @@ async def _inner(app) -> None:
         await _run_with_direct_stream()
 
 
-async def _mic_loop(app, audio_q: asyncio.Queue, wake_phrase: str, np, *, engine) -> None:
-    """openWakeWord keyword detector.
+async def _get_gate():
+    """Build the wake gate once per process; model loading runs off the event loop."""
+    global _gate
+    if _gate is None:
+        from app.local.voice.wake_setup import make_detector, make_gate
 
-    Feeds 80 ms (1280-sample) int16 chunks to the OWW model and triggers a
-    session when the score exceeds _OWW_THRESHOLD. Sub-megabyte model, 0.5 ms
-    inference per chunk — no ASR model runs while armed. Stand-in phrase is
-    hey_jarvis until the owner's 40 "hey vox" clips are recorded and trained.
+        def _build():
+            return make_gate(make_detector(), phrase=_TRIGGER_PHRASE)
+
+        log.info("wake-word-listener: loading wake gate detector=%s", _DETECTOR_NAME)
+        _gate = await asyncio.to_thread(_build)
+        log.info("wake-word-listener: wake gate ready detector=%s", _gate.detector.model_name)
+    return _gate
+
+
+class _PreRollQueue:
+    """A session's audio source: the audio heard after the wake phrase, then live capture.
+
+    Offers the subset of asyncio.Queue that _run_session and _drain use.
     """
-    from openwakeword.model import Model
 
-    global _oww_model
-    if _oww_model is None:
-        log.info("wake-word-listener: loading OWW model=%s", _OWW_MODEL_NAME)
-        _oww_model = await asyncio.to_thread(
-            Model, wakeword_models=[_OWW_MODEL_NAME], inference_framework="onnx"
-        )
-        log.info("wake-word-listener: OWW model loaded")
+    def __init__(self, pre_roll, live: asyncio.Queue, chunk_frames: int) -> None:
+        from collections import deque
+        self._pre = deque(pre_roll[i: i + chunk_frames]
+                          for i in range(0, len(pre_roll), chunk_frames))
+        self._live = live
 
-    chunk_buf: list[float] = []
-    last_trigger_t = 0.0
+    async def get(self):
+        if self._pre:
+            return self._pre.popleft()
+        return await self._live.get()
+
+    def get_nowait(self):
+        if self._pre:
+            return self._pre.popleft()
+        return self._live.get_nowait()
+
+    def empty(self) -> bool:
+        return not self._pre and self._live.empty()
+
+
+def _take_queued(q: asyncio.Queue) -> list:
+    """Everything already queued, in order, without waiting."""
+    out = []
+    while not q.empty():
+        try:
+            out.append(q.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    return out
+
+
+async def _record_wake_event(app, *, score: float, accepted: bool, reject_reason: str | None,
+                             detector: str | None, speech_ratio: float | None,
+                             meeting_id: str | None = None) -> None:
+    """One wake_events row per candidate, accepted or not. Never raises."""
+    now_z = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    try:
+        async with app.state.store.pool.connection() as conn:
+            await conn.execute(
+                "INSERT INTO wake_events (id, phrase, confidence, triggered_at, started_meeting_id, "
+                "accepted, reject_reason, detector, speech_ratio) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (str(uuid.uuid4()), _WAKE_EVENT_PHRASE, float(score), now_z, meeting_id,
+                 accepted, reject_reason, detector, speech_ratio),
+            )
+            await conn.commit()
+    except Exception:
+        log.exception("wake: failed to record wake event accepted=%s", accepted)
+
+
+async def _mic_loop(app, audio_q: asyncio.Queue, wake_phrase: str, np, *, engine) -> None:
+    """Two-stage wake gate over 80 ms frames (T02).
+
+    Stage 1 is the configured WakeDetector with frame patience; stage 2 is a Silero voice check
+    on the last second and a Whisper confirm on the last two seconds (voxscribe.wake.gate).
+    Every candidate is written to wake_events with its score and reject reason. A rejected
+    candidate plays no sound and opens no session. The peak stage 1 score is logged once a
+    minute of audio. No transcript text is logged at any stage.
+    """
+    gate = await _get_gate()
+    frame_buf = np.zeros(0, dtype=np.float32)
 
     while True:
         if _state["state"] == WakeState.OFF:
@@ -292,59 +369,82 @@ async def _mic_loop(app, audio_q: asyncio.Queue, wake_phrase: str, np, *, engine
         if engine is not None and engine.is_playing:
             continue
 
-        # Accumulate samples; OWW requires exactly _OWW_CHUNK int16 samples per call.
-        chunk_buf.extend(chunk.tolist())
+        # The gate scores exact 80 ms frames; capture delivers 32 ms chunks.
+        frame_buf = np.concatenate([frame_buf, chunk.astype(np.float32, copy=False)])
 
-        while len(chunk_buf) >= _OWW_CHUNK:
-            oww_chunk_f = np.array(chunk_buf[:_OWW_CHUNK], dtype=np.float32)
-            chunk_buf   = chunk_buf[_OWW_CHUNK:]
-            oww_i16     = (oww_chunk_f * 32767).clip(-32768, 32767).astype(np.int16)
-            prediction  = await asyncio.to_thread(_oww_model.predict, oww_i16)
-            score       = float(prediction.get(_OWW_MODEL_NAME, 0.0))
+        while frame_buf.shape[0] >= FRAME_SAMPLES:
+            frame, frame_buf = frame_buf[:FRAME_SAMPLES], frame_buf[FRAME_SAMPLES:]
+            # Off the loop: a candidate frame includes the voice check and the confirm pass.
+            decision = await asyncio.to_thread(gate.process, frame)
 
-            if score < _OWW_THRESHOLD:
+            tele = gate.pop_telemetry()
+            if tele is not None:
+                log.info("wake: peak_score=%.3f frames=%d peak_rms=%.4f",
+                         tele.peak_score, tele.frames, tele.peak_rms)
+            if decision is None:
                 continue
 
-            # Debounce: ignore re-triggers within _DEBOUNCE_S of the last one.
-            now = time.monotonic()
-            if now - last_trigger_t < _DEBOUNCE_S:
+            if not decision.accepted:
+                log.info("wake: candidate rejected detector=%s score=%.3f reason=%s speech_ratio=%s",
+                         decision.detector, decision.score, decision.reject_reason,
+                         "n/a" if decision.speech_ratio is None else f"{decision.speech_ratio:.2f}")
+                await _record_wake_event(app, score=decision.score, accepted=False,
+                                         reject_reason=decision.reject_reason,
+                                         detector=decision.detector,
+                                         speech_ratio=decision.speech_ratio)
                 continue
-            last_trigger_t = now
-
-            triggered_ms = int(now * 1000)
-            log.info("wake-word-listener: DETECTED model=%s score=%.3f monotonic_ms=%d",
-                     _OWW_MODEL_NAME, score, triggered_ms)
-            chunk_buf.clear()  # discard stale audio so it cannot re-trigger
 
             # B4.7: ignore trigger while already listening.
             if _state["state"] == WakeState.LISTENING:
                 log.info("wake-word-listener: already LISTENING -- ignored (B4.7)")
                 continue
 
+            log.info("wake-word-listener: DETECTED detector=%s score=%.3f speech_ratio=%s "
+                     "monotonic_ms=%d", decision.detector, decision.score,
+                     "n/a" if decision.speech_ratio is None else f"{decision.speech_ratio:.2f}",
+                     int(time.monotonic() * 1000))
+
+            # Keep "hey vox, how are you" in one breath: the audio after the phrase end, what is
+            # left in the frame buffer, and what queued during the confirm pass are all from
+            # before the chime. Then play the chime and drop everything captured while it played
+            # and decayed, so the chime is never transcribed and never reaches the gate.
+            # (T03 moves cues into the audio engine and mutes them from capture instead.)
+            pre_roll = np.concatenate([decision.pre_roll, frame_buf, *_take_queued(audio_q)])
+            frame_buf = np.zeros(0, dtype=np.float32)
             await _play_chime_async(_CHIME_ACK)
-            chime_done_ms = int(time.monotonic() * 1000)
-            log.info("wake-word-listener: chime latency=%d ms", chime_done_ms - triggered_ms)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(_CHIME_DECAY_S)
             _drain(audio_q)
 
             _publish_wake_state(WakeState.LISTENING)
 
             try:
-                await _run_session(app, audio_q, confidence=score, np=np,
-                                   wake_phrase=wake_phrase)
+                await _run_session(app, _PreRollQueue(pre_roll, audio_q, _CHUNK_FRAMES),
+                                   confidence=decision.score, np=np, wake_phrase=wake_phrase,
+                                   detector=decision.detector,
+                                   speech_ratio=decision.speech_ratio)
             except Exception:
                 log.exception("wake-word-listener: session failed")
                 await _play_chime_async(_CHIME_ERR)
             finally:
                 set_state(WakeState.ARMED)
                 _publish_wake_state(WakeState.ARMED)
-                log.info("[Vox Stopped] back to armed — say 'hey vox' to start a new conversation")
+                log.info("[Vox Stopped] back to armed; say %r to start a new conversation",
+                         _TRIGGER_PHRASE)
                 _drain(audio_q)
+                frame_buf = np.zeros(0, dtype=np.float32)
+                # Detector state, held audio and patience run all predate the session.
+                gate.reset()
 
 
-async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
-                        wake_phrase: str = "hey vox") -> None:
-    """Multi-turn conversation: one meeting, many turns, until stop phrase or idle timeout."""
+async def _run_session(app, audio_q, confidence: float, np,
+                        wake_phrase: str = "hey vox", *, detector: str = _TRIGGER_DETECTOR,
+                        speech_ratio: float | None = None) -> None:
+    """Multi-turn conversation: one meeting, many turns, until stop phrase or idle timeout.
+
+    audio_q is the live capture queue, or a _PreRollQueue that yields the audio heard after the
+    wake phrase first. detector and speech_ratio describe the accepted wake for wake_events; the
+    debug trigger route passes neither.
+    """
     from voxscribe.meeting.live import LiveTranscriber
 
     from app.local import meeting_bus
@@ -393,14 +493,8 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
         )
         await conn.commit()
 
-    event_id = str(uuid.uuid4())
-    async with pool.connection() as conn:
-        await conn.execute(
-            "INSERT INTO wake_events (id, phrase, confidence, triggered_at, started_meeting_id) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (event_id, "hey_vox", float(confidence), now_z, meeting_id),
-        )
-        await conn.commit()
+    await _record_wake_event(app, score=confidence, accepted=True, reject_reason=None,
+                             detector=detector, speech_ratio=speech_ratio, meeting_id=meeting_id)
 
     await store.start_meeting(meeting_id)
     _state["meeting_id"] = meeting_id
@@ -427,6 +521,7 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
                     session_id=meeting_id,
                     vad_mode=getattr(settings, "live_vad_mode", "adaptive"),
                     max_segment_ms=getattr(settings, "live_max_segment_ms", 15000) or None,
+                    partial_update_interval_ms=500,
                 )
 
             # Consumer drains the ring and accumulates stable ASR segments.
@@ -436,7 +531,7 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
             _turn_detector_ref: list = []  # mutable slot filled after TD is created
 
             async def _consumer(ring_t=ring, tr_t=transcriber, tt=_turn_texts,
-                                 td_ref=_turn_detector_ref):
+                                 td_ref=_turn_detector_ref, turn_t=turn_n):
                 while True:
                     frame = await ring_t.pop()
                     if frame is None:
@@ -446,6 +541,10 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
                     src, data = frame[0], frame[1:]
                     try:
                         new_stable = await asyncio.to_thread(tr_t.push_audio, src, data)
+                        for seg in new_stable:
+                            _publish_wake_segment(meeting_id, turn_t, seg)
+                        for seg in tr_t.pop_partials():
+                            _publish_wake_segment(meeting_id, turn_t, seg)
                         for seg in new_stable:
                             db = Segment(id=seg.id, startMs=seg.start_ms, endMs=seg.end_ms,
                                          source=seg.source, speaker=seg.speaker,
@@ -588,6 +687,7 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
                 try:
                     tail = await asyncio.to_thread(transcriber.flush)
                     for seg in tail:
+                        _publish_wake_segment(meeting_id, turn_n, seg)
                         db = Segment(id=seg.id, startMs=seg.start_ms, endMs=seg.end_ms,
                                      source=seg.source, speaker=seg.speaker,
                                      text=seg.text, state=seg.state)
@@ -633,12 +733,16 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
 
             # Await the reply so TTS finishes before we listen for the next turn.
             # (No barge-in: next turn starts only after speech completes.)
+            _publish_wake("wake.reply", {"meetingId": meeting_id, "turn": turn_n,
+                                         "phase": "thinking", "userText": turn_text, "text": ""})
             reply_text = await _run_reply_safe(
                 app, meeting_id, turn_text, _turn_end_ms,
                 asr_final_ms=_asr_final_ms, turn_n=turn_n,
                 history=_history if _history else None,
                 pre_stream=_pre_stream,
             )
+            _publish_wake("wake.reply", {"meetingId": meeting_id, "turn": turn_n,
+                                         "phase": "done", "userText": turn_text, "text": reply_text})
 
             # Append this turn to conversation history for context on next turn.
             if turn_text:
@@ -662,6 +766,25 @@ async def _run_session(app, audio_q: asyncio.Queue, confidence: float, np,
             log.info("wake: finalize scheduled meeting_id=%s turns=%d", meeting_id, turn_n)
         else:
             log.info("wake: session already stopped meeting_id=%s", meeting_id)
+
+
+def _publish_wake(kind: str, data: dict) -> None:
+    # Broadcast like wake_state: the wake loop runs outside any tenant scope, so a scoped event reaches no one.
+    try:
+        from app.local import events
+        events.publish(kind, data, broadcast=True)
+    except Exception:
+        pass
+
+
+def _publish_wake_segment(meeting_id: str, turn: int, seg) -> None:
+    if not seg.text:
+        return
+    _publish_wake("wake.transcript", {
+        "meetingId": meeting_id, "turn": turn,
+        "segment": {"id": seg.id, "text": seg.text, "state": seg.state,
+                    "startMs": seg.start_ms, "endMs": seg.end_ms},
+    })
 
 
 def _publish_wake_state(state: WakeState) -> None:

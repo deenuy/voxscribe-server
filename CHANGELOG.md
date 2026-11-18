@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+- Changed the wake word to "hey vox" behind a two-stage gate: a session starts only when the detector holds the phrase for its patience, at least 30% of the last second is voice, and a short recognizer pass over the last two seconds hears "hey vox". "Hey jarvis" no longer wakes the assistant.
+- Added two wake detectors behind one interface: an open-vocabulary keyword spotter that takes the phrase as plain text (the default) and an openWakeWord model trained on synthetic "hey vox" clips. `VOXSCRIBE_WAKE_DETECTOR=oww` selects the second.
+- Added a row in `wake_events` for every wake candidate, accepted or rejected, with its score, reject reason, detector and voice ratio, and a once-a-minute `wake: peak_score=` log line so missed wakes can be counted.
+- Added `tools/fetch_wake_models.py`, `tools/wake_synth_clips.py` and a working `tools/train_wake_model.py`, and a gate mode in `tools/voice_bench/replay.py` that runs the same gate offline and reports accepts, candidates and reject reasons per fixture set.
+
+### Bug Fixes
+- Fixed the acknowledgement chime being transcribed as the user's first words: the session now starts with the audio heard after the wake phrase and drops what the microphone captured while the chime played.
+- Fixed a rejected or noise-triggered wake playing a chime and opening a session; a rejected candidate is now silent and only recorded.
+
+### Changed
+- Requires voxscribe-core 0.3.0 for the wake gate; the `wake` extra now includes sherpa-onnx, sentencepiece and openwakeword, and a new `train` extra holds the training-only packages.
+
 ## What's New in VoxScribe Server 0.8.0
 
 ### New Features
