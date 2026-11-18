@@ -87,21 +87,21 @@ async def _get_kokoro():
         return await asyncio.to_thread(_load_kokoro_sync)
 
 
-def _kokoro_synth_sync(kokoro, text: str, voice: str):
+def _kokoro_synth_sync(kokoro, text: str, voice: str, speed: float = 1.0):
     """Blocking Kokoro synthesis. Returns (samples_f32, sample_rate)."""
     import numpy as np
-    samples, sr = kokoro.create(text, voice=voice, speed=1.0, lang="en-us")
+    samples, sr = kokoro.create(text, voice=voice, speed=speed, lang="en-us")
     return samples.astype("float32"), sr
 
 
-async def _kokoro_synthesize(text: str, voice: str):
+async def _kokoro_synthesize(text: str, voice: str, speed: float = 1.0):
     """Async Kokoro synthesis. Returns float32 numpy array or None."""
     try:
         k = await _get_kokoro()
         if k is None:
             return None
         samples, sr = await asyncio.wait_for(
-            asyncio.to_thread(_kokoro_synth_sync, k, text, voice),
+            asyncio.to_thread(_kokoro_synth_sync, k, text, voice, speed),
             timeout=_KOKORO_TIMEOUT_S,
         )
         return samples
@@ -113,7 +113,7 @@ async def _kokoro_synthesize(text: str, voice: str):
         return None
 
 
-async def synthesize(text: str, *, voice: str = _KOKORO_VOICE):
+async def synthesize(text: str, *, voice: str = _KOKORO_VOICE, speed: float = 1.0):
     """Synthesize text to float32 mono at _PLAYBACK_RATE_HZ: Kokoro, else macOS say.
 
     Returns None when both fail or the text is blank. Nothing is played.
@@ -127,7 +127,7 @@ async def synthesize(text: str, *, voice: str = _KOKORO_VOICE):
         log.error("tts_engine: numpy required")
         return None
 
-    samples = await _kokoro_synthesize(text, voice)
+    samples = await _kokoro_synthesize(text, voice, speed)
 
     if samples is None:
         log.info("tts_engine: falling back to say voice=%s", _SAY_VOICE)
@@ -155,9 +155,14 @@ async def synthesize_and_play(
     audio_engine,
     *,
     voice: str = _KOKORO_VOICE,
+    speed: float = 1.0,
 ) -> float:
-    """Synthesize text and play through AudioEngine. Returns duration seconds."""
-    samples = await synthesize(text, voice=voice)
+    """Synthesize text and play through AudioEngine. Returns duration seconds.
+
+    voice and speed are read from the profile store in reply_chain.py and passed
+    here on each synthesis call so changes take effect without a restart.
+    """
+    samples = await synthesize(text, voice=voice, speed=speed)
     if samples is None:
         return 0.0
 
@@ -174,6 +179,7 @@ async def synthesize_stream_and_play(
     audio_engine,
     *,
     voice: str = _KOKORO_VOICE,
+    speed: float = 1.0,
 ):
     """Synthesize and play an async iterable of sentences clause-by-clause.
 
@@ -184,7 +190,7 @@ async def synthesize_stream_and_play(
     async for sentence in sentences:
         if not sentence.strip():
             continue
-        duration_s = await synthesize_and_play(sentence, audio_engine, voice=voice)
+        duration_s = await synthesize_and_play(sentence, audio_engine, voice=voice, speed=speed)
         yield sentence, duration_s
 
 
