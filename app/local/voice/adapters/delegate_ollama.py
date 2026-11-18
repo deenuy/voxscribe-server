@@ -2,7 +2,8 @@
 
 `speculate` starts the reply model on the turn's text before the final recognizer flush, so
 token generation overlaps it; the host keeps or cancels it with its drift rule. `reply` routes
-the turn and returns its sentences; the reply stage gates and speaks them.
+the turn and returns its sentences; the reply stage gates and speaks them. After a barge-in the
+host passes `system_note` (voice/barge_in.py), which reaches the reply model's system prompt.
 """
 from __future__ import annotations
 
@@ -45,10 +46,13 @@ class OllamaDelegate:
                                          history=list(history) if history else None))
 
     async def reply(self, turn_text: str, session_id: str, *, turn_id: str | None = None,
-                    history: Sequence[dict] | None = None, speculation=None) -> ReplyStream:
+                    history: Sequence[dict] | None = None, speculation=None,
+                    system_note: str | None = None) -> ReplyStream:
+        """system_note is appended to the system prompt for this turn only (the barge-in note)."""
         src = reply_chain.reply_sentences(
             self._app, session_id, turn_text, turn_id=turn_id,
-            history=list(history) if history else None, pre_stream=speculation)
+            history=list(history) if history else None, pre_stream=speculation,
+            system_note=system_note)
         return ReplyStream(sentences=src.sentences, source=src.source,
                            cue=reply_chain.THINKING_PHRASE if turn_text.strip() else None,
                            lead_in=src.lead_in, fallback=reply_chain.FALLBACK_PHRASE)

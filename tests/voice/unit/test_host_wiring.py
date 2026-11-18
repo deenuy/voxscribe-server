@@ -89,17 +89,35 @@ def test_production_adapters_satisfy_their_ports():
         assert isinstance(adapter, proto), type(adapter).__name__
 
 
+# Host stages split into their own module: they import only stdlib, numpy and the engine, like
+# the host itself, so the host still reaches no server code at import time.
+HOST_STAGE_MODULES = {"app.local.voice.barge_in"}
+
+
+def _top_level_imports(path: Path) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            names.append(node.module or "")
+        elif isinstance(node, ast.Import):
+            names.extend(a.name for a in node.names)
+    return names
+
+
 def test_host_imports_adapters_only_inside_builders():
     """Module level: stdlib, numpy and the engine. Server code only as adapters, lazily."""
     tree = ast.parse(HOST_FILE.read_text(encoding="utf-8"))
-    top = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
-    for node in top:
-        names = [node.module] if isinstance(node, ast.ImportFrom) else [a.name for a in node.names]
-        assert not any(n and n.startswith("app.") for n in names), names
+    for name in _top_level_imports(HOST_FILE):
+        assert not name.startswith("app.") or name in HOST_STAGE_MODULES, name
+    for stage in HOST_STAGE_MODULES:
+        stage_file = HOST_FILE.parent / f"{stage.rsplit('.', 1)[1]}.py"
+        assert not any(n.startswith("app.") for n in _top_level_imports(stage_file)), stage
     lazy = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
-            and n.module and n.module.startswith("app.")]
+            and n.module and n.module.startswith("app.") and n.module not in HOST_STAGE_MODULES]
     assert lazy and all(m.startswith(("app.local.voice.adapters", "app.local.voice.wake_setup",
-                                       "app.local.voice.clause_splitter"))
+                                       "app.local.voice.clause_splitter",
+                                       "app.local.voice.barge_in"))
                         for m in lazy), lazy
 
 

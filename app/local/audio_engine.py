@@ -9,6 +9,9 @@ One instance per process. Owns:
     subtracts what the speaker is playing (WebRTC AEC3) and, when enabled, then suppresses
     stationary noise, before any subscriber sees it
   - an EchoGuard time-based mute, kept behind the canceller as a fallback
+  - interruptible playback (T13): each queued chunk is written in PLAYBACK_SLICE_MS slices, so
+    cancel_playback() silences the speaker at the next slice boundary rather than at the end of
+    the sentence, and a chunk can carry a callback that runs once it has played to its end
 
 Capture path:
     mic chunk -> echo cancellation -> noise suppression (opt-in) -> subscribers
@@ -43,6 +46,10 @@ _CAPTURE_RATE     = 16_000   # Hz; matches faster-whisper and OWW
 _PLAYBACK_RATE    = 24_000   # Hz; Kokoro MLX / Piper output rate
 _CHUNK_FRAMES     = 512      # 32 ms at capture rate
 _PLAYBACK_REF_MS  = 250      # milliseconds of playback kept for the barge-in gate
+# A queued chunk (one sentence) is written in slices of this length. A cancel takes effect at the
+# next slice boundary, and the event loop runs between slices, so capture is read while a long
+# sentence plays (one blocking write of a whole sentence held the loop for its full length).
+PLAYBACK_SLICE_MS = 40
 
 # Capture clean-up (T12). WebRTC's audio processing runs on 10 ms frames.
 _APM_FRAME_MS        = 10
@@ -104,6 +111,10 @@ class EchoGuard:
         mute_until = monotonic_ms() + duration_ms
         if mute_until > self._mute_until_ms:
             self._mute_until_ms = mute_until
+
+    def release(self) -> None:
+        """End the mute now: playback was cancelled, and what the user says next must be heard."""
+        self._mute_until_ms = -1
 
     def observe(self, mic_frame, playback_ref) -> object:
         """Returns ("muted", mic_frame) or ("pass", mic_frame)."""
@@ -167,6 +178,23 @@ class _SampleFifo:
         self._head = 0
         self._size = 0
 
+    def drop_tail(self, n: int) -> int:
+        """Remove up to n of the newest samples. Returns how many were removed."""
+        removed = 0
+        while removed < n and self._chunks:
+            last = self._chunks[-1]
+            avail = last.size - (self._head if len(self._chunks) == 1 else 0)
+            take = min(n - removed, avail)
+            if take == avail:
+                self._chunks.pop()
+                if not self._chunks:
+                    self._head = 0
+            else:
+                self._chunks[-1] = last[: last.size - take]
+            self._size -= take
+            removed += take
+        return removed
+
     def _discard(self, n: int) -> None:
         while n > 0 and self._chunks:
             take = min(n, self._chunks[0].size - self._head)
@@ -192,6 +220,7 @@ class _LinearResampler:
     def __init__(self, np, src_rate: int, dst_rate: int) -> None:
         self._np = np
         self._step = src_rate / dst_rate
+        self.ratio = self._step     # source samples per output sample
         self._t = 0.0       # next output position, in source samples, from the next chunk start
         self._last = 0.0    # last source sample of the previous chunk (position -1)
 
@@ -307,6 +336,19 @@ class AcousticEchoCanceller:
         with self._lock:
             self._far.push(ref)
 
+    def drop_reference(self, playback_samples: int) -> None:
+        """Forget the newest reference audio that will now never play (a cancelled chunk's tail).
+
+        The far-end queue is filled a chunk ahead of the speaker. Left in place after a cancel, the
+        unplayed tail would be treated as playing while the user talks, and the echo suppressor
+        would attenuate the user's voice for that long.
+        """
+        if not self.echo_cancellation or playback_samples <= 0:
+            return
+        n = int(round(playback_samples / self._resample.ratio))
+        with self._lock:
+            self._far.drop_tail(n)
+
     def process_capture(self, pcm_float32):
         """Return the capture chunk with the echo removed and noise suppressed, same length."""
         if self._apm is None:
@@ -345,6 +387,16 @@ class AcousticEchoCanceller:
     def _prime(self) -> None:
         # One frame of lead so a call can always return as many samples as it was given.
         self._out.push(self._np.zeros(self.frame_samples, dtype=self._np.float32))
+
+
+class _QueuedAudio:
+    """A playback chunk and the callback to run once all of it has been written."""
+
+    __slots__ = ("samples", "on_played")
+
+    def __init__(self, samples, on_played) -> None:
+        self.samples = samples
+        self.on_played = on_played
 
 
 class AudioEngine:
@@ -387,6 +439,8 @@ class AudioEngine:
         self._capture_stream                   = None
         self._playback_stream                  = None
         self._playback_task: asyncio.Task | None = None
+        self._writing = False                    # a dequeued chunk is being written
+        self._cancel_gen = 0                     # bumped by cancel_playback()
         self._started = False
         self._capture_cb = None                  # set by start(), reused by reopen_stream()
         self._reopen_lock = asyncio.Lock()
@@ -454,11 +508,18 @@ class AudioEngine:
 
     @property
     def is_playing(self) -> bool:
-        """True while the playback queue has samples or the task is draining."""
-        return not self._playback_q.empty()
+        """True while the playback queue has samples or a chunk is being written."""
+        return self._writing or not self._playback_q.empty()
 
     def cancel_playback(self) -> None:
-        """Discard all queued playback samples (barge-in gate, P1)."""
+        """Discard all queued playback and stop the chunk being written at its next slice.
+
+        Used by barge-in (T13), a gate refusal and a stream reopen. A discarded chunk's
+        on_played callback never runs. With echo cancellation on, the time-based mute is
+        released too: the canceller removes the short tail, and the user's next words must
+        reach the recognizer.
+        """
+        self._cancel_gen += 1
         discarded = 0
         while not self._playback_q.empty():
             try:
@@ -466,15 +527,20 @@ class AudioEngine:
                 discarded += 1
             except asyncio.QueueEmpty:
                 break
-        if discarded:
-            log.info("audio_engine: playback cancelled discarded=%d chunks", discarded)
+        if self._aec is not None and self._aec.echo_cancellation:
+            self._echo_guard.release()
+        if discarded or self._writing:
+            log.info("audio_engine: playback cancelled discarded=%d chunks in_flight=%s",
+                     discarded, self._writing)
 
-    async def play(self, samples, *, block: bool = False) -> None:
+    async def play(self, samples, *, block: bool = False, on_played=None) -> None:
         """Enqueue float32 samples for playback.
 
         samples: any sequence of float32 values at self.playback_rate.
         block=True: wait until the queue has room (streaming TTS path).
         block=False: drop oldest if full (non-critical sounds).
+        on_played: called on the loop once every sample has been written; never for a chunk
+        that is cancelled or dropped. The reply stage uses it to know what the user heard.
         """
         try:
             import numpy as np
@@ -482,15 +548,16 @@ class AudioEngine:
             return
 
         arr = np.asarray(samples, dtype="float32")
+        item = arr if on_played is None else _QueuedAudio(arr, on_played)
         if block:
-            await self._playback_q.put(arr)
+            await self._playback_q.put(item)
         else:
             if self._playback_q.full():
                 try:
                     self._playback_q.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
-            self._playback_q.put_nowait(arr)
+            self._playback_q.put_nowait(item)
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -629,27 +696,57 @@ class AudioEngine:
                 log.warning("audio_engine: error closing %s", name.strip("_"))
 
     async def _playback_loop(self, np) -> None:
+        slice_samples = max(1, self.playback_rate * PLAYBACK_SLICE_MS // 1000)
         try:
             while True:
-                chunk = await self._playback_q.get()
+                item = await self._playback_q.get()
+                if isinstance(item, _QueuedAudio):
+                    chunk, on_played = item.samples, item.on_played
+                else:
+                    chunk, on_played = item, None
                 if self._playback_stream is None:
                     if self._started:
                         continue  # mid-reopen, or a reopen failed: drop the chunk, keep the loop
                     break
-                self._playback_ref.push(chunk.tolist())
-                # Before the write, not after: write() blocks until the chunk is nearly played,
-                # and the canceller must hold the reference before the echo of it is captured.
-                if self._aec is not None:
-                    self._aec.push_reference(chunk)
+                self._writing = True
                 try:
-                    self._playback_stream.write(chunk)
-                    if self._echo_guard_on:
-                        self._echo_guard.notify_playback_end(monotonic_ms())
-                except Exception:
-                    log.exception("audio_engine: playback write error")
+                    if await self._write_chunk(chunk, slice_samples) and on_played is not None:
+                        try:
+                            on_played()
+                        except Exception:
+                            log.exception("audio_engine: on_played callback failed")
+                finally:
+                    self._writing = False
         except asyncio.CancelledError:
             pass
 
+    async def _write_chunk(self, chunk, slice_samples: int) -> bool:
+        """Write one chunk slice by slice. True when all of it was written."""
+        gen = self._cancel_gen
+        self._playback_ref.push(chunk.tolist())
+        # Before the first write, not after: write() blocks until the audio is nearly played,
+        # and the canceller must hold the reference before the echo of it is captured.
+        if self._aec is not None:
+            self._aec.push_reference(chunk)
+        written = 0
+        while written < chunk.size:
+            stream = self._playback_stream
+            if self._cancel_gen != gen or stream is None:
+                break
+            part = chunk[written: written + slice_samples]
+            try:
+                stream.write(part)
+                if self._echo_guard_on:
+                    self._echo_guard.notify_playback_end(monotonic_ms())
+            except Exception:
+                log.exception("audio_engine: playback write error")
+                break
+            written += part.size
+            if written < chunk.size:
+                await asyncio.sleep(0)   # capture callbacks and a cancel run between slices
+        if written < chunk.size and self._aec is not None:
+            self._aec.drop_reference(chunk.size - written)
+        return written >= chunk.size
 
 # ------------------------------------------------------------------
 # helper: device selection by name
