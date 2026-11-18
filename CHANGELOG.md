@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+- Added a capture watchdog that reopens the microphone stream when it stalls, delivers only digital silence, or the default input device changes, and logs clipping, dropouts and mains hum as capture health events.
+- Added quiet hours (`VOXSCRIBE_QUIET_HOURS_ENABLED`, `VOXSCRIBE_QUIET_HOURS_START`, `VOXSCRIBE_QUIET_HOURS_END`, local time): a wake inside the window plays no sound, opens no session and is stored in `wake_events` with `accepted=false` and `reject_reason='quiet_hours'`.
+- Added `POST /v1/wake/power` (`sleep`, `wake`, `lock`, `unlock`) so the app can tell the engine about system sleep; after a wake the microphone is reopened and the wake loop is armed on a live stream.
+
 ## What's New in VoxScribe Server 0.8.0
 
 ### New Features

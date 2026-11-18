@@ -8,8 +8,10 @@ POST /v1/wake/trigger   → DEBUG ONLY (--no-auth). Bypass OWW, start a session 
 """
 
 import asyncio
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
 from app.local import events
 from app.local.wake_loop import WakeState, get_state, set_state
@@ -96,3 +98,22 @@ async def trigger_wake_session(request: Request):
             return {"triggered": True, "state": get_state()["state"].value, "meeting_id": mid}
 
     return {"triggered": True, "state": get_state()["state"].value, "meeting_id": None}
+
+
+class PowerEvent(BaseModel):
+    event: Literal["sleep", "wake", "lock", "unlock"]
+
+
+@router.post("/power", status_code=202)
+async def power_event(body: PowerEvent, request: Request):
+    """Power and session events forwarded by the app (Electron powerMonitor).
+
+    sleep pauses the capture watchdog; wake (or an unlock that follows a missed wake) reopens the
+    microphone stream after a short delay so the wake loop is armed on a live stream. Lock alone
+    changes nothing. Returns handled=False when the engine runs without an audio engine.
+    """
+    watchdog = getattr(request.app.state, "capture_watchdog", None)
+    if watchdog is None:
+        return {"event": body.event, "handled": False}
+    watchdog.on_power(body.event)
+    return {"event": body.event, "handled": True, "sleeping": watchdog.sleeping}

@@ -277,6 +277,8 @@ async def _mic_loop(app, audio_q: asyncio.Queue, wake_phrase: str, np, *, engine
             return
 
         chunk = await audio_q.get()
+        if _capture_reset_pending:
+            _apply_capture_reset(chunk_buf)
         rms = float((chunk ** 2).mean() ** 0.5)
 
         # P1 barge-in: energy-over-echo-estimate gate stops playback.
@@ -310,6 +312,11 @@ async def _mic_loop(app, audio_q: asyncio.Queue, wake_phrase: str, np, *, engine
             if now - last_trigger_t < _DEBOUNCE_S:
                 continue
             last_trigger_t = now
+            # Quiet hours: the wake is recorded as rejected, and nothing is played or opened.
+            if await _rejected_for_quiet_hours(app, score):
+                chunk_buf.clear()
+                _oww_model.reset()  # or the same phrase scores again on the next frames
+                continue
 
             triggered_ms = int(now * 1000)
             log.info("wake-word-listener: DETECTED model=%s score=%.3f monotonic_ms=%d",
@@ -754,3 +761,58 @@ def _drain(q: asyncio.Queue) -> None:
             q.get_nowait()
         except asyncio.QueueEmpty:
             break
+
+
+# ----------------------------------------------------------------------
+# Capture health and quiet hours (T06)
+
+_capture_reset_pending = False   # set by the capture watchdog after it reopened the stream
+
+
+def on_capture_health(event) -> None:
+    """Receive a CaptureHealth event from the capture watchdog (app.local.voice.capture_watchdog).
+
+    After a reopen the wake model still holds features from before the gap, so the next frame the
+    armed loop reads resets it. Every event is also published for the app.
+    """
+    global _capture_reset_pending
+    if event.action == "reopened":
+        _capture_reset_pending = True
+        log.info("wake: capture recovered issue=%s; wake model reset on next frame", event.issue)
+    elif event.action == "reopen_failed":
+        log.warning("wake: capture reopen failed issue=%s; watchdog will retry", event.issue)
+    try:
+        from app.local import events
+        events.publish("capture_health", {"issue": event.issue, "action": event.action,
+                                          "value": event.value}, broadcast=True)
+    except Exception:
+        pass
+
+
+def _apply_capture_reset(chunk_buf: list) -> None:
+    global _capture_reset_pending
+    _capture_reset_pending = False
+    chunk_buf.clear()
+    if _oww_model is not None:
+        _oww_model.reset()
+
+
+async def _rejected_for_quiet_hours(app, confidence: float) -> bool:
+    """True when quiet hours are active; the wake is then stored with accepted=False."""
+    settings = getattr(app.state, "settings", None)
+    quiet = getattr(settings, "quiet_hours", None)
+    if quiet is None or not quiet.active():
+        return False
+    log.info("wake: rejected (quiet hours) score=%.3f", confidence)
+    now_z = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    try:
+        async with app.state.store.pool.connection() as conn:
+            await conn.execute(
+                "INSERT INTO wake_events (id, phrase, confidence, triggered_at, started_meeting_id, "
+                "accepted, reject_reason) VALUES (%s, %s, %s, %s, NULL, FALSE, %s)",
+                (str(uuid.uuid4()), "hey_vox", float(confidence), now_z, "quiet_hours"),
+            )
+            await conn.commit()
+    except Exception:
+        log.exception("wake: failed to record rejected wake")
+    return True

@@ -119,6 +119,9 @@ class AudioEngine:
         self._playback_stream                  = None
         self._playback_task: asyncio.Task | None = None
         self._started = False
+        self._capture_cb = None                  # set by start(), reused by reopen_stream()
+        self._reopen_lock = asyncio.Lock()
+        self.reopen_count = 0
 
     # ------------------------------------------------------------------
     # public: clock
@@ -232,6 +235,60 @@ class AudioEngine:
                 except Exception:
                     pass
 
+        self._capture_cb = _capture_cb
+        self._open_streams(sd)
+
+        self._playback_task = asyncio.create_task(self._playback_loop(np), name="audio-engine-playback")
+        self._started = True
+
+    async def stop(self) -> None:
+        if not self._started:
+            return
+        self._started = False
+        if self._playback_task and not self._playback_task.done():
+            self._playback_task.cancel()
+            try:
+                await self._playback_task
+            except asyncio.CancelledError:
+                pass
+        self._close_streams(abort=False)
+        log.info("audio_engine: stopped")
+
+    async def reopen_stream(self, reason: str = "manual") -> bool:
+        """Close both streams, refresh the device list, and open them again.
+
+        Called by the capture watchdog after a stall, digital silence, an input device change or a
+        system wake. Subscribers keep their queues, so consumers see a gap and nothing else.
+        PortAudio is re-initialised in between, because it reads the device list (and so the
+        default input) only once: without that, a reopen after a device change would reopen the
+        old device. Queued playback is dropped. Runs on the loop thread, like start() and the
+        playback writes, so no write can race the close. Returns True when both streams are open.
+        """
+        if not self._started:
+            return False
+        async with self._reopen_lock:
+            import sounddevice as sd
+
+            self.cancel_playback()
+            self._close_streams(abort=True)
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                log.warning("audio_engine: device list refresh failed; reopening with the old list")
+            try:
+                self._open_streams(sd)
+            except Exception:
+                log.exception("audio_engine: reopen failed reason=%s", reason)
+                return False
+            self.reopen_count += 1
+            log.info("audio_engine: streams reopened reason=%s count=%d", reason, self.reopen_count)
+            return True
+
+    # ------------------------------------------------------------------
+    # internal
+
+    def _open_streams(self, sd) -> None:
         capture_kw = {}
         if self.capture_device is not None:
             capture_kw["device"] = _resolve_device(self.capture_device, kind="input")
@@ -241,7 +298,7 @@ class AudioEngine:
             channels=1,
             dtype="float32",
             blocksize=self.chunk_frames,
-            callback=_capture_cb,
+            callback=self._capture_cb,
             **capture_kw,
         )
         self._capture_stream.start()
@@ -262,37 +319,26 @@ class AudioEngine:
         log.info("audio_engine: playback open device=%r rate=%d",
                  self.playback_device or "default", self.playback_rate)
 
-        self._playback_task = asyncio.create_task(self._playback_loop(np), name="audio-engine-playback")
-        self._started = True
-
-    async def stop(self) -> None:
-        if not self._started:
-            return
-        self._started = False
-        if self._playback_task and not self._playback_task.done():
-            self._playback_task.cancel()
+    def _close_streams(self, *, abort: bool) -> None:
+        # abort() does not wait for pending buffers: a stream whose device went away can hang in stop().
+        for name in ("_capture_stream", "_playback_stream"):
+            stream = getattr(self, name)
+            setattr(self, name, None)
+            if stream is None:
+                continue
             try:
-                await self._playback_task
-            except asyncio.CancelledError:
-                pass
-        if self._capture_stream:
-            self._capture_stream.stop()
-            self._capture_stream.close()
-            self._capture_stream = None
-        if self._playback_stream:
-            self._playback_stream.stop()
-            self._playback_stream.close()
-            self._playback_stream = None
-        log.info("audio_engine: stopped")
-
-    # ------------------------------------------------------------------
-    # internal
+                stream.abort() if abort else stream.stop()
+                stream.close()
+            except Exception:
+                log.warning("audio_engine: error closing %s", name.strip("_"))
 
     async def _playback_loop(self, np) -> None:
         try:
             while True:
                 chunk = await self._playback_q.get()
                 if self._playback_stream is None:
+                    if self._started:
+                        continue  # mid-reopen, or a reopen failed: drop the chunk, keep the loop
                     break
                 self._playback_ref.push(chunk.tolist())
                 try:
