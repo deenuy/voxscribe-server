@@ -3,6 +3,7 @@
 GET  /v1/assistant/profile       -- return the current profile
 PATCH /v1/assistant/profile      -- merge partial update; returns updated profile
 POST /v1/assistant/profile/reset -- revert to startup profile
+GET  /v1/assistant/voices        -- list available Kokoro voice IDs
 
 The profile is stored in app.state.profile_store (AssistantProfileStore).
 Changes take effect on the next turn with no restart.
@@ -17,6 +18,35 @@ from fastapi.responses import JSONResponse
 log = logging.getLogger("app.local.routers.assistant")
 
 router = APIRouter(prefix="/v1/assistant", tags=["assistant"])
+
+# Standard Kokoro voice IDs shipped with the kokoro-onnx model bundle.
+# Format: <language_gender>_<name>  (a=American, b=British; f=female, m=male)
+KNOWN_KOKORO_VOICE_IDS: tuple[str, ...] = (
+    "af_heart",
+    "af_alloy",
+    "af_aoede",
+    "af_bella",
+    "af_jessica",
+    "af_kore",
+    "af_nicole",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_echo",
+    "am_fable",
+    "am_liam",
+    "am_michael",
+    "am_onyx",
+    "am_puck",
+    "bf_alice",
+    "bf_emma",
+    "bf_isabella",
+    "bf_lily",
+    "bm_daniel",
+    "bm_fable",
+    "bm_george",
+    "bm_lewis",
+)
 
 
 def _profile_to_dict(profile) -> dict:
@@ -95,3 +125,13 @@ async def reset_profile(request: Request):
     store = _get_store(request)
     reverted = store.reset()
     return JSONResponse(_profile_to_dict(reverted))
+
+
+@router.get("/voices")
+async def list_voices():
+    """Return the list of available Kokoro voice IDs.
+
+    The list is static: it reflects the voices bundled with the kokoro-onnx model.
+    The first entry is the default voice used when no voice_id is set in the profile.
+    """
+    return JSONResponse({"voices": list(KNOWN_KOKORO_VOICE_IDS)})
