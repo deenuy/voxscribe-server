@@ -46,6 +46,16 @@ def monotonic_ms() -> int:
     return int((time.monotonic() - _EPOCH) * 1000)
 
 
+def _offer_drop_oldest(q: asyncio.Queue, chunk) -> None:
+    # Runs on the loop thread: the full check and the put must not be split across threads.
+    if q.full():
+        try:
+            q.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    q.put_nowait(chunk)
+
+
 class EchoGuard:
     """Time-based mic mute: suppresses mic frames during TTS playback + 500 ms tail.
 
@@ -225,13 +235,8 @@ class AudioEngine:
                 log.debug("capture status: %s", status)
             chunk = indata[:, 0].copy()
             for q in list(self._capture_qs):
-                if q.full():
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
                 try:
-                    loop.call_soon_threadsafe(q.put_nowait, chunk)
+                    loop.call_soon_threadsafe(_offer_drop_oldest, q, chunk)
                 except Exception:
                     pass
 

@@ -27,6 +27,7 @@ async def wake_state(_: Request):
         "state":      v.value if isinstance(v, WakeState) else str(v),
         "model":      s["model"],
         "phrase":     s["phrase"],
+        "trigger":    s.get("trigger"),
         "meeting_id": s.get("meeting_id"),
     }
 
