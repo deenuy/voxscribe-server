@@ -424,9 +424,14 @@ async def create_app(
         import httpx
         settings = app.state.settings
 
-        # Database health
+        # Database health. This route is public and carries no person, so with tenant isolation on there is no
+        # tenant in scope: the check reads only the platform's own schema version, which is system work.
         try:
-            db_ok, schema_version, _ = await store.health_check()
+            if tenancy.current_tenant() is None:
+                with tenancy.system_scope():
+                    db_ok, schema_version, _ = await store.health_check()
+            else:
+                db_ok, schema_version, _ = await store.health_check()
             db_full_name = "postgresql"  # the kind of database, never its name: a name such as a dev database must not reach a screen
         except Exception as exc:
             print(f"health: database check failed: {exc}", file=sys.stderr, flush=True)
