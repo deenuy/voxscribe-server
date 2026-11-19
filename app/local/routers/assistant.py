@@ -1,12 +1,17 @@
 """Assistant profile API.
 
-GET  /v1/assistant/profile       -- return the current profile
+GET  /v1/assistant/profile       -- return the current profile (tenant-aware)
 PATCH /v1/assistant/profile      -- merge partial update; returns updated profile
 POST /v1/assistant/profile/reset -- revert to startup profile
 GET  /v1/assistant/voices        -- list available Kokoro voice IDs
 
-The profile is stored in app.state.profile_store (AssistantProfileStore).
-Changes take effect on the next turn with no restart.
+The profile is persisted in the assistant_profiles table (migration 022), one row per
+tenant schema. app.state.profile_store holds the in-memory cache.
+
+With a database pool in app.state.store the router reads and writes through the DB via the
+scope adapter helpers (voice/adapters/scope.py). Without a pool (unit tests) it falls back
+to the in-memory store. The 422 status codes on validation errors are left as-is (a later
+task aligns all validation errors to 400).
 """
 from __future__ import annotations
 
@@ -50,7 +55,7 @@ KNOWN_KOKORO_VOICE_IDS: tuple[str, ...] = (
 
 
 def _profile_to_dict(profile) -> dict:
-    """Serialize a Profile to a plain dict for JSON responses."""
+    """Serialize a profile view to a plain dict for JSON responses."""
     cfg = profile.assistant
     return {
         "assistant": {
@@ -72,11 +77,31 @@ def _get_store(request: Request):
     return store
 
 
+def _has_pool(request: Request) -> bool:
+    """True when the app has a live database pool (not running in a unit-test minimal app)."""
+    store_obj = getattr(request.app.state, "store", None)
+    return getattr(getattr(store_obj, "pool", None), "connection", None) is not None
+
+
+def _current_tenant(request: Request):
+    """The tenant key for the caller, or None with isolation off."""
+    from app.local import tenancy
+    return tenancy.current_tenant()
+
+
 @router.get("/profile")
 async def get_profile(request: Request):
     """Return the current assistant profile."""
-    store = _get_store(request)
-    return JSONResponse(_profile_to_dict(store.get()))
+    _get_store(request)   # validate store is present
+
+    if _has_pool(request):
+        from app.local.voice.adapters.scope import load_profile_for_request
+        tenant = _current_tenant(request)
+        view = await load_profile_for_request(request.app, tenant)
+    else:
+        store = _get_store(request)
+        view = store.get()
+    return JSONResponse(_profile_to_dict(view))
 
 
 @router.patch("/profile")
@@ -93,7 +118,8 @@ async def patch_profile(request: Request):
     """
     from app.local.voice.profile_store import ProfileValidationError
 
-    store = _get_store(request)
+    _get_store(request)   # validate store is present
+
     try:
         body = await request.json()
     except Exception:
@@ -103,7 +129,13 @@ async def patch_profile(request: Request):
         raise HTTPException(status_code=422, detail="body must be a JSON object")
 
     try:
-        updated = store.patch(body)
+        if _has_pool(request):
+            from app.local.voice.adapters.scope import save_profile_for_request
+            tenant = _current_tenant(request)
+            updated = await save_profile_for_request(request.app, body, tenant)
+        else:
+            store = _get_store(request)
+            updated = store.patch(body)
     except ProfileValidationError as exc:
         return JSONResponse(
             status_code=422,
@@ -122,8 +154,15 @@ async def reset_profile(request: Request):
 
     Returns the reverted profile.
     """
-    store = _get_store(request)
-    reverted = store.reset()
+    _get_store(request)   # validate store is present
+
+    if _has_pool(request):
+        from app.local.voice.adapters.scope import reset_profile_for_request
+        tenant = _current_tenant(request)
+        reverted = await reset_profile_for_request(request.app, tenant)
+    else:
+        store = _get_store(request)
+        reverted = store.reset()
     return JSONResponse(_profile_to_dict(reverted))
 
 
