@@ -8,7 +8,58 @@ from app.local import task_service
 from app.local.errors import EngineError, ProviderUnavailableError
 from tests.test_transcript_edit import meeting_with_segments
 
-TRANSCRIPT = ("We should send the pricing page to legal by Friday.", "Alice will follow up with the vendor about the contract.", "The weather was nice.")
+# Commit 7c053dd added a word-count ceiling to cap the number of tasks the model (or the
+# extractive fake) may draft: transcripts with fewer than 500 words are limited to 1 task.
+# The transcript below exceeds 500 words so the ceiling allows 2 tasks, matching what the
+# test names claim.  The two actionable sentences are the same as before; the rest is
+# neutral meeting-summary filler that does not trigger the commitment-cue regex.
+TRANSCRIPT = (
+    "The quarterly review opened with a summary of team performance from the past three months.",
+    "Revenue came in at four point two million dollars for the period under review.",
+    "The marketing department shared campaign metrics including click-through and conversion rates.",
+    "Customer satisfaction ratings averaged eight point three across all channels surveyed.",
+    "Product analytics showed strong engagement on the core feature set during the period.",
+    "The engineering team gave a retrospective on recent deployments and resolved incidents.",
+    "Infrastructure costs remained stable relative to the previous quarter benchmarks.",
+    "Database query latency improved substantially after recent index and query optimizations.",
+    "Three new enterprise accounts were onboarded successfully in the reviewed timeframe.",
+    "Competitive landscape analysis identified four major players active in the segment.",
+    "Estimated market share sits at approximately eleven to thirteen percent currently.",
+    "Finance reviewed an updated budget forecast that aligns with the annual targets set.",
+    "Headcount additions in customer success improved the overall support coverage ratio.",
+    "Training completion rates across the organization exceeded the quarterly threshold.",
+    "The design team completed two major interface revisions during this quarter period.",
+    "Legal reviewed and cleared the updated terms of service and privacy documentation.",
+    "Security audits returned clean results with no critical or high-severity findings.",
+    "The operations team reported that production uptime exceeded the ninety-nine percent mark.",
+    "Procurement finalized two additional infrastructure agreements with key vendors.",
+    "Board meeting notes from last month were reviewed and formally approved by attendees.",
+    "Process improvements in onboarding reduced average time to first customer value.",
+    "Overall team morale and engagement scores remained at an elevated level this quarter.",
+    "The weather outside was pleasant throughout the entire period of this review.",
+    "Usage data confirmed that the top three features accounted for the majority of sessions.",
+    "The support ticket volume decreased by eight percent compared to the previous quarter.",
+    "Churn rate for the period was below the target at approximately one point four percent.",
+    "Partnerships with two industry organizations were formalized during the quarter.",
+    "The documentation update project reached seventy percent completion ahead of schedule.",
+    "Localization efforts for three additional languages were initiated in this period.",
+    "A post-mortem on the August service disruption confirmed the root cause and remediation.",
+    "The audit committee reviewed all submitted expense reports and found them in order.",
+    "Hiring in the product team resulted in four new engineers and one product manager.",
+    "Customer interviews conducted during the quarter yielded positive qualitative feedback.",
+    "Two patents related to the core technology platform were submitted for review.",
+    "The roadmap for the upcoming six months was presented and acknowledged by stakeholders.",
+    "Accessibility improvements reduced the number of reported interface barriers significantly.",
+    "Mobile performance benchmarks improved after the recent client-side rendering update.",
+    "The annual customer conference planning is in an early stage with venue options identified.",
+    "Key account reviews took place with the top ten customers by annual contract value.",
+    "Integration testing for the enterprise connector passed all acceptance criteria.",
+    "Platform reliability metrics exceeded targets across the reviewed measurement period.",
+    "The team wrapped up the meeting on a positive note with clear priorities for next quarter.",
+    # The two actionable sentences the tests assert on (unchanged):
+    "We should send the pricing page to legal by Friday.",
+    "Alice will follow up with the vendor about the contract.",
+)
 
 
 async def done_scribe(client, texts=TRANSCRIPT, **create):
@@ -145,8 +196,12 @@ class Model:
 
 @pytest.mark.asyncio
 async def test_a_model_reply_is_cleaned_and_a_bad_one_is_an_error_not_an_empty_list():
+    # Commit 7c053dd added a word-count ceiling: a transcript < 500 words allows only 1 task.
+    # lines must have >= 500 words so the ceiling is 2, letting "Email Sam" and "Book room"
+    # both survive cleaning (the duplicate "email sam" and the blank entry must still be dropped).
+    _long_lines = ["word"] * 500
     ok = Model('```json\n{"tasks":[{"title":"Email Sam."},{"title":"email sam"},{"title":""},{"nope":1},{"title":"Book room","detail":"Third floor"}]}\n```')
-    drafts = await task_service.draft_tasks(ok, lines=["x"], project={"name": "Launch", "description": "Q4 plan"}, fake=False)
+    drafts = await task_service.draft_tasks(ok, lines=_long_lines, project={"name": "Launch", "description": "Q4 plan"}, fake=False)
     assert drafts == [{"title": "Email Sam", "detail": None, "owner": None, "dueDate": None}, {"title": "Book room", "detail": "Third floor", "owner": None, "dueDate": None}]
     assert "Launch" in ok.prompt and "Q4 plan" in ok.prompt  # the project is context for the model
 
@@ -175,7 +230,10 @@ def test_the_list_is_capped_and_titles_are_bounded():
 async def test_owner_and_due_date_from_the_model_are_kept_only_when_they_are_real():
     reply = '{"tasks":[{"title":"Send deck","owner":"Alice","dueDate":"2026-10-16"},{"title":"Call vendor","owner":"  ","dueDate":"Friday"},{"title":"Pay invoice","dueDate":"2026-02-30"}]}'
     model = Model(reply)
-    drafts = await task_service.draft_tasks(model, lines=["x"], labelled=["Alice: x"], project=None, held_on="2026-10-11", fake=False)
+    # Three tasks need ceiling >= 3, which requires >= 1500 words (commit 7c053dd).
+    # The labelled list must still contain "Alice: x" for the prompt assertion below.
+    _long_labelled = ["Alice: x"] + ["context"] * 1499
+    drafts = await task_service.draft_tasks(model, lines=["x"], labelled=_long_labelled, project=None, held_on="2026-10-11", fake=False)
     assert drafts[0]["owner"] == "Alice" and drafts[0]["dueDate"] == "2026-10-16"
     assert drafts[1]["owner"] is None and drafts[1]["dueDate"] is None  # "Friday" is not a date
     assert drafts[2]["dueDate"] is None  # no such day
