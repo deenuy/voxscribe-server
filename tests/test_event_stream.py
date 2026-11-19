@@ -8,7 +8,7 @@ import ast
 import asyncio
 import json
 import re
-from contextlib import nullcontext
+from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 
 import pytest
@@ -150,6 +150,58 @@ async def test_streams_past_the_bound_are_let_go_and_their_ids_then_reset():
     with tenancy.tenant_scope(keys[0]):
         async with events.subscribe(ids[keys[0]]) as sub:
             assert (await _read(sub, 1))[0].type == "stream.reset"
+
+
+@pytest.mark.parametrize("bound", [1, 2, 3])
+async def test_a_new_tenant_can_subscribe_when_every_kept_stream_has_a_subscriber(bound):
+    """At the bound with nothing idle to let go, the stream being made is not the one trimmed
+    (it has no subscriber yet): the subscription works, on every retry, and receives events."""
+    events.configure(max_streams=bound)
+    held = [tenancy.tenant_key(f"pl33-held-{i}") for i in range(bound)]
+    newcomer = tenancy.tenant_key("pl33-newcomer")
+    async with AsyncExitStack() as stack:
+        for key in held:
+            with tenancy.tenant_scope(key):
+                await stack.enter_async_context(events.subscribe())
+        for attempt in range(2):
+            with tenancy.tenant_scope(newcomer):
+                async with events.subscribe() as sub:
+                    assert events._streams[newcomer] is sub.stream
+                    _publish(newcomer, 1, start=attempt)
+                    assert _job_ids(await _read(sub, 1)) == [f"j{attempt}"]
+        assert set(held) <= set(events._streams)       # nobody listening was let go for it
+    # Once they are idle again, the next stream made brings the count back to the bound.
+    another = tenancy.tenant_key("pl33-another")
+    with tenancy.tenant_scope(another):
+        async with events.subscribe():
+            assert len(events._streams) == bound and another in events._streams
+
+
+async def test_at_a_bound_of_one_an_idle_stream_makes_way_for_the_one_being_made():
+    events.configure(max_streams=1)
+    with tenancy.tenant_scope(A):
+        async with events.subscribe():
+            pass
+    with tenancy.tenant_scope(B):
+        async with events.subscribe() as sub:
+            assert list(events._streams) == [B] and events._streams[B] is sub.stream
+
+
+async def test_a_dropped_stream_keeps_nothing_and_tells_whoever_is_still_connected():
+    with tenancy.tenant_scope(A):
+        async with events.subscribe() as sub:
+            _publish(A, 3)
+            (first,) = await _read(sub, 1)
+            assert events.drop_stream(A) is True and A not in events._streams
+            last = await asyncio.wait_for(sub.next(), 1)        # the two unread events are gone
+            assert last.type == "stream.reset" and last.data["lastEventId"] == first.id
+            event_schema.validate(last.type, last.data)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(sub.next(), 0.1)
+        _publish(A, 1, start=3)                                  # no stream: not kept
+        async with events.subscribe(first.id) as again:          # a new stream, a new epoch
+            assert (await _read(again, 1))[0].data["reason"] == "unknown_id"
+    assert events.drop_stream(B) is False
 
 
 async def test_an_event_for_a_tenant_with_no_stream_is_not_kept():

@@ -156,19 +156,39 @@ def _stream(tenant: str | None, *, create: bool) -> _Stream | None:
     if stream is None:
         if not create:
             return None
+        _let_go_idle(room_for=1)        # before it is added: it has no subscriber yet either
         stream = _streams[tenant] = _Stream(_replay_buffer)
-        _let_go_idle()
     _streams.move_to_end(tenant)
     return stream
 
 
-def _let_go_idle() -> None:
-    """Past the bound, forget the least recently used streams that nobody is subscribed to."""
-    excess = len(_streams) - _max_streams
+def _let_go_idle(room_for: int = 0) -> None:
+    """Past the bound, forget the least recently used streams that nobody is subscribed to.
+
+    `room_for` is the number of streams about to be added. A stream somebody is subscribed to is
+    never let go, so with every kept stream in use the count passes the bound until one is idle."""
+    excess = len(_streams) + room_for - _max_streams
     if excess <= 0:
         return
     for tenant in [t for t, s in _streams.items() if not s.subscribers][:excess]:
         del _streams[tenant]
+
+
+def drop_stream(tenant: str | None) -> bool:
+    """Forget a tenant's stream and every event it holds (the tenant's data was erased). True
+    when there was one.
+
+    An id it issued is answered with a reset from then on, as for a stream that was let go. A
+    subscriber still connected loses what it had not read yet, is handed one last
+    `stream.reset`, and receives nothing after it: the client reloads and subscribes again."""
+    stream = _streams.pop(tenant, None)
+    if stream is None:
+        return False
+    stream.buffer.clear()
+    for sub in list(stream.subscribers):
+        sub.end()
+    stream.subscribers.clear()
+    return True
 
 
 def publish(event_type: str, data: Any, *, broadcast: bool = False,
@@ -211,6 +231,14 @@ class Subscription(asyncio.Queue):
             except asyncio.QueueEmpty:
                 pass
         self.put_nowait(event)
+
+    def end(self) -> None:
+        """The stream was dropped: forget what is queued and hand out a reset as the last event."""
+        reset = self.stream.reset("gap", self.stream.id_for(self.last), at=self.last + 1)
+        self.pending.clear()
+        while not self.empty():
+            self.get_nowait()
+        self.put_nowait(reset)
 
     def resume(self, last_event_id: str) -> None:
         """Start from the event after `last_event_id`: replay what was missed, or a reset."""
