@@ -133,12 +133,16 @@ async def _delete_profile_row(conn) -> None:
     await conn.execute("DELETE FROM assistant_profiles")
 
 
-def _row_to_config(row, startup) -> "tuple[AssistantConfig, int]":
-    """Convert a DB row to (AssistantConfig, revision). Falls back to startup defaults."""
-    from app.local.voice.profile_store import AssistantConfig
+def _row_to_config(row, startup, product_profile=None) -> "tuple[AssistantConfig, int]":
+    """Convert a DB row to (AssistantConfig, revision). Falls back to startup defaults.
+
+    This is where a stored row becomes a config, so the product clamp and the speed range run
+    here: whatever the row holds (written under another product mode, or by hand), what a
+    session or a response gets from it is inside the loaded product's limits."""
+    from app.local.voice.profile_store import AssistantConfig, apply_product_clamp
 
     if row is None:
-        return (copy.deepcopy(startup), 0)
+        return (apply_product_clamp(copy.deepcopy(startup), product_profile), 0)
 
     name, wake_phrase, end_phrases_str, voice_id, speed, system_prompt, persona_label, revision = row
     cfg = AssistantConfig(
@@ -150,7 +154,7 @@ def _row_to_config(row, startup) -> "tuple[AssistantConfig, int]":
         system_prompt=system_prompt or "",
         persona_label=persona_label or "assistant",
     )
-    return (cfg, int(revision))
+    return (apply_product_clamp(cfg, product_profile), int(revision))
 
 
 async def load_profile_for_request(app, tenant: str | None):
@@ -179,7 +183,7 @@ async def load_profile_for_request(app, tenant: str | None):
         async with pool.connection() as conn:
             row = await _load_profile_row(conn)
 
-    cfg, revision = _row_to_config(row, store.startup)
+    cfg, revision = _row_to_config(row, store.startup, getattr(app.state, "profile", None))
     store.set_config(tenant, cfg, revision)
     return _ProfileView(copy.deepcopy(cfg))
 
@@ -187,8 +191,8 @@ async def load_profile_for_request(app, tenant: str | None):
 async def save_profile_for_request(app, partial: dict, tenant: str | None):
     """Validate and persist a profile patch; update the cache; return the updated view.
 
-    Does not enforce product-profile limits here: the store's patch() method applies the
-    clamp before we receive the validated config.
+    Product-profile limits: the row is clamped as it is loaded (_row_to_config) and the store's
+    patch() applies the clamp again to the merged config before it is written.
     """
     from app.local.voice.profile_store import ProfileValidationError, _ProfileView
 
@@ -296,7 +300,8 @@ class TenantSessionScope(SessionScope):
             async with pool.connection() as conn:
                 row = await _load_profile_row(conn)
 
-        cfg, revision = _row_to_config(row, store.startup)
+        cfg, revision = _row_to_config(row, store.startup,
+                                       getattr(self._app.state, "profile", None))
         store.set_config(tenant, cfg, revision)
         return (cfg.voice_id, cfg.speed, revision)
 

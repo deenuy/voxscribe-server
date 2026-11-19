@@ -9,16 +9,24 @@ Sync API (get / patch / reset) is preserved for unit tests that run without a da
 The tenant argument selects whose profile is in scope; None means the single shared profile
 used when isolation is off.
 
-Product-profile limits enforced here (applied on every patch):
+Limits enforced here (apply_product_clamp), on every patch and wherever a stored row becomes a
+config (scope._row_to_config), so a row written under another product mode, or by hand, cannot
+loosen one:
   - In senior_care or classroom mode, voice_id must be a known local voice or empty.
     A voice_id that is not in the known local set is considered a cloud voice and is
     silently clamped to an empty string.
+  - In senior_care or classroom mode, system_prompt is clamped to an empty string: the
+    product's prompt is the only one, and a tenant's text never joins it.
+  - In every mode, speed is brought inside [_SPEED_MIN, _SPEED_MAX] (a patch outside the range
+    is refused before it gets here; a stored value is clamped).
 No log line names or wake phrases together with a tenant key.
 """
 from __future__ import annotations
 
 import copy
+import dataclasses
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 
@@ -87,19 +95,30 @@ def _defaults_from_product_profile(product_profile) -> AssistantConfig:
     return cfg
 
 
-def _apply_product_clamp(config: AssistantConfig, product_profile) -> AssistantConfig:
-    """Enforce product-profile limits that a tenant cannot override.
+def _speed_in_range(speed: float) -> float:
+    if not math.isfinite(speed):
+        return AssistantConfig.speed
+    return min(max(speed, _SPEED_MIN), _SPEED_MAX)
 
-    Currently: in senior_care or classroom mode a voice_id that is not a known
-    local Kokoro voice is silently clamped to empty string (no cloud voices).
+
+def apply_product_clamp(config: AssistantConfig, product_profile) -> AssistantConfig:
+    """Enforce the limits a tenant's stored or patched values cannot override.
+
+    In senior_care or classroom mode a voice_id that is not a known local Kokoro voice is
+    silently clamped to an empty string (no cloud voices), and so is any system_prompt (no
+    tenant text in the reply prompt). In every mode the speed is brought inside the range.
     """
-    if product_profile is None:
-        return config
     mode = getattr(product_profile, "mode", "") or ""
-    if mode in _RESTRICTED_MODES and config.voice_id and config.voice_id not in _LOCAL_VOICE_IDS:
-        config = copy.copy(config)
-        config.voice_id = ""
-    return config
+    restricted = mode in _RESTRICTED_MODES
+    voice_id, system_prompt = config.voice_id, config.system_prompt
+    if restricted and voice_id not in _LOCAL_VOICE_IDS:
+        voice_id = ""
+    if restricted:
+        system_prompt = ""
+    speed = _speed_in_range(config.speed)
+    if (voice_id, system_prompt, speed) == (config.voice_id, config.system_prompt, config.speed):
+        return config
+    return dataclasses.replace(config, voice_id=voice_id, system_prompt=system_prompt, speed=speed)
 
 
 def _apply_patch(base: AssistantConfig, partial: dict) -> AssistantConfig:
@@ -202,7 +221,7 @@ class AssistantProfileStore:
         with self._lock:
             base = self._configs.get(tenant, self._startup)
             cfg = _apply_patch(base, partial)
-            cfg = _apply_product_clamp(cfg, effective_profile)
+            cfg = apply_product_clamp(cfg, effective_profile)
             self._configs[tenant] = cfg
             self._revisions[tenant] = self._revisions.get(tenant, 0) + 1
             return _ProfileView(copy.deepcopy(cfg))
