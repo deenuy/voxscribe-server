@@ -1261,6 +1261,72 @@
         "title": "ProviderStatus",
         "type": "object"
       },
+      "ReminderItem": {
+        "properties": {
+          "dueAt": {
+            "title": "Dueat",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "reminder",
+              "timer"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "scheduled",
+              "fired",
+              "missed",
+              "cancelled"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "text",
+          "dueAt",
+          "state"
+        ],
+        "title": "ReminderItem",
+        "type": "object"
+      },
+      "ReminderList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ReminderItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "ReminderList",
+        "type": "object"
+      },
       "SendMessageRequest": {
         "properties": {
           "text": {
@@ -5266,6 +5332,62 @@
         "summary": "Create Feature",
         "tags": [
           "ideas"
+        ]
+      }
+    },
+    "/v1/reminders": {
+      "get": {
+        "operationId": "list_reminders_v1_reminders_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReminderList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Reminders",
+        "tags": [
+          "reminders"
+        ]
+      }
+    },
+    "/v1/reminders/{reminder_id}": {
+      "delete": {
+        "operationId": "cancel_reminder_v1_reminders__reminder_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "reminder_id",
+            "required": true,
+            "schema": {
+              "title": "Reminder Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Reminder",
+        "tags": [
+          "reminders"
         ]
       }
     },

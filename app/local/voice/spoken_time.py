@@ -2,7 +2,7 @@
 
 Pure: no model, no database, no route, no logging of what was said, and no hidden clock. Every
 function that needs the time takes `now` (an aware datetime) and `tz` (a tzinfo such as
-`ZoneInfo("America/Toronto")`). A later task wires this into reminders and timers (PL45) and the
+`ZoneInfo("America/Toronto")`). Reminders and timers use it (voice/reminder_dialog.py, PL45); the
 calendar answers (PL48).
 
 Public entry points
@@ -15,6 +15,9 @@ Public entry points
     read_back_reminder(value, subject) / announce_timer(value)   the scripted lines
     reminder_subject(remainder)       "remind me to call the dentist" -> Subject
     propose / reply / silence         the read-back state machine of design section 2.5
+    classify_reply(text)              yes, no or neither, for a question that holds no time
+    say_moment / say_clock            a stored moment in words (lists, due and missed lines)
+    timer_length(d) / is_recurring    "ten minute" before "timer"; "every day at eight"
 
 A TimeParse holds either a validated SpokenTime or a Refusal with its reason code, plus the
 character spans of the time expression and the remainder of the text with those spans removed,
@@ -1685,13 +1688,18 @@ def _is_yes(text: str, norm: str) -> bool:
     return said and all(w in _YES_VOCABULARY for w in norm.split())
 
 
-def reply(proposal: Proposal, text: str, *, at: datetime) -> Proposal:
+def reply(proposal: Proposal, text: str, *, at: datetime,
+          waited: timedelta | None = None) -> Proposal:
     """The person's next turn after the read-back. Yes confirms; no declines; a corrected time
     ("no, eight") reads back again; silence past the window or an unrelated turn declines, and
-    the unrelated turn is answered normally."""
+    the unrelated turn is answered normally.
+
+    `waited` is the silence the caller measured between the end of the read-back and the start
+    of the reply, when it knows it (a voice host does). Without it the silence is taken to be
+    `at - asked_at`, which also counts the read-back's own playback and the reply's length."""
     if proposal.state is not ConfirmState.PENDING:
         raise ValueError("the proposal is no longer waiting for a reply")
-    if at - proposal.asked_at > READBACK_WINDOW:
+    if (at - proposal.asked_at if waited is None else waited) > READBACK_WINDOW:
         return replace(proposal, state=ConfirmState.DECLINED, last_reply=ReplyKind.SILENCE,
                        answer_normally=bool(_norm(text)))
     corrected = correct(proposal.when, text, now=at)
@@ -1722,11 +1730,73 @@ def silence(proposal: Proposal, *, at: datetime, window: timedelta = READBACK_WI
     return replace(proposal, state=ConfirmState.DECLINED, last_reply=ReplyKind.SILENCE)
 
 
+def classify_reply(text: str) -> tuple[ReplyKind, bool]:
+    """A reply to a question that holds no time (cancel this reminder?): (YES, NO or UNRELATED,
+    whether the turn carries more than the answer and is to be answered normally). Uses the
+    same yes and no words as reply()."""
+    norm = _norm(text)
+    no, more = _is_no(norm)
+    if no:
+        return ReplyKind.NO, more
+    if _is_yes(text, norm):
+        return ReplyKind.YES, False
+    return ReplyKind.UNRELATED, True
+
+
+def is_recurring(text: str) -> bool:
+    """True when the words ask for a repeating time ("every day at eight", "daily at noon").
+    The parsers refuse those as not understood; this lets a caller say why."""
+    return _recurring(_tokenize(text))
+
+
+def timer_length(d: timedelta) -> str:
+    """A timer's length as the noun before "timer": "ten minute", "one hour", "ninety second".
+    Whole hours, else whole minutes, else seconds."""
+    total = int(d.total_seconds())
+    if total <= 0 or total != d.total_seconds():
+        raise ValueError("a timer length must be a positive whole number of seconds")
+    if total % 3600 == 0:
+        n, unit = total // 3600, "hour"
+    elif total % 60 == 0:
+        n, unit = total // 60, "minute"
+    else:
+        n, unit = total, "second"
+    return f"{number_words(n)} {unit}"
+
+
+def say_moment(instant: datetime, *, now: datetime, tz: tzinfo) -> str:
+    """A stored moment in words, for a list, a cancel question or a missed reminder: "today at
+    three in the afternoon", "yesterday at noon", "tomorrow at midnight", "on Friday the
+    twenty-first at eight in the morning". Unlike say_when() it takes any aware instant (one read
+    back from the store, already validated when it was set) and may be in the past."""
+    _check_now(now, tz)
+    if not isinstance(instant, datetime) or instant.utcoffset() is None:
+        raise ValueError("instant must be an aware datetime")
+    local = instant.astimezone(tz)
+    today = now.astimezone(tz).date()
+    d = local.date()
+    day = "yesterday" if (d - today).days == -1 else _say_day(d, today)
+    if (local.hour, local.minute) == (0, 0):
+        return f"{day} at midnight"
+    return f"{day} at {_say_clock(local.hour, local.minute)}"
+
+
+def say_clock(instant: datetime, *, tz: tzinfo) -> str:
+    """The time of day alone, in words: "eight in the evening", "noon", "midnight"."""
+    if not isinstance(instant, datetime) or instant.utcoffset() is None:
+        raise ValueError("instant must be an aware datetime")
+    local = instant.astimezone(tz)
+    if (local.hour, local.minute) == (0, 0):
+        return "midnight"
+    return _say_clock(local.hour, local.minute)
+
+
 __all__ = [
     "ANNOUNCE_TIMER", "BARE_MINUTES_MAX", "EARLY_HOURS_END", "MAX_REMINDER_AHEAD",
     "MAX_SUBJECT_CHARS", "MAX_TIMER_DURATION", "READBACK_WINDOW", "READ_BACK_REMINDER",
     "Ambiguity", "ConfirmState", "Correction", "DayRange", "Kind", "Proposal", "Refusal",
-    "ReplyKind", "SpokenTime", "Subject", "TimeParse", "announce_timer", "correct",
-    "number_words", "parse_day_range", "parse_duration", "parse_when", "propose",
-    "read_back_reminder", "reminder_subject", "reply", "say_duration", "say_when", "silence",
+    "ReplyKind", "SpokenTime", "Subject", "TimeParse", "announce_timer", "classify_reply",
+    "correct", "is_recurring", "number_words", "parse_day_range", "parse_duration",
+    "parse_when", "propose", "read_back_reminder", "reminder_subject", "reply", "say_duration",
+    "say_clock", "say_moment", "say_when", "silence", "timer_length",
 ]

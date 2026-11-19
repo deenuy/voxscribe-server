@@ -128,9 +128,16 @@ TRIGGER_POLL_TRIES = 20
 MUTE_HOLD_S = 300.0             # a muted session is not ended by the idle timeout for this long
 END_WAIT_S = 2.0                # end_session() waits at most this long for the session to close
 END_POLL_S = 0.02
+# Lines the device says on its own (a reminder or timer that came due, PL46): it waits for the
+# room to be this quiet first, polling at INITIATED_POLL_S, for at most INITIATED_HOLD_S; past
+# that it says nothing and the item is a notification, spoken at the next session.
+INITIATED_QUIET_S = 1.0
+INITIATED_POLL_S = 0.1
+INITIATED_HOLD_S = 30.0
 INT16_SCALE = 32767
 
 CHIME_ACK = "/System/Library/Sounds/Glass.aiff"
+CHIME_DUE = "/System/Library/Sounds/Ping.aiff"     # before a reminder or timer that came due
 CHIME_END = "/System/Library/Sounds/Pop.aiff"
 CHIME_ERR = "/System/Library/Sounds/Basso.aiff"
 
@@ -238,14 +245,25 @@ def partial_drift(previous: str, latest: str) -> float:
     return row[-1] / len(ref)
 
 
+# One-word answers that count as speech when the assistant has just asked a question (a
+# read-back's "Shall I set it?"): a plain "yes" must not end the session.
+SHORT_ANSWERS = frozenset({"yes", "yeah", "yep", "yup", "sure", "okay", "ok", "correct",
+                           "right", "no", "nope", "nah"})
+
+
 def is_genuine_speech(text: str, audio_duration_ms: int,
-                      no_speech_prob: float | None = None) -> bool:
+                      no_speech_prob: float | None = None, *,
+                      short_answer: bool = False) -> bool:
     """False for a chime transcript, fewer than MIN_REPLY_WORDS words, under MIN_AUDIO_MS of
-    unmuted audio, or a final decode Whisper itself scores as not speech."""
+    unmuted audio, or a final decode Whisper itself scores as not speech. With `short_answer`
+    (a question is waiting for its answer) one word of SHORT_ANSWERS is enough."""
     stripped = text.strip()
     if stripped.lower().rstrip(".!?,;:") in CHIME_TRANSCRIPTS:
         return False
-    if len(stripped.split()) < MIN_REPLY_WORDS:
+    words = stripped.split()
+    one_word_answer = (short_answer and len(words) == 1
+                       and words[0].lower().strip(".!?,;:") in SHORT_ANSWERS)
+    if len(words) < MIN_REPLY_WORDS and not one_word_answer:
         return False
     if audio_duration_ms < MIN_AUDIO_MS:
         return False
@@ -290,8 +308,9 @@ class QuietHours:
         self._start = datetime.time(sh, sm)
         self._end = datetime.time(eh, em)
 
-    def active(self) -> bool:
-        now = datetime.datetime.now().time().replace(second=0, microsecond=0)
+    def active(self, now: datetime.datetime | None = None) -> bool:
+        """Inside the window at `now` (its wall-clock time; the local clock when omitted)."""
+        now = (now or datetime.datetime.now()).time().replace(second=0, microsecond=0)
         s, e = self._start, self._end
         if s <= e:
             return s <= now < e
@@ -722,6 +741,11 @@ class SessionContext:
     seq: int = 0                   # sequence number of the last event the session published
     stop_requested: bool = False   # End from the app: the session closes at its next step
     muted_until: float | None = None    # Mute from the app: monotonic end of the hold, None unmuted
+    # The silence before a turn, for a read-back's window (voice/reminder_dialog.py): when the
+    # turn's capture was first unmuted (the last reply and its echo tail were over) and when
+    # the person's speech began, in seconds on the ports' mono clock.
+    reply_ended_mono: float | None = None
+    speech_onset_mono: float | None = None
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     @property
@@ -804,8 +828,39 @@ class ReplyResult:
     pre_roll: np.ndarray | None = None
 
 
+@dataclass(frozen=True)
+class Initiated:
+    """A line the device says without being asked: a reminder or timer that came due (PL46).
+    `line` is said if the gate passes it; otherwise `neutral` (the due time only), if that
+    passes; otherwise nothing. `tenant` is whose item it is: only their device says it."""
+
+    item_id: str
+    tenant: str | None
+    line: str
+    neutral: str | None = None
+
+
+@dataclass(frozen=True)
+class InitiatedResult:
+    """What became of an initiated line. `owed`: not said now, to be said at the next session.
+
+    reason  spoken | neutral (the gate refused the words; the time was said) | gate_refused
+            (nothing passed) | tenant_not_bound | voice_not_ready | person_speaking | failed"""
+
+    spoken: bool
+    owed: bool
+    reason: str
+    text: str | None = None
+
+
 class VoiceHost:
-    """Builds the ports (once, off the loop), then runs armed, listening, armed, ..."""
+    """Builds the ports (once, off the loop), then runs armed, listening, armed, ...
+
+    It also says lines nobody asked for (speak_initiated, PL46): a reminder or timer that came
+    due. Gate first, with a ledger of its own; the chime and the line through AudioOut, which
+    mutes capture for its own audio; never while the room has a voice in it, and it stops at
+    once when someone starts speaking. With a session open the line waits for the end of the
+    turn's reply and is said before the device listens again."""
 
     def __init__(self, config: VoiceConfig, ports: VoicePorts | None = None, *,
                  build: Callable[[], VoicePorts] | None = None,
@@ -830,6 +885,11 @@ class VoiceHost:
         self._task: asyncio.Task | None = None
         self._cues: set[asyncio.Task] = set()      # cues playing off the hot path
         self._capture_reset_pending = False
+        self._initiated: list[tuple[Initiated, asyncio.Future]] = []   # waiting for a turn's end
+        self._initiated_lock = asyncio.Lock()
+        self._last_voice_mono: float | None = None   # armed: when capture last held a voice
+        self._session_listeners: list[Callable[[str | None], None]] = []
+        self.initiated_hold_s = INITIATED_HOLD_S
         self._state: dict = {
             "state": WakeState.OFF,
             "model": config.detector,      # replaced by the detector's model_name once loaded
@@ -1094,6 +1154,8 @@ class VoiceHost:
             # No wake detection while the speaker plays: it would hear itself.
             if out.is_playing:
                 continue
+            if rms > RMS_FLOOR * IDLE_SPEECH_RMS_FACTOR and not p.audio_in.capture_muted():
+                self._last_voice_mono = p.clock.mono_ms() / 1000   # someone is talking
 
             frame_buf = np.concatenate([frame_buf, np.asarray(chunk, dtype=np.float32)])
             while frame_buf.shape[0] >= FRAME_SAMPLES:
@@ -1201,6 +1263,7 @@ class VoiceHost:
                 self._open = session
                 if self._stop_pending:
                     session.request_stop()
+                self._session_opened(session)
                 try:
                     await self._conversation(audio_q, session, score=score, detector=detector,
                                              speech_ratio=speech_ratio)
@@ -1209,6 +1272,11 @@ class VoiceHost:
         finally:
             self._claimed = False
             self._stop_pending = False
+            # Lines still waiting for a turn's end are said with no session open instead.
+            waiting, self._initiated = self._initiated, []
+            for _u, fut in waiting:
+                if not fut.done():
+                    fut.set_result(None)
 
     async def _conversation(self, audio_q, session: SessionContext, *, score: float,
                             detector: str, speech_ratio: float | None) -> None:
@@ -1256,6 +1324,14 @@ class VoiceHost:
         finally:
             self._state["meeting_id"] = None
             await self._await_late_finals(session)
+            # A read-back still waiting for its yes is declined: nothing is set by silence.
+            closed = getattr(p.delegate, "session_closed", None)
+            if closed is not None:
+                try:
+                    await closed(session_id)
+                except Exception:
+                    log.exception("voice host: delegate session close failed meeting_id=%s",
+                                  session_id)
             if session.silent:
                 log.info("wake: silent close -- no genuine speech in turn 1 meeting_id=%s",
                          session_id)
@@ -1288,6 +1364,7 @@ class VoiceHost:
         if session.pre_roll is not None and session.pre_roll.size:
             listen_q = PreRollQueue(session.pre_roll, audio_q)
         session.pre_roll = None
+        session.speech_onset_mono = session.reply_ended_mono = None
 
         if await self._listen(p, listen_q, ring, turn_n, use_turns, session):
             heard = bool(texts) or bool(partial.text)
@@ -1371,7 +1448,10 @@ class VoiceHost:
             return False
         # Speech guard (T03): chime echoes, sub-threshold audio, one-word transcripts and
         # decodes Whisper scores as not speech get no reply.
-        if not is_genuine_speech(turn_text, ring.pushed_ms, no_speech_prob):
+        awaiting = getattr(p.delegate, "awaiting_answer", None)
+        short_answer = bool(awaiting is not None and awaiting(session_id))
+        if not is_genuine_speech(turn_text, ring.pushed_ms, no_speech_prob,
+                                 short_answer=short_answer):
             log.info("wake: speech guard blocked turn=%d words=%d audio_ms=%d no_speech=%s",
                      turn_n, len(turn_text.split()), ring.pushed_ms,
                      "n/a" if no_speech_prob is None else f"{no_speech_prob:.2f}")
@@ -1419,7 +1499,13 @@ class VoiceHost:
         if interrupted:
             session.pre_roll = result.pre_roll
         else:
-            _drain(audio_q)
+            # A reminder or timer that came due during the turn is said now, after the reply
+            # and before the device listens again (PL46).
+            pre = await self._speak_queued(p, audio_q, session)
+            if pre is not None:
+                session.pre_roll = pre
+            else:
+                _drain(audio_q)
         if result.text and last_reply is not None:
             last_reply[0] = result.text
         if session.stop_requested:
@@ -1562,6 +1648,13 @@ class VoiceHost:
                     silence_run = 0
                     continue
 
+                if session is not None:
+                    now_s = p.clock.mono_ms() / 1000
+                    if session.reply_ended_mono is None:
+                        session.reply_ended_mono = now_s
+                    if (session.speech_onset_mono is None
+                            and rms > RMS_FLOOR * IDLE_SPEECH_RMS_FACTOR):
+                        session.speech_onset_mono = now_s
                 ring.push(chunk)
                 chunks += 1
 
@@ -1892,6 +1985,143 @@ class VoiceHost:
                 if event in (BACKCHANNEL, OVERLAP):
                     log.info("voice host: %s during reply, keeping the floor", event)
         return None
+
+    # ------------------------------------------------------------------ initiated speech
+
+    def on_session_open(self, listener: Callable[[str | None], None]) -> None:
+        """Call `listener(tenant)` each time a session opens (the scheduler then hands over the
+        lines owed to that tenant, said at the end of the session's first reply)."""
+        self._session_listeners.append(listener)
+
+    def _session_opened(self, session: SessionContext) -> None:
+        for listener in list(self._session_listeners):
+            try:
+                listener(session.tenant)
+            except Exception:
+                log.exception("voice host: a session-open listener failed")
+
+    def _for_tenant(self, tenant: str | None) -> bool:
+        """True when the device works for `tenant` now (always, with isolation off)."""
+        if not self.bound:
+            return False
+        return not self._scope.tenant_required or self._binding.tenant == tenant
+
+    async def speak_initiated(self, u: Initiated) -> InitiatedResult:
+        """Say `u` on this device, if and when it may be said. Returns what became of it."""
+        while True:
+            if not self._for_tenant(u.tenant):
+                return InitiatedResult(False, True, "tenant_not_bound")
+            if self.ports is None:
+                return InitiatedResult(False, True, "voice_not_ready")
+            if self._open is not None or self._claimed:
+                fut = asyncio.get_running_loop().create_future()
+                self._initiated.append((u, fut))
+                result = await fut
+                if result is not None:
+                    return result
+                continue                # the session ended first: say it with none open
+            if not await self._quiet_room():
+                return InitiatedResult(False, True, "person_speaking")
+            async with self._initiated_lock:
+                if self._open is not None or self._claimed:
+                    continue
+                result, _ = await self._say_initiated(
+                    self.ports, u, watch=self.state == WakeState.ARMED)
+                return result
+
+    async def _quiet_room(self) -> bool:
+        """Wait until capture has held no voice for INITIATED_QUIET_S; False past the hold."""
+        clock, waited = self.ports.clock, 0.0
+        while (self._last_voice_mono is not None
+               and clock.mono_ms() / 1000 - self._last_voice_mono < INITIATED_QUIET_S):
+            if waited >= self.initiated_hold_s:
+                return False
+            await asyncio.sleep(INITIATED_POLL_S)
+            waited += INITIATED_POLL_S
+        return True
+
+    async def _speak_queued(self, p: VoicePorts, audio_q,
+                            session: SessionContext) -> np.ndarray | None:
+        """Say the initiated lines that waited for this turn to end. Returns the capture held
+        when someone interrupted one (the next turn opens with it), else None."""
+        pre_roll = None
+        while self._initiated and pre_roll is None and not session.stop_requested:
+            u, fut = self._initiated.pop(0)
+            if fut.done():
+                continue
+            if self._scope.tenant_required and u.tenant != session.tenant:
+                fut.set_result(InitiatedResult(False, True, "tenant_not_bound"))
+                continue
+            try:
+                result, pre_roll = await self._say_initiated(p, u, audio_q=audio_q)
+            except Exception:
+                log.exception("voice host: an initiated line failed")
+                result = InitiatedResult(False, True, "failed")
+            fut.set_result(result)
+        return pre_roll
+
+    async def _say_initiated(self, p: VoicePorts, u: Initiated, *, audio_q=None,
+                             watch: bool = False) -> tuple[InitiatedResult, np.ndarray | None]:
+        """Gate, then the chime and the line. The gate's evaluations are recorded in a ledger
+        of their own (the store's record_initiated). Returns the result and the capture held
+        if someone started speaking over it (playback was stopped at once)."""
+        from app.local.voice.adapters.gate_policy import TurnGate  # lazy: boundary test
+
+        gate = TurnGate(p.gate)
+        text, refused = None, None
+        for candidate in (u.line, u.neutral):
+            if not candidate:
+                continue
+            try:
+                verdict = gate.check(candidate, (), user_text="")
+            except Exception:  # noqa: BLE001 - journalled; fail closed, nothing is said
+                refused = refused or "gate_error"
+                break
+            if verdict.decision == GATE_PASS:
+                text = candidate
+                break
+            refused = refused or verdict.category
+        pre_roll = None
+        if text is not None:
+            speak = asyncio.create_task(self._chime_and_say(p, text), name="voice-initiated")
+            own = None
+            if audio_q is None and watch and self._barge_in_enabled(p):
+                own = audio_q = p.audio_in.subscribe()
+            try:
+                if audio_q is not None and self._barge_in_enabled(p):
+                    pre_roll = await self._watch_barge_in(p, audio_q, speak)
+                if pre_roll is not None:
+                    speak.cancel()
+                await asyncio.gather(speak, return_exceptions=True)
+            finally:
+                if own is not None:
+                    p.audio_in.unsubscribe(own)
+                if not speak.done():
+                    speak.cancel()
+        whole = text is not None and text == u.line
+        decision = GATE_PASS if whole else ("replace" if text else "refuse")
+        category = "ok" if whole else (refused or "gate_refused")
+        record = getattr(p.store, "record_initiated", None)
+        if record is not None:
+            try:
+                await record(u.item_id, gate.events, decision=decision, category=category)
+            except Exception:
+                log.exception("voice host: initiated gate records not written item=%s",
+                              u.item_id)
+        reason = "spoken" if whole else ("neutral" if text else "gate_refused")
+        log.info("voice host: initiated line item=%s outcome=%s interrupted=%s", u.item_id,
+                 reason, pre_roll is not None)
+        return InitiatedResult(spoken=text is not None, owed=False, reason=reason,
+                               text=text), pre_roll
+
+    @staticmethod
+    async def _chime_and_say(p: VoicePorts, text: str) -> None:
+        try:
+            await p.audio_out.play_file(CHIME_DUE)
+        except Exception:
+            log.debug("voice host: due chime failed (non-critical)")
+        pcm = await p.talker.synthesize(text)
+        await p.audio_out.play(pcm, p.talker.sample_rate)
 
     # ------------------------------------------------------------------ hooks
 

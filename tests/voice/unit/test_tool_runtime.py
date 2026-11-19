@@ -20,13 +20,19 @@ from tests.voice.unit.tool_fakes import ToolPool, load_profile, make_app
 SECRET = "call the dentist about my tooth"
 FIRE_AT = "2026-11-19T15:00:00+00:00"
 CTX = CallContext(session_id="s1", turn_id="t1")
+# reminder.create asks first (PL45): it runs only with the turn whose yes confirmed it.
+YES = CallContext(session_id="s1", turn_id="t1", confirm_turn_id="t1")
+WHEN = "Today at ten in the morning"
+ARGS = {"text": SECRET, "fire_at": FIRE_AT, "when": WHEN, "time_zone": "America/Toronto"}
+TIMER = {"duration_s": 300, "fire_at": FIRE_AT, "length": "Five minute",
+         "time_zone": "America/Toronto"}
 
 
 class Executor:
     """Counts its calls; returns `fields`, raises `raises`, or sleeps past the deadline."""
 
     def __init__(self, fields=None, *, raises: Exception | None = None, sleep_s: float = 0):
-        self.fields = fields if fields is not None else {"reminder_id": "r1", "when": "3:00 PM"}
+        self.fields = fields if fields is not None else {"reminder_id": "r1"}
         self.raises, self.sleep_s = raises, sleep_s
         self.calls: list[dict] = []
 
@@ -49,7 +55,7 @@ def app(pool):
     return make_app(pool, profile=load_profile("personal"))
 
 
-def _call(app, args, execute, name=builtin.REMINDER_CREATE, ctx=CTX):
+def _call(app, args, execute, name=builtin.REMINDER_CREATE, ctx=YES):
     return runtime.call(app, name, args, ctx, execute)
 
 
@@ -58,9 +64,9 @@ def _call(app, args, execute, name=builtin.REMINDER_CREATE, ctx=CTX):
 
 async def test_an_executed_call_writes_a_receipt_row(app, pool):
     execute = Executor()
-    outcome = await _call(app, {"text": SECRET, "fire_at": FIRE_AT}, execute)
+    outcome = await _call(app, ARGS, execute)
     assert outcome.executed and outcome.receipt is not None
-    assert outcome.line == f"Got it, I'll remind you at 3:00 PM: {SECRET}."
+    assert outcome.line == "Reminder set."
     (row,) = pool.tool_calls
     spec = app.state.tool_registry.get(builtin.REMINDER_CREATE)
     assert row["status"] == audit.EXECUTED and row["tool_version"] == spec.version
@@ -73,17 +79,18 @@ async def test_an_executed_call_writes_a_receipt_row(app, pool):
 
 
 @pytest.mark.parametrize("args,code", [
-    ({"text": SECRET, "fire_at": FIRE_AT, "priority": "high"}, "unknown_field:priority"),
-    ({"text": 42, "fire_at": FIRE_AT}, "wrong_type:text"),
-    ({"text": "x" * 501, "fire_at": FIRE_AT}, "too_long:text"),
-    ({"text": SECRET, "fire_at": "at nine"}, "pattern_mismatch:fire_at"),
+    ({**ARGS, "priority": "high"}, "unknown_field:priority"),
+    ({**ARGS, "text": 42}, "wrong_type:text"),
+    ({**ARGS, "text": "x" * 201}, "too_long:text"),
+    ({**ARGS, "fire_at": "at nine"}, "pattern_mismatch:fire_at"),
+    ({**ARGS, "when": "At 9:00"}, "pattern_mismatch:when"),
 ])
 async def test_bad_arguments_make_no_call_and_one_invalid_args_row(app, pool, args, code):
     execute = Executor()
     outcome = await _call(app, args, execute)
     assert execute.calls == []
     assert outcome.status == audit.INVALID_ARGS and outcome.receipt is None
-    assert outcome.line == "I couldn't tell when to remind you."
+    assert outcome.line == "I couldn't set that reminder as asked."
     (row,) = pool.tool_calls
     assert (row["status"], row["error_code"]) == (audit.INVALID_ARGS, code)
     assert row["args"] is None and row["tool_version"]
@@ -130,7 +137,7 @@ async def test_a_call_past_its_timeout_is_timed_out_and_says_so(app, pool):
                                       if r["name"] == builtin.REMINDER_CREATE),
                               "timeout_ms": 20}])
     app.state.tool_registry = fast
-    outcome = await _call(app, {"text": SECRET, "fire_at": FIRE_AT}, execute)
+    outcome = await _call(app, ARGS, execute)
     assert outcome.status == audit.TIMED_OUT and outcome.receipt is None
     assert outcome.line == "I'm not sure that reminder was saved."
     assert floor.find_action_claim(outcome.line) is None
@@ -144,7 +151,7 @@ async def test_a_call_past_its_timeout_is_timed_out_and_says_so(app, pool):
 @pytest.mark.parametrize("raises,code", [(ToolFailed("store_down"), "store_down"),
                                          (RuntimeError("boom"), "raised:RuntimeError")])
 async def test_a_failing_executor_is_failed_and_never_confirmed(app, pool, raises, code):
-    outcome = await _call(app, {"text": SECRET, "fire_at": FIRE_AT}, Executor(raises=raises))
+    outcome = await _call(app, ARGS, Executor(raises=raises))
     assert outcome.status == audit.FAILED and outcome.receipt is None
     assert outcome.line == "Sorry, I couldn't save that reminder."
     assert floor.find_action_claim(outcome.line) is None
@@ -152,14 +159,13 @@ async def test_a_failing_executor_is_failed_and_never_confirmed(app, pool, raise
 
 
 async def test_a_result_outside_its_schema_is_failed(app, pool):
-    outcome = await _call(app, {"text": SECRET, "fire_at": FIRE_AT},
-                          Executor({"reminder_id": "r1"}))           # no "when"
+    outcome = await _call(app, ARGS, Executor({"reminder": "r1"}))    # not the record's field
     assert outcome.status == audit.FAILED
-    assert pool.tool_calls[0]["error_code"] == "bad_result:when"
+    assert pool.tool_calls[0]["error_code"] == "bad_result:reminder"
 
 
 async def test_a_cancelled_call_still_writes_its_row(app, pool):
-    task = asyncio.create_task(_call(app, {"text": SECRET, "fire_at": FIRE_AT},
+    task = asyncio.create_task(_call(app, ARGS,
                                      Executor(sleep_s=1)))
     await asyncio.sleep(0.01)
     task.cancel()
@@ -176,7 +182,7 @@ async def test_an_executed_write_whose_row_was_not_written_is_never_claimed(app,
             return await super().execute(sql, params)
 
     broken = make_app(NoInsert(), profile=load_profile("personal"))
-    outcome = await _call(broken, {"text": SECRET, "fire_at": FIRE_AT}, Executor())
+    outcome = await _call(broken, ARGS, Executor())
     assert outcome.executed and outcome.receipt is None and not outcome.row_written
     assert outcome.line == "I'm not sure that reminder was saved."
 
@@ -185,23 +191,22 @@ async def test_an_asking_tool_does_not_run_without_its_confirming_turn(app, pool
     from app.local.tools.registry import ToolRegistry
 
     record = next(r for r in builtin.FIRST_PARTY if r["name"] == builtin.REMINDER_CREATE)
-    record = {**record, "confirm": "ask",
-              "templates": {**record["templates"], "readback": "{text}. Shall I set it?"}}
+    assert record["confirm"] == "ask"
     app.state.tool_registry = ToolRegistry([record])
     execute = Executor()
-    outcome = await _call(app, {"text": SECRET, "fire_at": FIRE_AT}, execute)
+    outcome = await _call(app, ARGS, execute, ctx=CTX)
     assert outcome.status == audit.REFUSED and execute.calls == []
     assert pool.tool_calls[0]["error_code"] == "needs_confirmation"
     confirmed = CallContext(session_id="s1", turn_id="t1", confirm_turn_id="t2")
-    outcome = await _call(app, {"text": SECRET, "fire_at": FIRE_AT}, execute, ctx=confirmed)
+    outcome = await _call(app, ARGS, execute, ctx=confirmed)
     assert outcome.executed and pool.tool_calls[-1]["confirm_turn_id"] == "t2"
 
 
 async def test_no_argument_or_result_text_reaches_the_logs(app, caplog):
     with caplog.at_level(logging.DEBUG):
-        await _call(app, {"text": SECRET, "fire_at": FIRE_AT}, Executor())
-        await _call(app, {"text": SECRET, "fire_at": FIRE_AT, "x": 1}, Executor())
-        await _call(app, {"text": SECRET, "fire_at": FIRE_AT},
+        await _call(app, ARGS, Executor())
+        await _call(app, {**ARGS, "x": 1}, Executor())
+        await _call(app, ARGS,
                     Executor(raises=RuntimeError(SECRET)))
     assert caplog.records and SECRET not in caplog.text and "dentist" not in caplog.text
 
@@ -218,8 +223,7 @@ async def _receipts(app, turn_id: str) -> list[str]:
 
 async def _timer(app, *, turn_id: str, raises: Exception | None = None):
     return await runtime.call(app, builtin.TIMER_START,
-                              {"label": "5 minutes", "fire_at": FIRE_AT},
-                              CallContext(session_id="s1", turn_id=turn_id),
+                              TIMER, CallContext(session_id="s1", turn_id=turn_id),
                               Executor({"timer_id": "r9"}, raises=raises))
 
 
@@ -250,14 +254,16 @@ async def test_a_read_and_a_search_back_no_claim(app, pool):
 
 
 async def test_a_receipt_from_the_confirming_turn_backs_the_claim(app):
-    await runtime.call(app, builtin.TIMER_START, {"label": "5 minutes", "fire_at": FIRE_AT},
+    await runtime.call(app, builtin.TIMER_START, TIMER,
                        CallContext(session_id="s1", turn_id="t1", confirm_turn_id="t2"),
                        Executor({"timer_id": "r9"}))
     assert await _receipts(app, "t2") == [builtin.TIMER_START]
 
 
 def test_the_templates_forms_are_claims_and_the_failure_lines_are_not():
-    for line in ("Got it, timer set for 5 minutes.", "Reminder set for noon.",
+    for line in ("Got it, timer set for 5 minutes.", "Reminder set.", "Five minute timer,"
+                 " starting now.", "Five minute timer cancelled.",
+                 "Okay, that reminder is cancelled.",
                  "I've added it to your calendar. It's added to your calendar."):
         assert floor.find_action_claim(line) is not None, line
     for record in builtin.FIRST_PARTY:

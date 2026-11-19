@@ -11,7 +11,7 @@ Say **"hey vox"** and the assistant wakes, listens, replies by voice, and goes b
 - **Replies by voice** -- Kokoro TTS with clause-level streaming (second clause starts synthesizing while the first plays).
 - **Never speaks uninvited** -- every spoken output passes a speech guard; chime transcripts, sub-500ms turns, and low-ASR-confidence audio are discarded silently.
 - **Background tasks** -- searches and long lookups run in a delegate lane while the assistant keeps answering simpler follow-ups.
-- **Reminders and timers** -- "remind me at 3pm" creates a local reminder; no false confirmation when no tool backs it.
+- **Reminders and timers** -- "remind me tomorrow at 8 pm to call the dentist" is read back in words and saved only on a yes; "set a timer for ten minutes" starts at once and can be cancelled by voice. Rows live in the tenant's schema; a confirmation is spoken only with its receipt.
 - **Spoken controls** -- pacing, volume, hold, repeat, shorter/longer by voice.
 - **Session memory** -- names and preferences extracted from each turn, injected into the next reply.
 - **Runtime-mutable profile** -- name, wake phrase, voice, speed, and system prompt change at runtime with no restart.
@@ -116,8 +116,10 @@ BARGE_IN_MIN_FRAMES=4                 # 160ms
 STALE_RESULT_S=300                    # how long a delegate result stays fresh
 THINKER_TIMEOUT_S=30                  # max time for a background thinker
 
-# Reminders
-REMINDER_LOOKAHEAD_H=24               # how far ahead to scan for due reminders
+# Reminders and timers (PL46)
+VOXSCRIBE_REMINDER_MISSED_WINDOW_S=43200   # what came due while the engine was off is said once at
+                                           # the next start if at most this old; older is only listed
+VOX_TIMEZONE=America/Toronto               # the device's zone for spoken times; unset: the OS zone
 
 # Clause streaming
 MIN_CLAUSE_WORDS=4

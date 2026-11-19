@@ -114,6 +114,23 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.warning("recovery: unfinished meetings could not be recovered: %s", exc)
 
+    # Reminders and timers fire on time with or without a session open (PL46). With a voice
+    # host the device says them; without one the tenant's app is still sent the event.
+    try:
+        from datetime import timedelta
+
+        from app.local.voice.due_scheduler import DEFAULT_MISSED_WINDOW, DueScheduler
+
+        window = getattr(getattr(app.state, "settings", None), "reminder_missed_window_s",
+                         int(DEFAULT_MISSED_WINDOW.total_seconds()))
+        scheduler = DueScheduler(app, speaker=getattr(app.state, "voice_host", None),
+                                 missed_window=timedelta(seconds=window))
+        app.state.due_scheduler = scheduler
+        scheduler.start()
+        log.info("due-scheduler: started")
+    except Exception as exc:
+        log.warning("due-scheduler: could not start: %s", exc)
+
     # Retention sweep: start the loop after everything else is initialised so the pool is ready.
     _retention_task = None
     try:
@@ -131,6 +148,8 @@ async def lifespan(app: FastAPI):
         _retention_task.cancel()
         await asyncio.gather(_retention_task, return_exceptions=True)
     log.info("engine shutdown: stopping components")
+    if getattr(app.state, "due_scheduler", None) is not None:
+        await app.state.due_scheduler.stop()
     if getattr(app.state, "voice_host", None) is not None:
         log.info("voice-host: stopping")
         await app.state.voice_host.stop()

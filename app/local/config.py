@@ -192,8 +192,10 @@ class Config:
     # window is recorded as rejected and nothing is played.
     quiet_hours: QuietHours = dataclasses.field(default_factory=QuietHours)
 
-    # Context header injected into every reply turn
-    vox_timezone: str = "UTC"
+    # Context header injected into every reply turn. vox_timezone (VOX_TIMEZONE) is the device's
+    # IANA zone; empty means the operating system's (reminders and timers, voice/reminder_store.py
+    # device_zone), and UTC where nothing else can be read.
+    vox_timezone: str = ""
     vox_location: str = ""
     vox_user_name: str = ""
 
@@ -202,6 +204,12 @@ class Config:
     # to enable deletion.
     wake_candidate_retention_days: int = 0
     tool_call_retention_days: int = 0
+
+    # Reminders and timers that came due while the engine was not running are delivered once as
+    # missed at the next start when they are at most this old, in seconds; older ones are only
+    # listed as missed (VOXSCRIBE_REMINDER_MISSED_WINDOW_S). Also how long a line owed to the
+    # next session stays owed.
+    reminder_missed_window_s: int = 12 * 3600
 
     # Maximum request body size for uploads and imports, in bytes (VOXSCRIBE_MAX_UPLOAD_BYTES).
     # Requests that declare a larger Content-Length are refused before the body is read into memory.
@@ -472,6 +480,9 @@ class Config:
         )
         config_dict["tool_call_retention_days"] = _parse_int(
             env_vars, "VOXSCRIBE_TOOL_CALL_RETENTION_DAYS", 0
+        )
+        config_dict["reminder_missed_window_s"] = _parse_int(
+            env_vars, "VOXSCRIBE_REMINDER_MISSED_WINDOW_S", cls.reminder_missed_window_s
         )
 
         config_dict["max_upload_bytes"] = _parse_int(
