@@ -6,6 +6,10 @@ GET  /v1/wake/profile   → {mode, delegate, quiet_hours_enabled}  current produ
 POST /v1/wake/arm       → arm (no-op if already armed/listening). With tenant isolation on, the
                           verified person who arms is who the device listens for from then on
 POST /v1/wake/disarm    → set state to off; the armed loop closes its subscription
+                          With isolation on, arm, disarm and trigger need a role that may control
+                          the device (identity.DEVICE_CONTROL_ROLES: owner, admin, member, user)
+                          and a token not tied to another device: else 403 role_not_permitted or
+                          device_mismatch. With isolation off nothing is checked, as before
 POST /v1/wake/trigger   → DEBUG ONLY (--debug-trigger). Bypass the wake gate, start a session
                           immediately. Returns {meeting_id}. Use for automated roomplay tests.
 POST /v1/wake/power     → sleep | wake | lock | unlock from the app, for the capture watchdog
@@ -27,6 +31,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.local.errors import EngineError
+from app.local.identity import require_device_control
 from app.local.voice.host import (
     SessionInProgressError,
     SessionTenantRequiredError,
@@ -47,12 +52,31 @@ def _value(v) -> str:
     return v.value if isinstance(v, WakeState) else str(v)
 
 
+def _device_id(request: Request, host) -> str:
+    if host is not None:
+        return host.binding.device
+    from app.local.voice.adapters.scope import LOCAL_DEVICE
+
+    return getattr(getattr(request.app.state, "settings", None), "device_id", "") or LOCAL_DEVICE
+
+
+def _require_device_control(request: Request, host) -> None:
+    """Binding or unbinding the audio device needs a role that may do it (identity.py). Without
+    tenant isolation there is no person on the request and nothing is checked."""
+    require_device_control(getattr(request.state, "identity", None), _device_id(request, host))
+
+
 def _bind_caller(request: Request, host) -> None:
-    """The verified person making this request is who the device listens for. Without tenant
-    isolation there is no person on the request and the binding is left as it is."""
+    """The verified person making this request is who the device listens for, if their role
+    allows it. Without tenant isolation there is no person on the request and the binding is
+    left as it is."""
+    _require_device_control(request, host)
     tenant = getattr(request.state, "tenant", None)
     if tenant:
-        host.bind(replace(host.binding, tenant=tenant))
+        identity = getattr(request.state, "identity", None)
+        host.bind(replace(host.binding, tenant=tenant,
+                          organization=getattr(identity, "organization", None),
+                          role=getattr(identity, "role", None)))
 
 
 def _refused(exc: SessionTenantRequiredError | SessionInProgressError) -> EngineError:
@@ -92,6 +116,7 @@ async def wake_state(request: Request):
 @router.post("/arm", status_code=200)
 async def arm_wake(request: Request):
     host = _host(request)
+    _require_device_control(request, host)
     if host is None:
         return {"state": WakeState.OFF.value, "changed": False}
     try:
@@ -105,6 +130,7 @@ async def arm_wake(request: Request):
 @router.post("/disarm", status_code=200)
 async def disarm_wake(request: Request):
     host = _host(request)
+    _require_device_control(request, host)
     if host is None:
         return {"state": WakeState.OFF.value, "changed": False}
     changed = host.disarm()

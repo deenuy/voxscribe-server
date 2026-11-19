@@ -599,17 +599,22 @@ class SessionBinding:
     """Who and what a session is for. It comes from a verified credential, never from the audio:
     the request that arms the device host today, the connection's ticket for a network session.
 
-    tenant   whose data the session reads and writes: the tenant key, the unit of isolation.
-             None only when tenant isolation is off (the single shared scope)
-    product  the product the session serves (the loaded profile's mode)
-    device   where the audio comes from
+    tenant        whose data the session reads and writes: the tenant key, the unit of isolation.
+                  None only when tenant isolation is off (the single shared scope)
+    product       the product the session serves (the loaded profile's mode)
+    device        where the audio comes from
+    organization  the verified `org` claim of whoever bound it, or None (a person on their own,
+                  or isolation off)
+    role          the verified `role` claim of whoever bound it, or None (isolation off)
 
-    Organization and role are claims for access decisions, not isolation; they join this type,
-    with defaults, when identity carries them."""
+    Organization and role are claims for access decisions (identity.py), never for choosing a
+    schema: the tenant alone does that."""
 
     tenant: str | None = None
     product: str = ""
     device: str = ""
+    organization: str | None = None
+    role: str | None = None
 
 
 @dataclass

@@ -407,7 +407,7 @@ async def test_the_live_socket_refuses_a_caller_who_is_not_a_verified_person(ten
             self.closed = (code, reason)
 
     ws = FakeSocket()
-    await live_meeting(ws, "any-id", token=None, identity=None)
+    await live_meeting(ws, "any-id", token=None)
     assert ws.closed == (1008, "identity required")
 
 

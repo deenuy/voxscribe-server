@@ -20,9 +20,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from voxscribe.profile.loader import load_profile
 from voxscribe.profile.schema import ProfileValidationError
 
-from app.local import tenancy
+from app.local import tenancy, tickets
 from app.local.errors import EngineError
-from app.local.identity import IdentityError, tenant_for
+from app.local.identity import AccessDenied, IdentityError, caller_for
 from app.local.version import engine_version
 from app.local.pg_index import PostgresKnowledgeIndex
 from app.local.providers import select_providers
@@ -240,11 +240,31 @@ async def create_app(
             jwks_file=settings.identity_jwks_file or None,
         )
 
+    # One-shot tickets for the live socket and the event stream (tickets.py), so no long-lived credential has to
+    # travel in an address.
+    app.state.tickets = tickets.TicketBook(settings.ticket_ttl_s)
+
     # Auth middleware
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        if request.url.path in ("/health", "/v1/health", "/v1/ready"):
+        path = request.url.path
+        if path in ("/health", "/v1/health", "/v1/ready"):
             return await call_next(request)
+        enforced = app.state.identity is not None
+
+        # A ticket stands in for both the engine token and the identity token, once, on the route it names.
+        ticket = request.query_params.get("ticket") if tickets.ticketable(path) else None
+        if ticket is not None:
+            grant = app.state.tickets.redeem(ticket, path)
+            if grant is None or (enforced and grant.tenant is None):
+                return JSONResponse(status_code=401, content={
+                    "error": "ticket_invalid", "detail": "the ticket is not valid, was already used, or has expired"})
+            request.state.identity = grant.identity
+            if not enforced:
+                return await call_next(request)
+            request.state.tenant = grant.tenant
+            with tenancy.tenant_scope(grant.tenant):
+                return await call_next(request)
 
         if not app.state.auth_disabled:
             # Check Authorization header
@@ -252,8 +272,9 @@ async def create_app(
             token = None
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
-            elif request.url.path.endswith("/live") or request.url.path == "/v1/events":
-                # Query token only where a browser cannot set a header (WebSocket and SSE).
+            elif not enforced and tickets.ticketable(path):
+                # Kept for the desktop app until its client asks for tickets: the engine token in the address of
+                # the event stream, only with tenant isolation off. With isolation on, a ticket or headers only.
                 token = request.query_params.get("token")
 
             if not token:
@@ -271,35 +292,44 @@ async def create_app(
 
             request.state.token = token
 
-        if app.state.identity is None:
+        if not enforced:
             return await call_next(request)  # tenant isolation is off: one shared scope
 
         # Tenant isolation is on. Facts about the machine (health, the AI runtime's state) touch no one's data;
-        # everything else needs a verified person, and runs inside that person's scope.
-        path = request.url.path
+        # everything else needs a verified person, and runs inside that person's scope. The identity token comes
+        # from its header only: never from the address.
         if path == "/v1/health" or path.startswith("/v1/engine/"):
             with tenancy.system_scope():
                 return await call_next(request)
         identity_token = request.headers.get("X-Identity-Token")
-        if not identity_token and path == "/v1/events":
-            identity_token = request.query_params.get("identity")  # an EventSource cannot set headers
         try:
-            scope = await tenant_for(app, identity_token)
+            identity = await caller_for(app, identity_token)
         except IdentityError as exc:
             code = "identity_required" if not identity_token else "identity_invalid"
             return JSONResponse(status_code=401, content={"error": code, "detail": exc.detail})
+        except AccessDenied as exc:
+            return JSONResponse(status_code=exc.status, content={"error": exc.code, "detail": exc.detail})
+        scope = tenancy.tenant_key(identity.subject)
+        request.state.identity = identity
         request.state.tenant = scope
         with tenancy.tenant_scope(scope):
             return await call_next(request)
 
-    # CORS is added after the auth middleware so it is the OUTERMOST layer: preflight requests
-    # (which cannot carry a token) and 401 responses must still get CORS headers, or a browser
-    # reports every auth failure as an opaque network error.
+    # With tenant isolation on, a browser page from an origin outside the configured list is refused outright,
+    # on every route and on the live socket (CORS alone only hides answers from the page; it does not stop the
+    # request, and it does not apply to WebSockets at all). Requests with no Origin (not a browser page) pass.
     allowed_origins = settings.allowed_origins.split(",") if settings.allowed_origins else []
     allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
+    app.add_middleware(OriginGuard, allowed=allowed_origins, enabled=lambda: app.state.identity is not None)
+
+    # CORS is added after the auth middleware so it is the OUTERMOST layer: preflight requests
+    # (which cannot carry a token) and 401 responses must still get CORS headers, or a browser
+    # reports every auth failure as an opaque network error. With tenant isolation on, only the
+    # configured origins are allowed (none when none are configured); with it off, the configured
+    # list or any origin, as before.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins or ["*"],
+        allow_origins=allowed_origins if settings.tenancy_enforced else (allowed_origins or ["*"]),
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -539,6 +569,28 @@ async def create_app(
             raise RuntimeError(f"router {full_module_name} failed to load: {exc}") from exc
 
     return app
+
+
+class OriginGuard:
+    """Refuses a request or a socket whose Origin header is not in the allowed list, while enabled() is true."""
+
+    def __init__(self, app, *, allowed: list[str], enabled):
+        self.app = app
+        self.allowed = frozenset(allowed)
+        self.enabled = enabled
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket") and self.enabled():
+            origin = next((v.decode("latin-1") for k, v in scope.get("headers", ()) if k == b"origin"), None)
+            if origin is not None and origin not in self.allowed:
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008, "reason": "origin_not_allowed"})
+                    return
+                response = JSONResponse(status_code=403, content={
+                    "error": "origin_not_allowed", "detail": "this origin may not call the engine"})
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 def _constant_time_compare(a: str, b: str) -> bool:

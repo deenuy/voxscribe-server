@@ -1,14 +1,15 @@
 """Keeps credentials out of log lines.
 
-A browser cannot set headers on a WebSocket, so the live socket carries the engine token and the account's
-identity token in its address, and the server's connection log line prints that address. This filter rewrites
-`token=` and `identity=` values (and similar query parameters) to `[redacted]` before any handler sees them.
+A browser cannot set headers on a WebSocket, so the live socket and the event stream carry a credential in their
+address (a one-shot ticket, or with tenant isolation off the engine token), and the server's connection log line
+prints that address. This filter rewrites `ticket=`, `token=` and `identity=` values (and similar query
+parameters) to `[redacted]` before any handler sees them.
 """
 
 import logging
 import re
 
-_SECRET_PARAM = re.compile(r"\b((?:token|identity|access_token|id_token)=)[^&\s\"']+", re.IGNORECASE)
+_SECRET_PARAM = re.compile(r"\b((?:ticket|token|identity|access_token|id_token)=)[^&\s\"']+", re.IGNORECASE)
 
 
 def redact(text: str) -> str:

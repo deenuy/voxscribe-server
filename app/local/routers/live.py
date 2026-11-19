@@ -4,13 +4,14 @@ import hmac
 import asyncio
 import json
 import logging
+from typing import Annotated
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from voxscribe.speech import SpeechDetectorUnavailable
 
 from app.local import meeting_bus, tenancy
 from app.local.audio_ring import AudioRing
-from app.local.identity import IdentityError, tenant_for
+from app.local.identity import AccessDenied, IdentityError, tenant_for
 from app.local.enrichment import EnrichmentService
 from app.local.live_support import (
     ENERGY_DETECTOR,
@@ -33,39 +34,69 @@ async def live_meeting(
     websocket: WebSocket,
     meeting_id: str,
     token: str = Query(None),
-    identity: str = Query(None),
     levels: int = Query(0),
+    ticket: Annotated[str | None, Query()] = None,
 ):
     """WebSocket endpoint for live meeting transcription.
 
-    Clients connect with token auth (and, when tenant isolation is on, the account's access token as `identity`:
-    a browser cannot set headers on a WebSocket). The tenant is fixed once at connect and held for the whole
-    recording; everything the connection starts runs inside it. `levels=1` opts in to `vad.level` messages (the
-    detector's latest speech probability, at most 10 per second of audio; only the detector modes have one).
+    A browser cannot set headers on a WebSocket, so the client asks POST /v1/tickets for a one-shot ticket for this
+    path and connects with `?ticket=`. The ticket stands in for the engine token and the identity token, and
+    fixes the tenant it was issued to. A client that can set headers may send `Authorization: Bearer` and, with
+    tenant isolation on, `X-Identity-Token` instead. Only with isolation off is the engine token still accepted
+    as `?token=` (the desktop app's client until it asks for tickets); with isolation on no credential but a
+    ticket is read from the address. The tenant is fixed once at connect and held for the whole recording;
+    everything the connection starts runs inside it. `levels=1` opts in to `vad.level` messages (the detector's
+    latest speech probability, at most 10 per second of audio; only the detector modes have one).
     """
     app = websocket.scope.get("app")
-    if app is not None and getattr(app.state, "identity", None) is not None:
+    enforced = app is not None and getattr(app.state, "identity", None) is not None
+    send_levels = bool(levels)
+
+    if ticket is not None:
+        book = getattr(getattr(app, "state", None), "tickets", None)
+        grant = book.redeem(ticket, websocket.scope.get("path", "")) if book is not None else None
+        if grant is None or (enforced and grant.tenant is None):
+            await websocket.close(code=1008, reason="ticket_invalid")
+            return
+        if enforced:
+            with tenancy.tenant_scope(grant.tenant):
+                await _live_meeting(websocket, meeting_id, None, send_levels, authenticated=True)
+            return
+        await _live_meeting(websocket, meeting_id, None, send_levels, authenticated=True)
+        return
+
+    header_token = _bearer(websocket)
+    if enforced:
         try:
-            scope = await tenant_for(app, identity or websocket.headers.get("x-identity-token"))
+            scope = await tenant_for(app, websocket.headers.get("x-identity-token"))
         except IdentityError:
             await websocket.close(code=1008, reason="identity required")
             return
+        except AccessDenied as exc:
+            await websocket.close(code=1008, reason=exc.code)
+            return
         with tenancy.tenant_scope(scope):
-            await _live_meeting(websocket, meeting_id, token, bool(levels))
+            await _live_meeting(websocket, meeting_id, header_token, send_levels)
         return
-    await _live_meeting(websocket, meeting_id, token, bool(levels))
+    await _live_meeting(websocket, meeting_id, header_token or token, send_levels)
 
 
-async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None, send_levels: bool = False):
+def _bearer(websocket: WebSocket) -> str | None:
+    auth = websocket.headers.get("authorization", "")
+    return auth[7:] if auth.startswith("Bearer ") else None
+
+
+async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None, send_levels: bool = False,
+                        authenticated: bool = False):
     # Extract app from scope first (before validation)
     app = websocket.scope.get("app")
     if not app:
         await websocket.close(code=1011, reason="internal error")
         return
 
-    # Validate token (skip when --no-auth)
+    # Validate token (skip when --no-auth, or when a ticket already authenticated the connection)
     auth_disabled = getattr(app.state, "auth_disabled", False)
-    if not auth_disabled:
+    if not auth_disabled and not authenticated:
         if not token:
             await websocket.close(code=1008, reason="token required")
             return
