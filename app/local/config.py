@@ -17,6 +17,7 @@ from typing import Literal
 # Turn detectors the live path can run: the two energy gates in core's LiveTranscriber, and the two real detectors
 # of core's speech capability. Order is the order a person reads in an error message.
 LIVE_VAD_MODES = ("adaptive", "fixed", "silero", "heuristic")
+MAX_TICKET_TTL_S = 300  # a ticket is a one-shot credential, not a session: keep its lifetime short
 
 
 def live_vad_mode_unavailable(mode: str) -> str | None:
@@ -156,6 +157,10 @@ class Config:
     def tenancy_enforced(self) -> bool:
         return bool(self.identity_issuer and self.identity_audience and self.identity_jwks_url)
 
+    # How long a ticket for the live socket or the event stream stays valid, in seconds (VOXSCRIBE_TICKET_TTL_S).
+    # A ticket is used within moments of being issued; the lifetime only covers the round trip.
+    ticket_ttl_s: int = 30
+
     # What this engine's own audio devices are called on a voice session's row (VOXSCRIBE_DEVICE_ID).
     # Empty: the voice scope adapter's name for an unnamed device.
     device_id: str = ""
@@ -236,6 +241,11 @@ class Config:
         configured = [bool(config_dict.get(f)) for f in ("identity_issuer", "identity_audience", "identity_jwks_url")]
         if any(configured) and not all(configured):
             _fail("VOXSCRIBE_IDENTITY_*", "set all of ISSUER, AUDIENCE and JWKS_URL, or none of them")
+
+        # Tickets
+        config_dict["ticket_ttl_s"] = _parse_int(env_vars, "VOXSCRIBE_TICKET_TTL_S", cls.ticket_ttl_s)
+        if not 1 <= config_dict["ticket_ttl_s"] <= MAX_TICKET_TTL_S:
+            _fail("VOXSCRIBE_TICKET_TTL_S", f"must be between 1 and {MAX_TICKET_TTL_S} seconds")
 
         # Device
         device_id = env_vars.get("VOXSCRIBE_DEVICE_ID", "").strip()

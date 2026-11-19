@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -19,6 +20,32 @@ from app.local.migrations import run_migrations
 from app.local.version import engine_version
 
 _MONOTONIC_START = time.monotonic()
+
+# Where the engine listens. Loopback only for now; a configurable address belongs to the hosted deployment work,
+# and whatever sets it must go through bind_host() below.
+BIND_HOST = "127.0.0.1"
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False  # a name other than localhost could resolve anywhere: not loopback
+
+
+def bind_host(*, auth_disabled: bool, requested: str | None = None) -> str:
+    """The address to listen on. Refuses, by exiting non-zero, to serve with authentication off on an address
+    other than loopback: --no-auth is for a development engine that only this machine can reach."""
+    host = requested if requested is not None else BIND_HOST
+    if auth_disabled and not _is_loopback(host):
+        print(f"refusing to start: authentication is off (--no-auth) and the bind address {host} is not loopback",
+              file=sys.stderr)
+        print(json.dumps({"error": "startup", "detail": "authentication off on a non-loopback address"}),
+              file=sys.stderr)
+        sys.exit(2)
+    return host
 
 
 class _AppHandler(logging.StreamHandler):
@@ -119,6 +146,9 @@ async def main():
     # This validates the config BEFORE we do anything else
     settings = _load_and_validate_config(args)
 
+    # Decide where to listen before touching the database, so a refused start changes nothing.
+    host = bind_host(auth_disabled=args.no_auth)
+
     # Run migrations
     try:
         print(f"Running migrations on {redact_password(settings.database_url)}...", file=sys.stderr)
@@ -146,7 +176,7 @@ async def main():
     # bound, so the port is the real one even with --port 0.
     uvicorn_config = uvicorn.Config(
         app,
-        host="127.0.0.1",
+        host=host,
         port=args.port,
         lifespan="on",
         access_log=False,
