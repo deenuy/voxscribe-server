@@ -6,7 +6,8 @@ refuses UPDATE, DELETE and TRUNCATE on the table.
   policy_applied  once per session: the policy in force (version, posture, pack digest, engine)
   heard           once per turn, before anything is played: a hash and a length of what the
                   person said, in place of the text (D17)
-  cue             once per scripted cue or lead-in the gate was asked about
+  cue             once per scripted line the gate was asked about: a cue, a lead-in, or the
+                  line recorded when the reply source yielded nothing (category no_reply)
   decision        once per candidate clause the gate was asked about
   outcome         once per reply: the verdict the host acted on
   legacy          a row carried over from the old gate_decisions table by migration 021
@@ -141,9 +142,11 @@ async def append_reply_events(conn, rec, *, decision: str, category: str) -> Non
             candidate_hash=ev.candidate_hash, candidate_len=ev.candidate_len,
             cost_us=ev.cost_us, recorded_at=ev.recorded_at))
     rec.gate_events_written += len(events)
-    # The rule behind the verdict: the last evaluation that did not pass, when there was one.
-    deciding = next((e for e in reversed(rec.gate_events)
-                     if e.event == EVENT_DECISION and e.rule != RULE_PASSED), None)
+    # The rule behind the verdict: the last clause evaluation that did not pass, when there was
+    # one; else the last scripted line that did not (a refused no-reply line has no clause).
+    refused = [e for e in rec.gate_events if e.rule != RULE_PASSED]
+    deciding = next((e for e in reversed(refused) if e.event == EVENT_DECISION),
+                    refused[-1] if refused else None)
     if decision == "pass":
         rule = RULE_PASSED
     else:

@@ -607,10 +607,82 @@ async def test_with_the_reply_model_disabled_deterministic_replies_still_pass_th
         second = await gate_records.reconstruct(conn, replies[2][0])
     assert [(d["decision"], d["rule"]) for d in first["decisions"]] == [("pass", "passed")]
     assert [(c["decision"], c["candidate_len"]) for c in first["cues"]] == [("pass", 2)]
-    assert second["decisions"] == [] and second["outcome"]["decision"] == GATE_PASS
+    # The fallback line was evaluated like the cue, and nothing says a model reply passed.
+    assert second["decisions"] == []
+    assert [(c["decision"], c["category"], c["candidate_hash"]) for c in second["cues"]] == [
+        ("pass", "ok", gate_records.candidate_digest("hm")),
+        ("pass", "no_reply", gate_records.candidate_digest(reply_chain.FALLBACK_PHRASE))]
+    outcome = second["outcome"]
+    assert (outcome["decision"], outcome["category"], outcome["rule"]) == \
+        (GATE_PASS, "no_reply", "passed")
+    async with gate_app.state.store.pool.connection() as conn:
+        cur = await conn.execute("SELECT gate_category FROM replies WHERE id = %s",
+                                 (replies[2][0],))
+        assert (await cur.fetchone())[0] == "no_reply"
     for seen in (first, second):
         assert seen["heard"]["policy_version"] == "seniorcare-v1"
         assert seen["outcome"]["policy_version"] == "seniorcare-v1"
+
+
+# ── the fallback line is scripted text too: gated, and recorded as what it is ─
+
+
+NO_REPLY = "nothing"                # FakeDelegate's fallback line
+
+
+@pytest.mark.parametrize("gate,recorded,decision,category", [
+    (FakeGate(), NO_REPLY, GATE_PASS, "no_reply"),
+    (FakeGate(refuse=NO_REPLY), "", GATE_REFUSE, "blocked"),
+    (FakeGate(raises=True), "", GATE_REFUSE, "gate_error"),
+])
+async def test_the_fallback_line_is_shown_and_stored_only_if_the_gate_passes_it(
+        gate, recorded, decision, category):
+    """When the reply model yields nothing the stream's fallback line becomes the reply text:
+    shown, stored, kept in the history and repeated on request. It is evaluated like the cue
+    and the lead-in, and the outcome says it was the no-reply line, not a reply that passed."""
+    ports = fake_ports(gate=gate, delegate=FakeDelegate([[]]))
+    text = await _host(ports).reply_turn("s1", 1, "tell me about the tomatoes", turn_end_ms=0)
+
+    assert gate.checked == [NO_REPLY]                       # the gate saw it
+    assert text == recorded
+    ((_turn_n, outcome),) = ports.store.turns
+    assert (outcome.text, outcome.decision, outcome.category) == (recorded, decision, category)
+    assert ports.talker.synthesized == [] and ports.talker.fixed_phrases == []   # never spoken
+
+
+async def test_a_reply_with_sentences_never_evaluates_the_fallback_line():
+    gate = FakeGate()
+    ports = fake_ports(gate=gate, delegate=FakeDelegate([["One."]]))
+    assert await _host(ports).reply_turn("s1", 1, "question", turn_end_ms=0) == "One."
+    assert gate.checked == ["One."]
+
+
+class _DeniesTheFallback(CorePolicyGate):
+    def check(self, sentence, session_tools=(), *, user_text=""):
+        if sentence == NO_REPLY:
+            return gate_policy.PolicyDecision(GATE_REFUSE, "policy_deny", self.fail_closed_phrase,
+                                              rule="deny_pattern:test",
+                                              policy_version=self.policy_version)
+        return super().check(sentence, session_tools, user_text=user_text)
+
+
+async def test_a_refused_fallback_line_leaves_no_text_and_a_record_of_the_rule(gate_app):
+    gate = _DeniesTheFallback(gate_policy.session_policy(gate_app))
+    ports = _ports(gate_app, gate=gate, replies=[[]])
+    session_id = await gate_app.session()
+    assert await _host(ports).reply_turn(session_id, 1, "anything at all", turn_end_ms=0) == ""
+
+    records = await _records(gate_app, session_id)
+    (line,) = [r for r in records if r["event"] == "cue"]
+    assert (line["decision"], line["rule"]) == (GATE_REFUSE, "deny_pattern:test")
+    assert line["candidate_hash"] == gate_records.candidate_digest(NO_REPLY)
+    (outcome,) = [r for r in records if r["event"] == "outcome"]
+    assert (outcome["decision"], outcome["category"], outcome["rule"]) == \
+        (GATE_REFUSE, "policy_deny", "deny_pattern:test")
+    async with gate_app.state.store.pool.connection() as conn:
+        cur = await conn.execute("SELECT text, gate_category FROM replies WHERE meeting_id = %s",
+                                 (session_id,))
+        assert await cur.fetchone() == ("", "policy_deny")
 
 
 def test_verdict_is_the_port_type_the_reply_stage_expects():

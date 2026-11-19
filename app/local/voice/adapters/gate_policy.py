@@ -63,6 +63,7 @@ CATEGORY_POLICY_DENY = "policy_deny"                 # the pack denied the candi
 CATEGORY_POLICY_FALLBACK = "policy_fallback"         # the engine could not allow it (fail closed)
 CATEGORY_GATE_ERROR = "gate_error"                   # the gate raised
 CATEGORY_GATE_TIMEOUT = "gate_timeout"               # the gate answered late, or its lookup hung
+CATEGORY_NO_REPLY = "no_reply"                       # the source yielded nothing: the fallback line
 
 # A verdict that took longer than this is discarded and the reply fails closed. The port's
 # check is synchronous, so this cannot interrupt a gate that never returns; it bounds what the
@@ -235,7 +236,8 @@ class TurnGate:
     Every evaluation is appended to `events` (the store writes them as gate records when the
     reply ends). A gate that raises, a verdict that arrives past the deadline, and a tool-row
     lookup that hangs are each journalled and then raised, so the reply stage refuses with the
-    gate's scripted fallback and the candidate is never synthesised.
+    gate's scripted fallback and the candidate is never synthesised. Scripted lines (the cue,
+    the lead-in and the line recorded when the source yields nothing) pass through it too.
     """
 
     def __init__(self, inner, events: list[GateEvent] | None = None, *,
@@ -300,10 +302,28 @@ class TurnGate:
             return None
         return phrase if verdict.decision == GATE_PASS else None
 
+    def fallback(self, phrase: str) -> tuple[str, str, str]:
+        """(text, decision, category) to record for a reply whose source yielded nothing.
+
+        The stream's fallback line is not spoken by the reply stage, but it becomes the reply
+        text: shown, stored, kept in the history and spoken if the person asks for a repeat.
+        It is scripted text like a cue, so it is evaluated like one and journalled. Passed, it
+        is recorded under CATEGORY_NO_REPLY (the journal row too), never as a reply that
+        passed. Refused, or with the gate down, no text is recorded at all."""
+        if not phrase:
+            return "", GATE_PASS, CATEGORY_NO_REPLY
+        try:
+            verdict = self._evaluate(EVENT_CUE, phrase, (), "", passed_as=CATEGORY_NO_REPLY)
+        except Exception:  # noqa: BLE001 - journalled in _evaluate; the line is dropped
+            return "", GATE_REFUSE, self.events[-1].category
+        if verdict.decision == GATE_PASS:
+            return phrase, GATE_PASS, CATEGORY_NO_REPLY
+        return "", GATE_REFUSE, verdict.category
+
     # ------------------------------------------------------------------ internals
 
     def _evaluate(self, event: str, text: str, session_tools: Sequence[str],
-                  user_text: str) -> GateDecision:
+                  user_text: str, *, passed_as: str | None = None) -> GateDecision:
         started = self._timer()
         try:
             verdict = self._inner.check(text, session_tools, user_text=user_text)
@@ -320,6 +340,8 @@ class TurnGate:
             raise GateTimeout("gate verdict arrived past its deadline")
         rule = getattr(verdict, "rule", None) or (RULE_PASSED if decision == GATE_PASS
                                                   else category)
+        if passed_as and decision == GATE_PASS:
+            category = passed_as
         self._journal(event, text, decision, category, rule, cost_us=cost_us,
                       policy_version=getattr(verdict, "policy_version", ""),
                       candidate_hash=getattr(verdict, "candidate_hash", ""))

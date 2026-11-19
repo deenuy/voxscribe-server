@@ -61,6 +61,7 @@ from enum import Enum
 
 import numpy as np
 from voxscribe.session.ports import (
+    GATE_PASS,
     AudioIn,
     AudioOut,
     ClockDomainError,
@@ -1574,7 +1575,7 @@ class VoiceHost:
                 source=stream.source,
                 cue=turn_gate.scripted(stream.cue),          # scripted lines pass the gate too
                 lead_in=turn_gate.scripted(stream.lead_in),
-                fallback=stream.fallback,
+                fallback="",        # recorded below, and only once the gate has seen it
             )
             clause_talker = _ClauseTalker(p.talker, p.clock)
 
@@ -1608,6 +1609,13 @@ class VoiceHost:
                          len(heard.played_clauses), len(heard.released))
             else:
                 outcome = completed
+            if interruption is None and outcome.decision == GATE_PASS and not outcome.sentences:
+                # The source yielded nothing. The stream's fallback line would become the reply
+                # text (the reply event, the stored reply, the history, the repeat phrase), so
+                # it passes the gate like the other scripted lines and is recorded as the
+                # no-reply line, not as a reply that passed.
+                outcome.text, outcome.decision, outcome.category = turn_gate.fallback(
+                    stream.fallback)
             if outcome.first_audio_ms is not None:
                 log.info("voice host: first audio +%d ms from turn end",
                          outcome.first_audio_ms - turn_end_ms)
