@@ -121,6 +121,12 @@ VOXSCRIBE_REMINDER_MISSED_WINDOW_S=43200   # what came due while the engine was 
                                            # the next start if at most this old; older is only listed
 VOX_TIMEZONE=America/Toronto               # the device's zone for spoken times; unset: the OS zone
 
+# How the assistant talks (app/local/voice/expression.py holds every line it says on its own)
+VOXSCRIBE_VOICE_EXPRESSIVENESS=natural    # plain | natural; unset: natural for personal and
+                                          # IdeaScribe, plain for senior care and classroom
+VOXSCRIBE_VOICE_THINKING_AFTER_S=1.5      # natural: one thinking line if a reply is this late
+VOXSCRIBE_VOICE_NO_SPEECH_LIMIT_S=120     # a session with no recognised speech ends after this
+
 # Clause streaming
 MIN_CLAUSE_WORDS=4
 MAX_CLAUSE_WORDS=25
@@ -134,6 +140,17 @@ VOXSCRIBE_DEBUG_TRIGGER=false         # true to allow POST /v1/wake/trigger
 ```
 
 Full reference: `app/local/config.py` (server-level) and `voxscribe/profile/schema.py` (assistant profile).
+
+### Hear the assistant's lines
+
+```bash
+uv run python -m app.local.voice.audition --out ./audition --play
+```
+
+Renders every reaction, thinking line and farewell with the configured voice (Kokoro; `--voice`
+and `--speed` to choose), writes each as `<list>-<name>.wav` under `--out`, prints them by name and,
+with `--play`, plays them in turn. To strike one, delete its name from its list in
+`app/local/voice/expression.py`: it is gone from the assistant and from the audition.
 
 ## API
 
