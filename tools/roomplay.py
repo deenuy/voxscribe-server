@@ -207,7 +207,7 @@ def _ledger_row(conn, meeting_id: str) -> dict | None:
 def _gate_row(conn, meeting_id: str) -> dict | None:
     row = conn.execute(
         "SELECT decision, category, mode, decided_at "
-        "FROM gate_decisions WHERE meeting_id = %s "
+        "FROM gate_outcomes WHERE meeting_id = %s "
         "ORDER BY decided_at DESC LIMIT 1",
         (meeting_id,),
     ).fetchone()

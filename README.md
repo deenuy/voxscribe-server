@@ -180,7 +180,35 @@ make db-migrate    # apply all pending migrations
 make db-shell      # psql into the development database
 ```
 
-Migrations: `app/local/migrations/001_init.sql` through `019_reminders.sql`. See `CHANGELOG.md` for which sprint introduced each.
+Migrations: numbered files in `app/local/migrations/`, one number each, no gaps. See `CHANGELOG.md` for which sprint introduced each.
+
+### Migrations only add: expand now, contract later
+
+Decision (PL32, 2026-11-18). A migration only adds: tables, columns, indexes, views, triggers, rows. Removing or
+renaming anything the previous release reads or writes happens in a later migration, shipped in a later release,
+once no supported version of the code uses it (the contract step).
+
+Why: the schema outlives the code that wrote it. A person who reinstalls the previous version, a second engine
+instance still on older code, and a feature branch run against a shared database all meet a schema migrated by newer
+code, and each must keep working. Migrations run automatically against whatever database an engine is pointed at, so
+there is no moment at which a breaking change could be coordinated by hand. On 2026-11-18 a test booted an engine on
+the developer's database and applied an unmerged migration that dropped `gate_decisions`, a table the running, older
+engine still wrote to.
+
+How it is enforced: `tests/test_migration_files.py` fails on `DROP TABLE`, `DROP COLUMN`, `DROP VIEW` or `RENAME` in a
+migration unless the file carries a marker naming the earlier migration that started the contract:
+
+```sql
+-- contract: completes 021 (gate_decisions has had no writer since 021's release)
+```
+
+Open contract steps:
+
+- `gate_decisions` (expanded in 021). Since 021 the engine writes the gate's ledger to `gate_records` and never writes
+  `gate_decisions`; the old table keeps its rows with `input_text` cleared, and a trigger clears any text an older
+  engine still writes. Per-reply outcomes are read from the view `gate_outcomes`. Contract, in a release after the one
+  that ships 021: copy into `gate_records` any `gate_decisions` rows written by older engines after 021 (as 021 copied
+  the earlier ones), then drop `gate_decisions` and its trigger function, with the marker above.
 
 Locally: `ideascribe_dev`. Production: set `DATABASE_URL`.
 
@@ -230,7 +258,7 @@ app/
       wake.py              GET /v1/wake/state, POST /v1/wake/power, POST /v1/wake/trigger
       meetings.py          /v1/meetings/*
       live.py              WebSocket /v1/live
-    migrations/            001_init.sql … 019_reminders.sql
+    migrations/            numbered SQL migrations (expand only; see Database)
 tools/
   fetch_wake_models.py     Download keyword spotter and OWW models (run once)
   train_wake_model.py      Train a custom OWW model on synthetic clips
