@@ -1,16 +1,53 @@
 # Changelog
 
-## Unreleased
+## What's New in VoxScribe Server 0.10.0
+
+Baseline release of 2026-11-19. Uses voxscribe-core 0.6.0. Starting this version applies migrations
+020 to 026 to the database it is pointed at; all seven only add.
 
 ### New Features
+- Added tenant isolation to the voice path: a device belongs to the person who arms it, and a voice session, its conversation, its tool calls and its reminders are stored in that person's schema.
+- Added `POST /v1/tickets`: a short-lived, single-path ticket for opening a socket or an event stream, so a session token is no longer sent in an address. Access tokens must carry `typ: "access"`, and browser origins are checked.
+- Added one safety path for speech: the host's gate delegates to core's policy gate, and every decision is kept in the append-only `gate_records` table.
+- Added a typed event envelope (`v`, `id`, `type`, `sessionId`, `seq`, `data`) with one stream per tenant, replay from the last event received, and `stream.reset` when replay is not possible.
+- Added a new first stage for the wake phrase: a speech-onset detector with a recognizer pass primed with the phrase, beside the keyword spotter. "hey vox" must begin the utterance.
+- Added `POST /v1/wake/start`, which starts a voice session with no wake phrase, for a button in an app.
+- Added the conversational pace as a setting: the pause that closes a turn comes from the product profile's `end_of_turn_pause_s`, or `VOXSCRIBE_END_OF_TURN_PAUSE_S`.
+- Added a tool registry: one declarative record per tool, checked at start-up, with an audit row for every call and a receipt for every executed write. A reply may claim an action only when that turn has a receipt for it.
+- Added one network rule for every remote tool: refused in senior care and classroom, refused when the profile turns the network off, and refused unless the tenant's privacy setting allows connectors.
+- Added reminders and timers by voice: a reminder is read back and saved only on "yes", a timer starts at once, and both can be listed and cancelled by voice. Times are parsed and read back by `voice/spoken_time.py`.
+- Added a scheduler that delivers due reminders and timers with no session open, after a restart, and without sound during quiet hours; `GET /v1/reminders`, `DELETE /v1/reminders/{id}` and the `reminder.due` event.
 - Added the `meeting.pipeline` event and `GET /v1/meetings/{id}/pipeline`: the transcript, summary and tasks steps after Stop, each working, ready, failed or skipped with a reason code. Added the `meeting_steps` table (migration 023).
 - Added `POST /v1/wake/stop` (End) and `POST /v1/wake/mute` (Mute) for a running voice session; `GET /v1/wake/state` reports `muted`.
+- Added a machine-readable contract in `contract/` (`openapi.json`, `events.json`, `websocket.json`, `errors.json`), written by `python -m contract.export` and checked by the tests.
 
 ### Bug Fixes
 - Fixed "Ask about this scribe" answering from a search over every source instead of the scribe's transcript, and chat searching through a connection of its own outside the tenant pool.
 - Fixed the chat reply stream breaking on backslashes and control characters, and holding the event loop while the model generated.
 - Fixed regenerating a summary, which never ran the model and left the summary pending; a regenerate while a summary is being written now attaches to that run.
 - Fixed a task drafting timeout being logged with no reason; it is now `model_timeout` on the pipeline and can be retried with Generate.
+- Fixed a saved reminder being followed by "I couldn't set that", a failed save being confirmed, and "timer set" being said without a timer.
+- Fixed the assistant not answering after waking: a turn that begins with speech is now seen, and a first turn with words heard is answered when its wait runs out.
+- Fixed the health route failing under isolation when no tenant was in scope.
+- Fixed the delegate lane spinning when every pending write had already finished.
+- Fixed a search warning that could log the query.
+
+### Changed
+- Changed the test suite to run in a dedicated `ideascribe_test` database and to refuse the development databases. An engine or a test run migrates the database it is pointed at.
+- Changed migrations to expand-only: a migration may add, never drop or rename. `tests/test_migration_files.py` enforces it.
+- Changed which privacy setting governs web search by voice: the tenant's stored setting, not the environment variable.
+- Changed the gate's replacement line for an unbacked action claim to "I haven't set anything." (floor version `host-floor-v3`).
+
+### Known Issues
+- The first turn of a session does not close on the pause; it runs to its eight-second wait.
+- A one-word turn outside a pending question ends the session with no reply, and in the first turn deletes the conversation after its captions were published. "stop" is not an ending phrase.
+- The idle wait after a reply is extended by loud sound, not only by recognised speech, so the end of a session is not predictable.
+- No event says that a session ended or why, and there is no single session state: `wake_state` knows off, armed, listening and error only.
+- `wake_state` and the `/v1/wake/*` responses use `snake_case` fields (`meeting_id`); the other events and routes use `camelCase`.
+- A refused web search ends the turn with the refusal line; the reply model is not asked instead.
+- A failed refresh of the identity service's keys is retried on every request with no back-off, and logs no reason when the cause is a timeout.
+- Reminders, timers and the scheduler have not been run with real audio. "set an alarm" is not recognised. The time zone is the machine's.
+- The Dockerfile has never been built. The workflow in `.github/` runs the tests (which include the contract check) and the undefined-name lint, and has not yet run on GitHub; a full lint (173 findings) and a type check are not part of it.
 
 ## What's New in VoxScribe Server 0.9.0
 

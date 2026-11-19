@@ -281,4 +281,4 @@ tools/archive/             Pre-sprint tool scripts
 
 ## Changelog
 
-See `CHANGELOG.md`. Current version: **0.9.0** (voice assistant GA, T00-T21).
+See `CHANGELOG.md`. Current version: **0.10.0** (baseline of 2026-11-19: tenant isolation on the voice path, tools with receipts, reminders and timers).
