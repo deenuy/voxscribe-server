@@ -211,29 +211,53 @@ def route_turn(settings, user_text: str) -> tuple[str, str] | None:
     return pre_router.route(user_text or "", settings) if settings else None
 
 
-def _voice_system_prompt(settings) -> str:
+_ENGINE_IDENTITY = "You are a helpful voice assistant."
+
+
+def _identity(persona) -> str:
+    """The prompt's first sentence. `persona` is the session's SessionSettings (or anything
+    with assistant_name and persona_label); both are validated labels, never free text."""
+    name = getattr(persona, "assistant_name", "") or ""
+    if not name:
+        return _ENGINE_IDENTITY
+    label = getattr(persona, "persona_label", "") or "assistant"
+    return f"You are {name}, a helpful voice {label}."
+
+
+def _owner_block(persona) -> str:
+    """The owner's system prompt, after the engine's instructions (profile_store bounds and
+    frames it). Empty in senior care and classroom, where the stored prompt is clamped."""
+    from app.local.voice.profile_store import owner_preferences_block
+
+    return owner_preferences_block(getattr(persona, "system_prompt", "") or "")
+
+
+def _voice_system_prompt(settings, persona=None) -> str:
     """The context header from the OS clock at turn start (not session start), then the voice
-    rules."""
+    rules. `persona` names the assistant (the session's settings; None: the engine's wording)."""
     from app.local.context import current_context_header
     from app.local.llm_adapter import _build_system_prompt
 
     ctx_header = current_context_header(settings) if settings else ""
     if not ctx_header:
-        return _build_system_prompt()
+        return _build_system_prompt().replace(_ENGINE_IDENTITY, _identity(persona), 1)
     return (
         f"{ctx_header} "
-        "You are a helpful voice assistant. "
+        f"{_identity(persona)} "
         "Reply in 1-2 short sentences only. "
         "Be direct and conversational. No markdown, no lists, no headers. "
         "Keep replies under 30 words."
     )
 
-def talker_system_prompt(settings) -> str:
+def talker_system_prompt(settings, persona=None) -> str:
     """The talker's prompt: the voice prompt plus the instruction to hand anything that needs
-    a tool to the delegate lane. The talker itself has no tools."""
+    a tool to the delegate lane, then the owner's preferences when there are any. The talker
+    itself has no tools."""
     from app.local.voice.delegate_lane import TALKER_DELEGATE_INSTRUCTION
 
-    return f"{_voice_system_prompt(settings)} {TALKER_DELEGATE_INSTRUCTION}"
+    prompt = f"{_voice_system_prompt(settings, persona)} {TALKER_DELEGATE_INSTRUCTION}"
+    owner = _owner_block(persona)
+    return f"{prompt}\n\n{owner}" if owner else prompt
 
 
 def talker_sentences(
@@ -245,6 +269,7 @@ def talker_sentences(
     pre_stream: AsyncIterator[str] | None = None,
     system_note: str | None = None,
     system_prefix: str | None = None,
+    persona=None,
 ) -> ReplySource:
     """The talker's reply to one turn, as sentences. No tools, nothing is spoken here.
 
@@ -252,6 +277,7 @@ def talker_sentences(
     answers, delegation to the thinker) is the Delegate adapter's job and happens before this.
     system_note  appended to the system prompt for this turn (the barge-in note, T13).
     system_prefix  prepended to the system prompt (memory block T19 + control suffix T15).
+    persona  the session's assistant settings (name, persona label, system prompt).
     """
     settings = getattr(app.state, "settings", None)
     model, _mode = reply_settings(settings)
@@ -261,7 +287,7 @@ def talker_sentences(
     if pre_stream is not None:
         return ReplySource(_sentence_stream_from_tokens(pre_stream, _OLLAMA_TIMEOUT_S),
                            source="pre_stream")
-    prompt = talker_system_prompt(settings)
+    prompt = talker_system_prompt(settings, persona)
     if system_prefix:
         prompt = f"{system_prefix}\n\n{prompt}"
     if system_note:
@@ -312,7 +338,7 @@ def _count_results(search_result: str) -> int:
 
 async def search_answer(app, meeting_id: str | None, request: str, query: str, *,
                         task_id: str, turn_id: str | None = None,
-                        history: list[dict] | None = None) -> str:
+                        history: list[dict] | None = None, persona=None) -> str:
     """The thinker's web search: search, write the tool_calls row, then have the reply model
     summarise the results in one or two sentences. Runs on the delegate lane, never in a turn.
 
@@ -353,11 +379,14 @@ async def search_answer(app, meeting_id: str | None, request: str, query: str, *
     if search_error or "[web_search: unavailable" in search_result:
         return _SEARCH_UNAVAILABLE_PHRASE
     search_system = (
-        f"{_voice_system_prompt(settings)}\n\n"
+        f"{_voice_system_prompt(settings, persona)}\n\n"
         f"Use the following search results to answer the user's question. "
         f"Do not reproduce URLs. Summarise in 1-2 sentences.\n\n"
         f"{search_result}"
     ).strip()
+    owner = _owner_block(persona)
+    if owner:
+        search_system = f"{search_system}\n\n{owner}"
     sentences = [s async for s in _sentence_stream(request, model, _OLLAMA_TIMEOUT_S,
                                                    history=history,
                                                    system_prompt=search_system)]
