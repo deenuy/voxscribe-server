@@ -64,6 +64,25 @@ async def search(query: str) -> str:
     return await _call({"query": query})
 
 
+_RESULT_MAX_CHARS = 20_000       # the web.search record's result bound
+
+
+def _count_results(search_result: str) -> int:
+    return len([ln for ln in search_result.splitlines()
+                if ln.startswith("1.") or ln[:2] in ("2.", "3.", "4.", "5.")])
+
+
+async def execute(args: dict):
+    """The web.search executor, run by the tool runtime. SearXNG unreachable is a failure."""
+    from app.local.tools.runtime import ToolFailed, ToolResult  # lazy: no import cycle
+
+    text = await search(args["query"])        # the module's name, so a test can replace it
+    if text.startswith("[web_search: unavailable"):
+        raise ToolFailed("unavailable")
+    return ToolResult(fields={"text": text[:_RESULT_MAX_CHARS],
+                              "result_count": _count_results(text)})
+
+
 async def is_reachable() -> bool:
     """Health check: can we reach SearXNG /healthz within 1 s?"""
     import httpx

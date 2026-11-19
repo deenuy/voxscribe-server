@@ -9,8 +9,8 @@ through the Delegate and SessionStore adapters in app/local/voice/adapters:
                       exists before anything is played (G1)
   talker_sentences()  the talker: the reply model's sentences for one turn, split at
                       punctuation. It has no tools
-  search_answer()     the thinker: a web search on the delegate lane (app/local/voice/
-                      delegate_lane.py); writes its tool_calls row with the task id
+  search_answer()     the thinker: `web.search` through the tool runtime on the delegate lane
+                      (app/local/voice/delegate_lane.py); its audit row carries the task id
   finish_reply()      update the replies row, write the behaviour log (G6), played_at and
                       the latency ledger, then publish the reply event over meeting_bus. The
                       gate's records for the reply are not written here: they have their own
@@ -27,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -38,7 +37,6 @@ log = logging.getLogger("app.local.reply_chain")
 _OLLAMA_TIMEOUT_S  = 30.0   # llama3.2 first-token <3s warm, ~8s cold; 30s covers first-time load
 _FALLBACK_PHRASE   = "I'm sorry, I didn't catch that. Could you say it again?"
 _THINKING_PHRASE   = "hm"
-_SEARCH_UNAVAILABLE_PHRASE = "I can't look that up right now."
 THINKING_PHRASE    = _THINKING_PHRASE   # spoken as the reply's cue
 FALLBACK_PHRASE    = _FALLBACK_PHRASE   # recorded when the reply model yields nothing
 _SENTENCE_RE       = re.compile(r'[.!?]["\')\]]*\s+')
@@ -117,20 +115,6 @@ async def warm_phrase_cache(extra: tuple[str, ...] = ()) -> None:
 
 def _now_z() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
-
-async def session_tools(pool, meeting_id: str) -> list[str]:
-    """Tool names recorded in tool_calls for this session. Fails closed to an empty list."""
-    try:
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                "SELECT DISTINCT tool FROM tool_calls WHERE meeting_id=%s", (meeting_id,),
-            )
-            rows = await cur.fetchall()
-        return [r[0] for r in rows]
-    except Exception:
-        log.exception("reply_chain: tool_calls lookup failed meeting_id=%s", meeting_id)
-        return []
 
 
 @dataclass
@@ -311,104 +295,39 @@ def split_sentences(text: str) -> list[str]:
     return [p for p in parts if p]
 
 
-async def record_tool_call(pool, *, task_id: str | None, turn_id: str | None,
-                           meeting_id: str | None, tool: str, query: str | None,
-                           engine: str | None, result_count: int, duration_ms: int,
-                           error: str | None, status: str | None = None,
-                           error_code: str | None = None) -> None:
-    """One tool_calls row. A thinker's row carries the delegate task that made the call (A5); a
-    call refused before it ran carries status `refused` and the decision's reason code."""
-    try:
-        async with pool.connection() as conn:
-            await conn.execute(
-                "INSERT INTO tool_calls"
-                " (id, turn_id, meeting_id, tool, query, engine, result_count,"
-                "  duration_ms, error, called_at, task_id, status, error_code)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
-                " ON CONFLICT DO NOTHING",
-                (str(uuid.uuid4()), turn_id or "", meeting_id, tool, query, engine,
-                 result_count, duration_ms, error, _now_z(), task_id, status, error_code),
-            )
-            await conn.commit()
-    except Exception:
-        log.exception("reply_chain: tool_calls insert failed task_id=%s", task_id)
-
-
-async def refuse_search(app, meeting_id: str | None, *, turn_id: str | None,
-                        task_id: str | None = None) -> str | None:
-    """PL41: the network decision for a web search. Returns None when the search may run;
-    otherwise writes one `refused` row, sends nothing, and returns the scripted refusal line."""
-    from app.local.tools.network import network_decision
-    from app.local.voice.adapters.scope import scoped_pool
-
-    decision = await network_decision(app)
-    if decision.allowed:
-        return None
-    await record_tool_call(scoped_pool(app), task_id=task_id, turn_id=turn_id,
-                           meeting_id=meeting_id, tool="web_search", query=None, engine=None,
-                           result_count=0, duration_ms=0, error=None, status="refused",
-                           error_code=decision.reason)
-    return decision.line
-
-
-def _count_results(search_result: str) -> int:
-    return len([ln for ln in search_result.splitlines()
-                if ln.startswith("1.") or ln[:2] in ("2.", "3.", "4.", "5.")])
-
-
 async def search_answer(app, meeting_id: str | None, request: str, query: str, *,
                         task_id: str, turn_id: str | None = None,
                         history: list[dict] | None = None, persona=None) -> str:
-    """The thinker's web search: search, write the tool_calls row, then have the reply model
-    summarise the results in one or two sentences. Runs on the delegate lane, never in a turn.
+    """The thinker's web search: `web.search` through the tool runtime, which checks the registry
+    and the network decision (PL41) before anything is sent and writes the call's audit row
+    with the task id; then the reply model summarises the results in one or two sentences. Runs
+    on the delegate lane, never in a turn.
 
-    Returns the text to deliver. The lane bounds the whole call with THINKER_TIMEOUT_S; the
-    search tool bounds its own request.
+    Returns the text to deliver: the summary, or the record's scripted line when the search was
+    refused, failed or timed out. The lane bounds the whole call with THINKER_TIMEOUT_S; the
+    record bounds the search.
     """
-    from app.local.tools.web_search import search as web_search
+    from app.local.tools import builtin, runtime, web_search
     from app.local.voice.adapters.scope import scoped_pool
 
     settings = getattr(app.state, "settings", None)
     model, _mode = reply_settings(settings)
-    # Called from the voice delegate lane: the pool comes through the voice scope adapter, which refuses (before the
-    # search runs) outside a tenant's scope with isolation on, or in a session that is not the tenant's.
-    pool = scoped_pool(app)
+    # Called from the voice delegate lane: the pool comes through the voice scope adapter, which
+    # refuses (before the search runs) outside a tenant's scope with isolation on, or in a session
+    # that is not the tenant's.
+    scoped_pool(app)
     log.info("reply_chain: thinker search task_id=%s meeting_id=%s", task_id, meeting_id)
-    # PL41: the decision is taken again when the search is about to run, so a privacy setting
-    # changed after the request was submitted is obeyed.
-    refusal = await refuse_search(app, meeting_id, turn_id=turn_id, task_id=task_id)
-    if refusal is not None:
-        return refusal
-    t_search = time.monotonic()
-    search_result = ""
-    search_error: str | None = None
-    cancelled = False
-    try:
-        search_result = await web_search(query)
-    except asyncio.CancelledError:
-        search_error, cancelled = "cancelled", True
-    except Exception as exc:
-        search_error = str(exc)
-        log.warning("reply_chain: web_search failed: %s", type(exc).__name__)
-
-    row = record_tool_call(
-        pool, task_id=task_id, turn_id=turn_id, meeting_id=meeting_id, tool="web_search",
-        query=query, engine="searxng", result_count=_count_results(search_result),
-        duration_ms=int((time.monotonic() - t_search) * 1000), error=search_error,
-        status="cancelled" if cancelled else ("failed" if search_error else "executed"))
-    if cancelled:
-        # The call was made, so the row is still written; then the cancel carries on.
-        await asyncio.shield(row)
-        raise asyncio.CancelledError
-    await row
-
-    if search_error or "[web_search: unavailable" in search_result:
-        return _SEARCH_UNAVAILABLE_PHRASE
+    outcome = await runtime.call(
+        app, builtin.WEB_SEARCH, {"query": query},
+        runtime.CallContext(session_id=meeting_id, turn_id=turn_id, task_id=task_id),
+        web_search.execute)
+    if not outcome.executed:
+        return outcome.line
     search_system = (
         f"{_voice_system_prompt(settings, persona)}\n\n"
         f"Use the following search results to answer the user's question. "
         f"Do not reproduce URLs. Summarise in 1-2 sentences.\n\n"
-        f"{search_result}"
+        f"{outcome.result['text']}"
     ).strip()
     owner = _owner_block(persona)
     if owner:

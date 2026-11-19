@@ -329,15 +329,22 @@ def _check_templates(name: str, record: Mapping) -> None:
     extra = set(templates) - set(keys)
     if extra:
         raise ToolSpecError(name, f"templates.{sorted(extra)[0]}", "not a template key")
-    fillable = set(record["args"]["properties"]) | set(record["result"]["properties"])
+    args_fields = set(record["args"]["properties"])
     for key in keys:
+        # Only a success line has a receipt to fill from. A refusal or an invalid call is
+        # spoken before any argument was accepted, so its line is fixed text.
+        if key == "success":
+            fillable = args_fields | set(record["result"]["properties"])
+        elif key in ("refused", "invalid"):
+            fillable = set()
+        else:
+            fillable = args_fields
         try:
             fields = _placeholders(templates[key])
         except ValueError:
             raise ToolSpecError(name, f"templates.{key}", "malformed placeholder") from None
         for f in fields:
-            if f not in fillable or (key != "success" and f not in record["args"]["properties"]):
-                # Only a success line may use the result: nothing else has a receipt.
+            if f not in fillable:
                 raise ToolSpecError(name, f"templates.{key}",
                                     f"{{{f}}} is not a field it can be filled from")
 

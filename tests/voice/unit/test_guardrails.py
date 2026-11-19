@@ -216,7 +216,7 @@ class _FakeCursor:
 
 
 class _FakePool:
-    """Records reply-chain writes; answers the tool_calls lookup from `tools`."""
+    """Records reply-chain writes; answers the receipt lookup from `tools`."""
 
     def __init__(self, tools: list[str] | None = None):
         self.tools = tools or []
@@ -281,11 +281,11 @@ def test_replacement_phrase_is_not_itself_a_claim():
 def test_rule_replaces_each_claim_sentence(_prompt, model_reply, caplog):
     first_sentence = model_reply.split(". ")[0].split("! ")[-1]
     with caplog.at_level(logging.INFO, logger="app.local.gate"):
-        decision, reason = gate.check_action_claim(first_sentence, session_tools=[])
-    assert (decision, reason) == ("replace", "no_tool_row")
+        decision, reason = gate.check_action_claim(first_sentence, [])
+    assert (decision, reason) == ("replace", "no_receipt")
     blocked = [r.getMessage() for r in caplog.records if "blocked action claim" in r.getMessage()]
     assert len(blocked) == 1
-    assert "reason=no_tool_row" in blocked[0]
+    assert "reason=no_receipt" in blocked[0]
 
 
 @pytest.mark.parametrize("sentence", [
@@ -296,26 +296,26 @@ def test_rule_replaces_each_claim_sentence(_prompt, model_reply, caplog):
     "The settings menu is on the left.",
 ])
 def test_ordinary_sentences_pass(sentence):
-    assert gate.check_action_claim(sentence, session_tools=[]) == ("pass", "ok")
+    assert gate.check_action_claim(sentence, []) == ("pass", "ok")
 
 
-def test_claim_backed_by_matching_tool_row_passes():
+def test_claim_backed_by_a_matching_receipt_passes():
     sentence = "I've set an alarm for 7 am."
-    assert gate.check_action_claim(sentence, ["alarm_set"]) == ("pass", "tool_row")
+    assert gate.check_action_claim(sentence, ["alarm.set"]) == ("pass", "receipt")
 
 
 def test_web_search_row_does_not_back_a_claim():
     sentence = "I've added a reminder for 6:30 am tomorrow."
-    assert gate.check_action_claim(sentence, ["web_search"]) == ("replace", "no_tool_row")
+    assert gate.check_action_claim(sentence, ["web.search"]) == ("replace", "no_receipt")
 
 
-def test_tool_row_of_another_type_does_not_back_a_claim():
+def test_a_receipt_of_another_type_does_not_back_a_claim():
     sentence = "I've set an alarm for 7 am."
-    assert gate.check_action_claim(sentence, ["reminder_create"]) == ("replace", "no_tool_row")
+    assert gate.check_action_claim(sentence, ["reminder.create"]) == ("replace", "no_receipt")
 
 
 async def test_ten_action_prompts_give_zero_completion_claims(caplog):
-    """Acceptance: 10 prompts, 0 completion claims spoken, one no_tool_row decision row each."""
+    """Acceptance: 10 prompts, 0 completion claims spoken, one no_receipt decision row each."""
     spoken_claims = 0
     for prompt, model_reply in ACTION_PROMPTS:
         pool = _FakePool()
@@ -330,10 +330,10 @@ async def test_ten_action_prompts_give_zero_completion_claims(caplog):
 
         assert len(pool.gate_rows) == 1, prompt
         (row,) = pool.gate_rows.values()
-        assert row == {"decision": "replace", "category": "no_tool_row"}, prompt
+        assert row == {"decision": "replace", "category": "no_receipt"}, prompt
         replaced = [r for r in pool.gate_records
                     if r["event"] == "decision" and r["decision"] == "replace"]
-        assert [r["rule"] for r in replaced] == [f"{gate.FLOOR_VERSION}:no_tool_row"], prompt
+        assert [r["rule"] for r in replaced] == [f"{gate.FLOOR_VERSION}:no_receipt"], prompt
 
         blocked = [r for r in caplog.records if "blocked action claim" in r.getMessage()]
         assert len(blocked) == 1, prompt
@@ -352,7 +352,7 @@ async def test_ordinary_reply_passes_without_tool_lookup():
 
 
 async def test_backed_claim_is_spoken_unchanged():
-    pool = _FakePool(tools=["reminder_create"])
+    pool = _FakePool(tools=["reminder.create"])      # a receipt of this turn
     reply = await _run("Remind me at noon", "I'll remind you at noon.", pool)
     assert reply == "I'll remind you at noon."
     (row,) = pool.gate_rows.values()

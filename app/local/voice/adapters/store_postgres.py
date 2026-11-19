@@ -131,8 +131,20 @@ class PostgresSessionStore:
 
         return session_policy(self._app)
 
+    async def turn_receipts(self, session_id: str, turn_id: str | None) -> list[str]:
+        """The receipts the gate's action-claim rule reads (PL43): the tools with an executed
+        write receipt for this turn, or for the turn that confirmed them. This extends the
+        SessionStore port in this server; a failed lookup raises and the gate fails closed."""
+        from app.local.tools import audit
+
+        return await audit.turn_receipts(self._pool, session_id, turn_id)
+
     async def session_tools(self, session_id: str) -> list[str]:
-        return await reply_chain.session_tools(self._pool, session_id)
+        """The port's session-wide lookup: every executed write receipt in the session. The
+        host's gate does not read it (a receipt from another turn backs nothing)."""
+        from app.local.tools import audit
+
+        return await audit.session_receipts(self._pool, session_id)
 
     async def add_turn(self, turn: TurnRecord, outcome: ReplyOutcome, *, turn_end_ms: int,
                        asr_final_ms: int | None = None,

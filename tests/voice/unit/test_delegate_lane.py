@@ -46,7 +46,8 @@ SEARCH_TOPIC = "the best standing desks"
 SEARCH_RESULT = "The Uplift V2 is the top pick. It costs about six hundred dollars."
 TALKER_ANSWER = "Four."
 
-TOOL_ENTRY_POINTS = ("web_search", "search_answer", "record_tool_call", "app.local.tools")
+TOOL_ENTRY_POINTS = ("web_search", "search_answer", "tool_runtime", "runtime.call",
+                     "app.local.tools")
 
 UNRELATED_QUESTIONS = (
     "What time is it?", "What day is it?", "What's the date?", "What is 2+2?", "How are you?",
@@ -558,7 +559,9 @@ async def test_every_tool_row_carries_the_task_id(monkeypatch, talker_calls):
     (tool_row,) = pool.named_rows("tool_calls")
     assert tool_row["task_id"] == task.task_id
     assert (tool_row["turn_id"], tool_row["meeting_id"]) == ("turn-1", "s1")
-    assert tool_row["tool"] == "web_search" and tool_row["status"] == "executed"
+    assert tool_row["tool"] == "web.search" and tool_row["status"] == "executed"
+    assert tool_row["tool_version"] and tool_row["duration_ms"] >= 0
+    assert SEARCH_TOPIC not in str(tool_row)           # the query is kept as a digest only
 
     task_rows = pool.rows("delegate_tasks")
     assert {r[0] for r in task_rows} == {task.task_id}
@@ -593,13 +596,14 @@ async def test_search_that_is_cancelled_still_writes_its_tool_row(monkeypatch, t
 
 
 def test_the_talker_path_cannot_reach_a_tool():
-    """Inspection: the search tool is imported in one function, and only the thinker calls it.
-    The network decision (app.local.tools.network) is a check, not a tool, and runs before it."""
+    """Inspection: the reply chain reaches tools in one function, and only the thinker calls it.
+    The delegate reaches tools only through the tool runtime (its deterministic reminder routes
+    and the registry check before the lane), never the search module itself."""
     chain = inspect.getsource(reply_chain)
-    assert chain.count("app.local.tools.web_search") == 1
-    assert "app.local.tools.web_search" in inspect.getsource(reply_chain.search_answer)
+    assert chain.count("app.local.tools") == 1
+    assert "app.local.tools" in inspect.getsource(reply_chain.search_answer)
     adapter = inspect.getsource(delegate_ollama)
-    assert "app.local.tools" not in adapter
+    assert "web_search" not in adapter and "tools.web_search" not in adapter
     assert adapter.count("search_answer") == 1
     assert "search_answer" in inspect.getsource(OllamaDelegate._think)
     for talker_fn in (reply_chain.talker_sentences, reply_chain._sentence_stream,

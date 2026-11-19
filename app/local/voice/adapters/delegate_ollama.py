@@ -37,6 +37,9 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from voxscribe.session.ports import ReplyStream
 
 from app.local import reply_chain
+from app.local.tools import builtin
+from app.local.tools import runtime as tool_runtime
+from app.local.tools.runtime import CallContext
 from app.local.voice import delegate_lane as dl
 from app.local.voice.adapters.events_app import publish as publish_event
 from app.local.voice.adapters.store_postgres import PostgresDelegateTaskStore
@@ -147,10 +150,12 @@ class OllamaDelegate:
         async def submit(request: str) -> str | None:
             # The thinker's one tool is web search: it is refused here, before the lane, so the
             # person hears why at once and no task is started (PL41).
-            refusal = await reply_chain.refuse_search(self._app, session_id, turn_id=turn_id)
-            if refusal is not None:
+            refused = await tool_runtime.preflight(
+                self._app, builtin.WEB_SEARCH, CallContext(session_id=session_id,
+                                                           turn_id=turn_id))
+            if refused is not None:
                 log.info("voice delegate: search refused session_id=%s", session_id)
-                return refusal
+                return refused.line
             task = self.lane.submit(request, session_id=session_id, turn_id=turn_id)
             if hist and task.status in dl.ACTIVE_STATUSES:
                 self._contexts[task.task_id] = hist

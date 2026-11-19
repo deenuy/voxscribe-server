@@ -12,8 +12,10 @@ G3: seniorcare mode refuses medical dosing with the escalation phrase.
 G4: injection-resistant -- gate uses fixed regex, not LLM output or user text structure.
 G5: gate failure never plays model text; caller uses refusal_phrase() only (enforced by reply_chain.py).
 G6: behaviour log written per exchange to BEHAVIOUR_LOG_DIR (no transcript text).
-G7: a sentence claiming a completed action (reminder, alarm, timer, calendar) with no
-    matching tool_calls row in the session is replaced with a fixed phrase (Defect F).
+G7: a sentence claiming a completed action (reminder, alarm, timer, calendar) is replaced with
+    a fixed phrase unless an executed receipt of that action's type exists for the turn that
+    speaks it, or for the turn whose yes confirmed it (Defect F; PL43, TOOLS-CONNECTORS.md 2.6).
+    A failed call, a refusal, a read, or a receipt from an earlier turn backs nothing.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from pathlib import Path
 log = logging.getLogger("app.local.gate")
 
 # Stamped on every record a floor rule decides. Bump it when a rule below changes.
-FLOOR_VERSION = "host-floor-v1"
+FLOOR_VERSION = "host-floor-v2"      # v2: G7 needs a receipt in this turn (PL43)
 
 # ── Fixed reply phrases (immutable per VOICE-AUTOPILOT.md) ──────────────────
 
@@ -123,14 +125,17 @@ def check(user_text: str, reply_text: str, mode: str = "default") -> tuple[str, 
     return "pass", "ok"
 
 
-# ── G7: action claims must be backed by a tool row ──────────────────────────
+# ── G7: action claims must be backed by a receipt ───────────────────────────
 # The reply model has no reminder, alarm, timer or calendar tool, yet it says
 # "I've added a reminder" (ROOT-CAUSE Defect F). Any sentence claiming such an
-# action is replaced unless the session has a tool_calls row for that tool type.
+# action is replaced unless the turn speaking it has an executed receipt of that
+# action's type (app/local/tools/audit.py turn_receipts). The success lines of the
+# engine's own tools are claims too, so they pass only after the store committed.
 # Extend the tuples below; the control flow does not change.
 
 ACTION_CLAIM_PHRASE = "I can't set reminders or alarms yet, but I can help answer questions."
-ACTION_CLAIM_REASON = "no_tool_row"
+ACTION_CLAIM_REASON = "no_receipt"
+ACTION_CLAIM_BACKED = "receipt"
 
 # Action-completion language, matched case-insensitively on word boundaries.
 ACTION_CLAIM_KEYWORDS: tuple[str, ...] = (
@@ -158,10 +163,15 @@ ACTION_CLAIM_KEYWORDS: tuple[str, ...] = (
     "set a timer",
     "added a reminder",
     "added an alarm",
+    # The forms the tools' templates and the models use (section 2.6).
+    "timer set",
+    "reminder set",
+    "alarm set",
+    "added to your calendar",
 )
 
 # Tool types that can back an action claim, each with the words that name it in a sentence.
-# A tool_calls.tool value backs a claim when it contains the tool type (e.g. "reminder_create").
+# A receipt's tool name backs a claim when it contains the tool type (e.g. "reminder.create").
 ACTION_TOOL_TYPES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("reminder", ("remind",)),
     ("alarm",    ("alarm",)),
@@ -190,29 +200,30 @@ def _claimed_tool_types(sentence: str) -> set[str]:
     return {tool for tool, words in ACTION_TOOL_TYPES if any(w in text for w in words)}
 
 
-def _backing_tool_types(session_tools: Iterable[str]) -> set[str]:
-    names = [t.lower() for t in session_tools if t]
+def _backing_tool_types(receipts: Iterable[str]) -> set[str]:
+    names = [t.lower() for t in receipts if t]
     return {tool for tool, _ in ACTION_TOOL_TYPES if any(tool in n for n in names)}
 
 
-def check_action_claim(sentence: str, session_tools: Iterable[str]) -> tuple[str, str]:
+def check_action_claim(sentence: str, receipts: Iterable[str]) -> tuple[str, str]:
     """Return (decision, reason) for one sentence about to be spoken.
 
     decision: "pass" | "replace"
-    reason:   "ok" (no claim) | "tool_row" (claim backed) | "no_tool_row" (claim not backed)
+    reason:   "ok" (no claim) | "receipt" (claim backed) | "no_receipt" (claim not backed)
 
-    session_tools: tool_calls.tool values recorded in this session. A claim naming a tool type
-    (e.g. "alarm") needs a row of that type; a claim naming none ("I've saved it") needs a row
-    of any action tool type. Web search never backs a claim.
+    receipts: the tool names with an executed write receipt for the turn speaking (or the turn
+    that confirmed the call). A claim naming a tool type (e.g. "alarm") needs a receipt of that
+    type; a claim naming none ("I've saved it") needs a receipt of any action tool type. Web
+    search and other reads never back a claim.
     On "replace", speak ACTION_CLAIM_PHRASE instead of the sentence.
     """
     keyword = find_action_claim(sentence)
     if keyword is None:
         return "pass", "ok"
     claimed = _claimed_tool_types(sentence)
-    backing = _backing_tool_types(session_tools)
+    backing = _backing_tool_types(receipts)
     if (claimed & backing) if claimed else backing:
-        return "pass", "tool_row"
+        return "pass", ACTION_CLAIM_BACKED
     log.info("gate: blocked action claim, sentence_len=%d, reason=%s",
              len(sentence), ACTION_CLAIM_REASON)
     return "replace", ACTION_CLAIM_REASON
