@@ -76,7 +76,7 @@ async def test_interruption_to_silence_timing():
 
 
 async def test_interrupted_turn_writes_heard_and_full_text(throwaway_schema):
-    from app.local.voice.adapters.gate_rule import RuleGate
+    from app.local.voice.adapters.gate_policy import CorePolicyGate
     from app.local.voice.adapters.store_postgres import PostgresSessionStore
     from tests.conftest import make_app
 
@@ -88,7 +88,7 @@ async def test_interrupted_turn_writes_heard_and_full_text(throwaway_schema):
         burst = Burst(at_playback_ms=_ms(clauses[0]) + _ms(clauses[1]) + _ms(clauses[2]) / 2,
                       dur_ms=INTERJECTION_MS, amp=LOUD)
         ports, capture = sim_ports([burst], delegate=FakeDelegate([clauses]),
-                                   store=PostgresSessionStore(app), gate=RuleGate())
+                                   store=PostgresSessionStore(app), gate=CorePolicyGate())
         host = VoiceHost(VoiceConfig(), ports=ports)
         session_id = await ports.store.create_session(0.9, detector="fake")
         await asyncio.wait_for(host._reply(session_id, 1, "what is the weather",

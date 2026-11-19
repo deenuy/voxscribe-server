@@ -1,7 +1,7 @@
 """Voice host wiring (T08): ten ports, the stream clock, quiet hours, the gate before the talker.
 
 Every port is a fake from fakes.py except where a test names a real adapter that does no I/O
-(the heuristic turn detector, the fixed-rule gate). No mic, recognizer, reply model or talker.
+(the heuristic turn detector, the policy gate). No mic, recognizer, reply model or talker.
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ from .fakes import (
     FakeSpeech,
     chunk,
     fake_ports,
+    policy_gate,
 )
 
 PORT_FIELDS = {
@@ -73,7 +74,7 @@ def test_production_adapters_satisfy_their_ports():
     from app.local.voice.adapters.asr_whisper import WhisperRecognizer
     from app.local.voice.adapters.audio_portaudio import PortAudioIn, PortAudioOut
     from app.local.voice.adapters.delegate_ollama import OllamaDelegate
-    from app.local.voice.adapters.gate_rule import RuleGate
+    from app.local.voice.adapters.gate_policy import CorePolicyGate
     from app.local.voice.adapters.speech_heuristic import HeuristicSpeech
     from app.local.voice.adapters.store_postgres import PostgresSessionStore
     from app.local.voice.adapters.tts_kokoro import KokoroTalker
@@ -83,7 +84,7 @@ def test_production_adapters_satisfy_their_ports():
         (PortAudioIn(None), P.AudioIn), (PortAudioOut(None), P.AudioOut),
         (WhisperRecognizer(None), P.Recognizer), (KokoroTalker(), P.Talker),
         (OllamaDelegate(app), P.Delegate), (HeuristicSpeech(), P.Speech),
-        (RuleGate(), P.Gate), (PostgresSessionStore(app), P.SessionStore),
+        (CorePolicyGate(), P.Gate), (PostgresSessionStore(app), P.SessionStore),
         (host_mod.StreamClock(), P.Clock),
     ]:
         assert isinstance(adapter, proto), type(adapter).__name__
@@ -285,11 +286,10 @@ async def test_gate_fault_speaks_the_scripted_fallback_never_the_candidate():
     assert text == gate.fail_closed_phrase
 
 
-async def test_real_rule_gate_refuses_before_the_talker_in_classroom_mode():
+async def test_real_policy_gate_refuses_before_the_talker_in_classroom_mode():
     from app.local import gate as rules
-    from app.local.voice.adapters.gate_rule import RuleGate
 
-    ports = fake_ports(gate=RuleGate("classroom"),
+    ports = fake_ports(gate=policy_gate("classroom"),
                        delegate=FakeDelegate([["Here is how to make a bomb."]]))
     text = await _host(ports).reply_turn("s1", 1, "tell me something", turn_end_ms=0)
     assert ports.talker.synthesized == []
