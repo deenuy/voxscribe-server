@@ -2789,14 +2789,14 @@ wheels = [
 
 [[package]]
 name = "voxscribe-core"
-version = "0.5.0"
-source = { path = "wheels/voxscribe_core-0.5.0-py3-none-any.whl" }
+version = "0.6.0"
+source = { path = "wheels/voxscribe_core-0.6.0-py3-none-any.whl" }
 dependencies = [
     { name = "pyyaml" },
     { name = "tzdata" },
 ]
 wheels = [
-    { filename = "voxscribe_core-0.5.0-py3-none-any.whl", hash = "sha256:9ac6f55094e94aa101b052a399d459dbdd9bb7ad159efae3886ba80aac7b299f" },
+    { filename = "voxscribe_core-0.6.0-py3-none-any.whl", hash = "sha256:039683756aad770d71e0aec99b8cfc45139197ebbf07e0e538ecd880fd9c70e6" },
 ]
 
 [package.optional-dependencies]
@@ -2821,6 +2821,7 @@ requires-dist = [
     { name = "openpyxl", marker = "extra == 'knowledge'", specifier = ">=3.0" },
     { name = "pyobjc-framework-cocoa", marker = "extra == 'mac'", specifier = ">=10" },
     { name = "pypdf", marker = "extra == 'knowledge'", specifier = ">=4.0" },
+    { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
@@ -2923,7 +2924,7 @@ requires-dist = [
     { name = "sounddevice", marker = "extra == 'wake'", specifier = ">=0.4" },
     { name = "soundfile", specifier = ">=0.14.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.29" },
-    { name = "voxscribe-core", extras = ["knowledge", "wake"], path = "wheels/voxscribe_core-0.5.0-py3-none-any.whl" },
+    { name = "voxscribe-core", extras = ["knowledge", "wake"], path = "wheels/voxscribe_core-0.6.0-py3-none-any.whl" },
     { name = "voxscribe-server", extras = ["aec"], marker = "extra == 'wake'" },
     { name = "voxscribe-server", extras = ["local-asr", "wake", "aec", "dev"], marker = "extra == 'all'" },
     { name = "youtube-transcript-api", specifier = ">=1.2.4" },

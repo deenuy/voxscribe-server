@@ -100,8 +100,8 @@ async def _reply_ids(app, session_id: str) -> dict[int, tuple[str, str, str]]:
     ("senior_care", "seniorcare", "seniorcare-v1", "allowlist"),
     ("classroom", "classroom", "classroom-v1", "allowlist"),
     ("ideascribe", "ideascribe", "ideascribe-v1", "denylist"),
-    # Core 0.5.0 ships no personal pack; personal runs the ideascribe pack (reported gap).
-    ("personal", "ideascribe", "ideascribe-v1", "denylist"),
+    # Core 0.6.0 ships a personal pack; personal now loads its own versioned pack.
+    ("personal", "personal", "personal-v1", "denylist"),
 ])
 def test_each_product_mode_loads_its_versioned_pack_in_the_right_posture(profile, pack, version,
                                                                          posture):

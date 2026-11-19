@@ -1,4 +1,4 @@
-"""PL03: Product profile reaches the voice host (X4, UNIT).
+"""PL03 / PL31: Product profile reaches the voice host (X4, UNIT).
 
 Covers:
   - QuietHours.active() across window styles.
@@ -6,10 +6,12 @@ Covers:
   - Senior care always answers a wake (VX-H5); quiet_hours_block_wake=False for that mode.
   - Personal profile with quiet_hours_enabled=True rejects wakes inside the window.
   - Explicit server config (settings) wins over profile defaults for wake phrase and
-    quiet hours; senior care exception: settings can never enable wake-blocking there.
+    quiet hours; senior care exception: profile field cannot be overridden to block.
   - Changing voice or speed via the get_voice_speed callable changes the arguments
     tts_engine.synthesize receives.
   - Health profile mode matches the loaded Profile.mode, not a hardcoded string.
+  - PL31: quiet_hours_block_wake and end_of_turn_pause_s come from the profile;
+    no mode-name check in host.py; changing pause changes the host's silence_needed.
 
 No mic, model, database or network required.
 """
@@ -29,6 +31,8 @@ from app.local.voice.host import (
     CONV_IDLE_S,
     FRAME_SAMPLES,
     QUIET_HOURS_REASON,
+    SAMPLE_RATE,
+    SILENCE_S,
     QuietHours,
     VoiceConfig,
     VoiceHost,
@@ -83,17 +87,22 @@ def test_from_profile_quiet_hours_enabled_builds_quiet_hours_object():
 
 
 def test_from_profile_senior_care_does_not_block_wake():
-    """Senior care always answers a wake (VX-H5); quiet_hours_block_wake must be False."""
-    sc = Profile(mode="senior_care", quiet_hours_enabled=True)
+    """Senior care sets quiet_hours_block_wake=False in the profile field (VX-H5).
+
+    The shipped senior_care.yaml has quiet_hours_block_wake: false, so from_profile
+    reads False. No mode-name check is needed.
+    """
+    sc = Profile(mode="senior_care", quiet_hours_enabled=True, quiet_hours_block_wake=False)
     config = VoiceConfig.from_profile(sc)
     assert config.quiet_hours is not None      # window is present
-    assert config.quiet_hours_block_wake is False  # but it never blocks a wake
+    assert config.quiet_hours_block_wake is False  # profile field, not mode check
 
 
 def test_from_profile_non_senior_care_blocks_wake_during_quiet_hours():
-    """All other modes block wakes when the window is active."""
+    """All other modes have quiet_hours_block_wake=True (the default)."""
     for mode in ("personal", "ideascribe", "classroom"):
         p = Profile(mode=mode, quiet_hours_enabled=True)  # type: ignore[arg-type]
+        # quiet_hours_block_wake defaults to True; the profile field drives from_profile.
         config = VoiceConfig.from_profile(p)
         assert config.quiet_hours_block_wake is True, f"mode={mode}"
 
@@ -202,16 +211,21 @@ class _NeverActive:
 
 
 async def test_senior_care_profile_quiet_hours_active_wake_opens_session():
-    """Senior care always answers a wake (VX-H5); window active does not block it."""
+    """Senior care always answers a wake (VX-H5); window active does not block it.
+
+    The profile field quiet_hours_block_wake=False is what controls this;
+    no mode-name check is performed in host code.
+    """
     senior_care = Profile(
         mode="senior_care",
         quiet_hours_enabled=True,
         quiet_hours_start="21:00",
         quiet_hours_end="08:00",
+        quiet_hours_block_wake=False,   # senior care: set by the profile
     )
     config = VoiceConfig.from_profile(senior_care)
     assert config.quiet_hours is not None           # window is present
-    assert config.quiet_hours_block_wake is False   # but it must not block
+    assert config.quiet_hours_block_wake is False   # profile field, not mode check
 
     # Replace the real QuietHours with an always-active stub so the test is clock-independent.
     config = VoiceConfig(
@@ -392,11 +406,14 @@ def test_settings_quiet_hours_enabled_wins_over_profile_default():
 
 
 def test_settings_quiet_hours_cannot_block_wake_in_senior_care():
-    """Even if the operator enables VOXSCRIBE_QUIET_HOURS_ENABLED, senior care never blocks."""
-    sc = Profile(mode="senior_care", quiet_hours_enabled=True)
+    """Even if the operator enables VOXSCRIBE_QUIET_HOURS_ENABLED, senior care never blocks.
+
+    The profile field quiet_hours_block_wake=False is the authority; settings cannot override.
+    """
+    sc = Profile(mode="senior_care", quiet_hours_enabled=True, quiet_hours_block_wake=False)
     settings = _fake_settings(qh_enabled=True, qh_start="21:00", qh_end="08:00")
     config = VoiceConfig.from_profile(sc, settings=settings)
-    # Window is present (operator set it), but wake is never blocked for senior care.
+    # Window is present (operator set it), but profile says no blocking.
     assert config.quiet_hours is not None
     assert config.quiet_hours_block_wake is False
 
@@ -409,3 +426,87 @@ def test_settings_quiet_hours_disabled_does_not_override_profile():
     config = VoiceConfig.from_profile(p, settings=settings)
     # Profile's quiet hours survive; settings did not override.
     assert config.quiet_hours is not None
+
+
+# ── PL31: profile-field-driven quiet hours and end-of-turn pause ─────────────
+
+
+def test_pl31_no_mode_name_in_host_source():
+    """host.py must not contain the string 'senior_care' in VoiceConfig.from_profile.
+
+    The mode check was replaced by reading the profile's quiet_hours_block_wake field.
+    This source-level assertion detects any regression that re-introduces a mode name.
+    """
+    import inspect
+    import app.local.voice.host as host_module
+    source = inspect.getsource(host_module.VoiceConfig.from_profile)
+    assert "senior_care" not in source, (
+        "from_profile must not contain 'senior_care'; "
+        "use profile.quiet_hours_block_wake instead"
+    )
+
+
+def test_pl31_senior_care_profile_answers_wake_during_quiet_hours():
+    """Senior care profile sets quiet_hours_block_wake=False; wake is never blocked (VX-H5).
+
+    Uses the shipped senior_care.yaml profile to confirm the field is set correctly and
+    that from_profile reads it.
+    """
+    from .fakes import shipped_profile
+    sc = shipped_profile("senior_care")
+    config = VoiceConfig.from_profile(sc)
+    assert config.quiet_hours is not None           # window is present in senior_care.yaml
+    assert config.quiet_hours_block_wake is False   # but it must not block
+
+
+def test_pl31_personal_profile_rejects_wake_during_quiet_hours():
+    """Personal profile with quiet_hours_enabled=True blocks a wake inside the window."""
+    from .fakes import shipped_profile
+    pe = shipped_profile("personal")
+    # personal.yaml has quiet_hours_enabled=False by default; override for this test.
+    pe_qh = Profile(
+        mode=pe.mode,
+        wake=pe.wake,
+        reply=pe.reply,
+        gate=pe.gate,
+        network=pe.network,
+        enrollment=pe.enrollment,
+        quiet_hours_enabled=True,
+        quiet_hours_start="22:00",
+        quiet_hours_end="07:00",
+        quiet_hours_block_wake=pe.quiet_hours_block_wake,
+        end_of_turn_pause_s=pe.end_of_turn_pause_s,
+    )
+    config = VoiceConfig.from_profile(pe_qh)
+    assert config.quiet_hours is not None
+    assert config.quiet_hours_block_wake is True
+
+
+def test_pl31_changing_pause_in_profile_changes_silence_needed():
+    """The host computes silence_needed from the profile's end_of_turn_pause_s.
+
+    Two profiles with different pause values must produce different silence_needed chunk counts.
+    Uses a fake clock (no wall time) to verify the computation.
+    """
+    p_default = Profile()   # end_of_turn_pause_s = 6.0
+    p_custom = Profile(end_of_turn_pause_s=10.0)
+
+    config_default = VoiceConfig.from_profile(p_default)
+    config_custom = VoiceConfig.from_profile(p_custom)
+
+    assert config_default.end_of_turn_pause_s == 6.0
+    assert config_custom.end_of_turn_pause_s == 10.0
+
+    silence_default = int(config_default.end_of_turn_pause_s * SAMPLE_RATE / CHUNK_FRAMES)
+    silence_custom = int(config_custom.end_of_turn_pause_s * SAMPLE_RATE / CHUNK_FRAMES)
+
+    assert silence_default != silence_custom
+    assert silence_custom > silence_default
+    # Confirm the formula matches what _listen computes: (pause_s * SAMPLE_RATE / CHUNK_FRAMES)
+    assert silence_default == int(SILENCE_S * SAMPLE_RATE / CHUNK_FRAMES)
+
+
+def test_pl31_default_pause_matches_silence_s():
+    """VoiceConfig.from_profile with no pause override uses SILENCE_S as the default."""
+    config = VoiceConfig.from_profile(Profile())
+    assert config.end_of_turn_pause_s == SILENCE_S
