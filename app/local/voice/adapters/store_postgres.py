@@ -4,6 +4,11 @@ Also the delegate lane's task rows (delegate_tasks), written by PostgresDelegate
 A voice session is a meeting with origin "wake", created and stopped through the same
 MeetingStore calls the mic button uses, then finalised like any other meeting. Segments are
 upserted and published on meeting_bus as transcript.stable, as the live WebSocket path does.
+
+Every connection is borrowed through scoped_pool() (adapters/scope.py): with tenant isolation on
+these writes only happen inside the session's tenant scope, which the host enters. The session
+row records who and what the session ran for: tenant, product, device and profile version, read
+from the session in scope.
 """
 from __future__ import annotations
 
@@ -15,8 +20,10 @@ from datetime import UTC, datetime
 from voxscribe.session.ports import ReplyOutcome, TranscriptSegment, TurnRecord
 
 from app.local import reply_chain
+from app.local.voice.adapters.scope import scoped_pool
 from app.local.voice.barge_in import Interruption
 from app.local.voice.delegate_lane import DelegateTask, TaskStatus
+from app.local.voice.host import current_session
 
 log = logging.getLogger("app.local.voice.store")
 
@@ -35,7 +42,7 @@ class PostgresSessionStore:
 
     @property
     def _pool(self):
-        return self._app.state.store.pool
+        return scoped_pool(self._app)
 
     def _meetings(self):
         from app.local.store_meetings import MeetingStore
@@ -66,9 +73,16 @@ class PostgresSessionStore:
         await store.create_meeting(meeting_id=meeting_id,
                                    title=SESSION_TITLE.format(datetime.now(UTC)),
                                    origin="wake", client_request_id=f"wake-{meeting_id}")
+        session = current_session()
         async with self._pool.connection() as conn:
             await conn.execute("UPDATE meetings SET consent_version=%s, consent_at=%s WHERE id=%s",
                                (CONSENT_VERSION, _now_z(), meeting_id))
+            if session is not None:
+                await conn.execute(
+                    "UPDATE meetings SET tenant=%s, product=%s, device=%s, profile_version=%s"
+                    " WHERE id=%s",
+                    (session.tenant, session.product or None, session.device or None,
+                     session.profile_version or None, meeting_id))
             await conn.commit()
         await self.record_wake(score=wake_score, accepted=True, reject_reason=None,
                                detector=detector, speech_ratio=speech_ratio,
@@ -158,7 +172,7 @@ class PostgresDelegateTaskStore:
         delivered = task.status is TaskStatus.DELIVERED
         async with self._order:
             try:
-                async with self._app.state.store.pool.connection() as conn:
+                async with scoped_pool(self._app).connection() as conn:
                     await conn.execute(
                         "INSERT INTO delegate_tasks"
                         " (id, session_id, request, status, result, delivered_at, task_id)"

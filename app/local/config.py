@@ -150,6 +150,10 @@ class Config:
     def tenancy_enforced(self) -> bool:
         return bool(self.identity_issuer and self.identity_audience and self.identity_jwks_url)
 
+    # What this engine's own audio devices are called on a voice session's row (VOXSCRIBE_DEVICE_ID).
+    # Empty: the voice scope adapter's name for an unnamed device.
+    device_id: str = ""
+
     # Voice
     voice_enabled: bool = False
     tts_engine: str = "piper"
@@ -226,6 +230,11 @@ class Config:
         configured = [bool(config_dict.get(f)) for f in ("identity_issuer", "identity_audience", "identity_jwks_url")]
         if any(configured) and not all(configured):
             _fail("VOXSCRIBE_IDENTITY_*", "set all of ISSUER, AUDIENCE and JWKS_URL, or none of them")
+
+        # Device
+        device_id = env_vars.get("VOXSCRIBE_DEVICE_ID", "").strip()
+        if device_id:
+            config_dict["device_id"] = device_id
 
         # Providers
         providers = env_vars.get("VOXSCRIBE_PROVIDERS", "").strip()

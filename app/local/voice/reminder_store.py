@@ -230,7 +230,9 @@ class ReminderStore:
 
     @property
     def _pool(self):
-        return self._app.state.store.pool
+        from app.local.voice.adapters.scope import scoped_pool  # lazy: this module stays pure
+
+        return scoped_pool(self._app)
 
     # ---------------------------------------------------------------- writes
 

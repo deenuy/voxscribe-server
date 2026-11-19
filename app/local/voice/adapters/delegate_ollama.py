@@ -248,6 +248,16 @@ class OllamaDelegate:
         self._writes.add(write)
         write.add_done_callback(self._writes.discard)
 
+    def forget(self) -> None:
+        """The device now listens for someone else: nothing held here for the person before may
+        reach them. Open tasks are cancelled, waiting results and the stale offer are dropped.
+        The host calls this inside the previous person's scope, so the rows it updates are theirs."""
+        lane = self.lane
+        for task in [*lane.active(), *lane.get_pending()]:
+            lane.cancel(task.task_id)
+        self._contexts.clear()
+        self._offered = None
+
     async def drain(self) -> None:
         """Wait for task rows still being written (shutdown and tests)."""
         while self._writes:

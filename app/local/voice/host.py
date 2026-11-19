@@ -35,17 +35,27 @@ frame), the debug trigger (behind --debug-trigger, see routers/wake.py), barge-i
 (the playback-ratio rule, BARGE_RATIO), multi-turn conversations with stop phrases, and the
 speculative reply start with its drift rule.
 No transcript text, audio or prompt is logged.
+
+A session belongs to someone (PL05). SessionBinding says who and what a session is for (tenant,
+product, device); SessionContext is the one object per session that carries it, the profile
+version in force and the turn state. The host enters the binding's scope while it is armed and
+the session's scope for the length of a session, through the SessionScope it was given, so every
+store write and every event of the session happens inside it and the tasks the session starts
+inherit it. With tenant isolation on, a host with no tenant bound does not arm and opens no
+session (SessionTenantRequiredError); there is no shared schema to fall back to.
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import datetime
 import logging
 import os
 import re
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -570,11 +580,49 @@ def _no_events(_kind: str, _data: dict) -> None:
     pass
 
 
+class SessionTenantRequiredError(RuntimeError):
+    """Tenant isolation is on and no tenant is bound: the host does not arm and opens no session.
+
+    There is no fallback to a shared schema. A tenant is bound by a verified person (bind())."""
+
+    code = "voice_tenant_unbound"
+
+
+class SessionInProgressError(RuntimeError):
+    """The device cannot be bound to another tenant while a session is running."""
+
+    code = "voice_session_in_progress"
+
+
+@dataclass(frozen=True)
+class SessionBinding:
+    """Who and what a session is for. It comes from a verified credential, never from the audio:
+    the request that arms the device host today, the connection's ticket for a network session.
+
+    tenant   whose data the session reads and writes: the tenant key, the unit of isolation.
+             None only when tenant isolation is off (the single shared scope)
+    product  the product the session serves (the loaded profile's mode)
+    device   where the audio comes from
+
+    Organization and role are claims for access decisions, not isolation; they join this type,
+    with defaults, when identity carries them."""
+
+    tenant: str | None = None
+    product: str = ""
+    device: str = ""
+
+
 @dataclass
 class SessionContext:
-    """One conversation's state across its turns."""
+    """One voice session: who it is for, the profile it runs under, and its state across turns.
 
-    session_id: str = ""
+    Opened by SessionScope.session(), which is the only place one is made. The binding and the
+    profile version are fixed for the life of the session; a device bound to someone else
+    meanwhile changes the next session, not this one."""
+
+    session_id: str = ""            # set once the store has created the session row
+    binding: SessionBinding = field(default_factory=SessionBinding)
+    profile_version: str = ""       # the profile in force when the session opened
     history: list[dict] = field(default_factory=list)
     late_finals: list[asyncio.Task] = field(default_factory=list)   # final decodes past the window
     silent: bool = False            # turn 1 heard no genuine speech: leave no meeting behind
@@ -582,6 +630,59 @@ class SessionContext:
     played_text: str = ""          # what the user heard of it
     pre_roll: np.ndarray | None = None   # the interjection's start, captured during the reply
     held_empty: bool = False       # one wordless turn after a barge-in did not end the session
+
+    @property
+    def tenant(self) -> str | None:
+        return self.binding.tenant
+
+    @property
+    def product(self) -> str:
+        return self.binding.product
+
+    @property
+    def device(self) -> str:
+        return self.binding.device
+
+
+_session: contextvars.ContextVar[SessionContext | None] = contextvars.ContextVar(
+    "voxscribe_voice_session", default=None)
+
+
+def current_session() -> SessionContext | None:
+    """The voice session in scope, for adapters that write or publish on its behalf. None
+    outside a session (the armed loop, a request, a test that calls an adapter directly)."""
+    return _session.get()
+
+
+class SessionScope:
+    """Where the host enters a binding's scope and opens a session.
+
+    This one is for a host with no tenant isolation: there is no tenant scope to enter, and a
+    session is still an object in scope. The server's adapter (adapters/scope.py) adds the
+    tenant's database scope, the refusal when isolation is on and no tenant is bound, and the
+    profile version."""
+
+    tenant_required = False         # True when a binding without a tenant must be refused
+
+    def profile_version(self) -> str:
+        """The profile in force for the tenant in scope. Read once, as a session opens."""
+        return ""
+
+    @contextmanager
+    def bound(self, binding: SessionBinding) -> Iterator[None]:
+        """Everything inside works for this binding's tenant, and so do the tasks it starts."""
+        yield
+
+    @contextmanager
+    def session(self, binding: SessionBinding) -> Iterator[SessionContext]:
+        """Open a session for this binding: its tenant's scope, with the session in scope."""
+        with self.bound(binding):
+            context = SessionContext(binding=binding, profile_version=self.profile_version())
+            token = _session.set(context)
+            try:
+                yield context
+            finally:
+                _session.reset(token)
 
 
 @dataclass
@@ -597,7 +698,9 @@ class VoiceHost:
     def __init__(self, config: VoiceConfig, ports: VoicePorts | None = None, *,
                  build: Callable[[], VoicePorts] | None = None,
                  wake_gate: WakeGate | None = None,
-                 publish: Callable[[str, dict], None] | None = None) -> None:
+                 publish: Callable[[str, dict], None] | None = None,
+                 scope: SessionScope | None = None,
+                 binding: SessionBinding | None = None) -> None:
         if ports is None and build is None:
             raise ValueError("VoiceHost needs ports or a build function")
         self.config = config
@@ -605,6 +708,11 @@ class VoiceHost:
         self._build = build
         self._gate = wake_gate
         self._publish = publish or _no_events
+        self._scope = scope or SessionScope()
+        self._binding = binding or SessionBinding()    # who the device's sessions are for
+        self._served: SessionBinding | None = None      # the binding the adapters last worked for
+        self._open: SessionContext | None = None        # the device's session, while one runs
+        self._rebound = False                           # bind() changed it: the armed loop re-enters
         self._task: asyncio.Task | None = None
         self._cues: set[asyncio.Task] = set()      # cues playing off the hot path
         self._capture_reset_pending = False
@@ -619,6 +727,7 @@ class VoiceHost:
     @classmethod
     def from_app(cls, app) -> VoiceHost:
         from app.local.voice.adapters.events_app import publish_broadcast
+        from app.local.voice.adapters.scope import TenantSessionScope
 
         profile = getattr(getattr(app, "state", None), "profile", None)
         settings = getattr(getattr(app, "state", None), "settings", None)
@@ -626,7 +735,11 @@ class VoiceHost:
             config = VoiceConfig.from_profile(profile, settings=settings)
         else:
             config = VoiceConfig.from_settings(settings)
-        return cls(config, build=lambda: build_ports(app), publish=publish_broadcast)
+        # The device starts with no tenant. With isolation on it stays off until a verified
+        # person binds it (routers/wake.py); with isolation off there is no tenant to wait for.
+        scope = TenantSessionScope(app)
+        return cls(config, build=lambda: build_ports(app), publish=publish_broadcast,
+                   scope=scope, binding=scope.device_binding())
 
     # ------------------------------------------------------------------ state
 
@@ -640,9 +753,61 @@ class VoiceHost:
     def set_state(self, s: WakeState) -> None:
         self._state["state"] = s
 
+    @property
+    def binding(self) -> SessionBinding:
+        return self._binding
+
+    @property
+    def bound(self) -> bool:
+        """False when tenant isolation is on and nobody has bound the device yet."""
+        return self._binding.tenant is not None or not self._scope.tenant_required
+
+    def bind(self, binding: SessionBinding) -> bool:
+        """Say who the device's sessions are for. True when the binding changed.
+
+        The armed loop leaves the old scope on its next frame and comes back in the new one. A
+        session in progress keeps the binding it opened with, so binding the device to another
+        tenant while one runs is refused. A binding with no tenant unbinds: with isolation on
+        the host then goes off until it is bound again."""
+        if binding == self._binding:
+            return False
+        if binding.tenant != self._binding.tenant and self._open is not None:
+            raise SessionInProgressError("a voice session is in progress for another tenant")
+        self._binding = binding
+        self._rebound = True
+        log.info("voice host: bound tenant=%s product=%s device=%s", binding.tenant,
+                 binding.product, binding.device)
+        return True
+
+    def _device_binding(self) -> SessionBinding:
+        """The binding the device works for now, or SessionTenantRequiredError. When it is no
+        longer the tenant the adapters last worked for, what they hold for that person goes."""
+        binding = self._binding
+        if not self.bound:
+            raise SessionTenantRequiredError(
+                "tenant isolation is on and no tenant is bound to the voice host")
+        served, self._served = self._served, binding
+        if served is not None and served.tenant != binding.tenant:
+            self._forget(served)
+        return binding
+
+    def _forget(self, served: SessionBinding) -> None:
+        """Drop what the adapters hold in memory for the person the device served before (the
+        delegate's open tasks and waiting results), inside that person's scope so the rows this
+        updates are theirs. An adapter with nothing to forget has no forget()."""
+        forget = getattr(getattr(self.ports, "delegate", None), "forget", None)
+        if forget is None:
+            return
+        with self._scope.bound(served):
+            forget()
+        log.info("voice host: dropped the state held for tenant=%s", served.tenant)
+
     def arm(self) -> bool:
         if self.state in (WakeState.ARMED, WakeState.LISTENING):
             return False
+        if not self.bound:
+            raise SessionTenantRequiredError(
+                "tenant isolation is on and no tenant is bound to the voice host")
         self.set_state(WakeState.ARMED)
         self._publish("wake_state", self.snapshot())
         return True
@@ -688,7 +853,10 @@ class VoiceHost:
     async def run(self) -> None:
         """Outer wrapper: any unhandled exception resets to armed after CRASH_RESET_S."""
         log.info("voice host: starting")
-        self.set_state(WakeState.ARMED)
+        if self.bound:
+            self.set_state(WakeState.ARMED)
+        else:
+            log.info("voice host: off until a tenant is bound (tenant isolation is on)")
         try:
             while True:
                 if self.state == WakeState.OFF:
@@ -698,6 +866,10 @@ class VoiceHost:
                     await self._armed_session_loop()
                 except asyncio.CancelledError:
                     raise
+                except SessionTenantRequiredError as exc:
+                    log.warning("voice host: not arming: %s", exc)
+                    self.set_state(WakeState.OFF)
+                    self._publish("wake_state", self.snapshot())
                 except Exception:
                     log.exception("voice host: crashed -- resetting in %.0f s", CRASH_RESET_S)
                     self.set_state(WakeState.ERROR)
@@ -725,23 +897,28 @@ class VoiceHost:
         p = await self._ready()
         gate = await self._wake_gate()
         self._state["model"] = gate.detector.model_name
-        self.set_state(WakeState.ARMED)
-        log.info("[Vox Initialized] armed detector=%s patience=%d threshold=%.2f; say %r to start",
-                 gate.detector.model_name, gate.detector.patience_frames, gate.config.threshold,
-                 self.config.trigger_phrase)
-        self._publish_state(WakeState.ARMED)
+        # Armed means armed for someone: wake candidates are that person's rows, so the whole
+        # armed stretch runs in the binding's scope, and with no tenant bound it does not start.
+        binding = self._device_binding()
+        self._rebound = False
+        with self._scope.bound(binding):
+            self.set_state(WakeState.ARMED)
+            log.info("[Vox Initialized] armed detector=%s patience=%d threshold=%.2f; say %r to "
+                     "start", gate.detector.model_name, gate.detector.patience_frames,
+                     gate.config.threshold, self.config.trigger_phrase)
+            self._publish_state(WakeState.ARMED)
 
-        # Resident models before the first wake: the reply model and the talker.
-        asyncio.create_task(p.delegate.warm(), name="delegate-warm")
-        asyncio.create_task(p.talker.warm(), name="talker-warm")
+            # Resident models before the first wake: the reply model and the talker.
+            asyncio.create_task(p.delegate.warm(), name="delegate-warm")
+            asyncio.create_task(p.talker.warm(), name="talker-warm")
 
-        await p.audio_in.start()
-        audio_q = p.audio_in.subscribe()
-        try:
-            await self._armed(p, gate, audio_q)
-        finally:
-            p.audio_in.unsubscribe(audio_q)
-            await p.audio_in.stop()
+            await p.audio_in.start()
+            audio_q = p.audio_in.subscribe()
+            try:
+                await self._armed(p, gate, audio_q)
+            finally:
+                p.audio_in.unsubscribe(audio_q)
+                await p.audio_in.stop()
 
     # ------------------------------------------------------------------ capture + wake
 
@@ -756,6 +933,9 @@ class VoiceHost:
         while True:
             if self.state == WakeState.OFF:
                 log.info("voice host: disarmed -- closing mic")
+                return
+            if self._rebound:
+                log.info("voice host: binding changed -- leaving the previous scope")
                 return
 
             chunk = await audio_q.get()
@@ -854,8 +1034,29 @@ class VoiceHost:
     # ------------------------------------------------------------------ session
 
     async def run_session(self, audio_q, *, score: float, detector: str = TRIGGER_DETECTOR,
-                          speech_ratio: float | None = None) -> None:
-        """One conversation: many turns until a stop phrase, an empty turn or idle timeout.
+                          speech_ratio: float | None = None,
+                          binding: SessionBinding | None = None) -> None:
+        """One conversation, inside its session's scope: every store write and event below
+        happens for the session's tenant, and the tasks it starts inherit that.
+
+        `binding` is who the session is for; without one it is the device's (bind()). With
+        tenant isolation on and no tenant, this raises SessionTenantRequiredError and nothing
+        is written."""
+        if binding is None:
+            binding = self._device_binding()
+        with self._scope.session(binding) as session:
+            log.info("voice host: session open tenant=%s product=%s device=%s profile=%s",
+                     session.tenant, session.product, session.device, session.profile_version)
+            self._open = session
+            try:
+                await self._conversation(audio_q, session, score=score, detector=detector,
+                                         speech_ratio=speech_ratio)
+            finally:
+                self._open = None
+
+    async def _conversation(self, audio_q, session: SessionContext, *, score: float,
+                            detector: str, speech_ratio: float | None) -> None:
+        """Many turns until a stop phrase, an empty turn or idle timeout.
 
         Silent close (T03): when turn 1 hears no genuine speech the meeting row is deleted (the
         wake_events row is kept for audit with its link cleared) and nothing is stored."""
@@ -871,7 +1072,7 @@ class VoiceHost:
 
         session_id = await p.store.create_session(score, detector=detector,
                                                    speech_ratio=speech_ratio)
-        session = SessionContext(session_id=session_id)
+        session.session_id = session_id
         self._state["meeting_id"] = session_id
         log.info("[Vox Initialized] meeting_id=%s", session_id)
 
@@ -1404,11 +1605,12 @@ class VoiceHost:
         if self.ports is None:
             raise RuntimeError("voice host is not ready")
         p = self.ports
+        binding = self._device_binding()    # refused here, before a task or a subscription
         audio_q = p.audio_in.subscribe()
 
         async def _session() -> None:
             try:
-                await self.run_session(audio_q, score=1.0)
+                await self.run_session(audio_q, score=1.0, binding=binding)
             except Exception:
                 log.exception("voice host: triggered session failed")
             finally:
