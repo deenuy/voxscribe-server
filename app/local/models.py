@@ -687,6 +687,12 @@ class WakeTriggerResponse(BaseModel):
     meeting_id: str | None = None
 
 
+class WakeStartResponse(BaseModel):
+    started: bool
+    state: str
+    meeting_id: str | None = None
+
+
 class WakePowerResponse(BaseModel):
     event: Literal["sleep", "wake", "lock", "unlock"]
     handled: bool

@@ -112,6 +112,11 @@
       "status": 409
     },
     {
+      "code": "voice_unavailable",
+      "detail": "this engine was started without the voice assistant",
+      "status": 409
+    },
+    {
       "code": "session_in_progress",
       "detail": "a session is already in progress",
       "status": 409

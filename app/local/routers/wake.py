@@ -36,14 +36,15 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.local.errors import EngineError
+from app.local.identity import require_device_control
 from app.local.models import (
     WakeArmResponse,
     WakePowerResponse,
     WakeProfileResponse,
+    WakeStartResponse,
     WakeStateResponse,
     WakeTriggerResponse,
 )
-from app.local.identity import require_device_control
 from app.local.voice.host import (
     SessionInProgressError,
     SessionTenantRequiredError,
@@ -183,7 +184,7 @@ async def trigger_wake_session(request: Request):
     return {"triggered": True, "state": _value(host.state), "meeting_id": mid}
 
 
-@router.post("/start", status_code=202)
+@router.post("/start", status_code=202, response_model=WakeStartResponse)
 async def start_session(request: Request):
     """Start a voice session now, with no wake phrase: the button in an app.
 

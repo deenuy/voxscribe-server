@@ -1638,6 +1638,35 @@
         "title": "WakeProfileResponse",
         "type": "object"
       },
+      "WakeStartResponse": {
+        "properties": {
+          "meeting_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Meeting Id"
+          },
+          "started": {
+            "title": "Started",
+            "type": "boolean"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "started",
+          "state"
+        ],
+        "title": "WakeStartResponse",
+        "type": "object"
+      },
       "WakeStateResponse": {
         "properties": {
           "bound_to_caller": {
@@ -5879,6 +5908,28 @@
           }
         },
         "summary": "Wake Profile",
+        "tags": [
+          "wake"
+        ]
+      }
+    },
+    "/v1/wake/start": {
+      "post": {
+        "description": "Start a voice session now, with no wake phrase: the button in an app.\n\nThe same person may do this who may arm the device, and the device becomes theirs the same\nway. The wake listener is left as it was, so with the listener off this is the only way a\nsession starts. Returns {meeting_id} once the session has one (up to about 2 s).",
+        "operationId": "start_session_v1_wake_start_post",
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WakeStartResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Start Session",
         "tags": [
           "wake"
         ]

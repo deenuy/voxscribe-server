@@ -107,6 +107,7 @@ _ERRORS: list[dict] = [
     {"code": "product_mismatch",     "status": 409, "detail": "the meeting was started by a different product"},
     {"code": "voice_tenant_unbound", "status": 409, "detail": "no tenant has armed the device yet"},
     {"code": "voice_session_in_progress", "status": 409, "detail": "a voice session is already running"},
+    {"code": "voice_unavailable", "status": 409, "detail": "this engine was started without the voice assistant"},
     {"code": "session_in_progress",  "status": 409, "detail": "a session is already in progress"},
     # assistant profile
     {"code": "assistant_field_fixed", "status": 400, "detail": "the assistant setting is fixed for this engine or product mode and cannot be changed"},
