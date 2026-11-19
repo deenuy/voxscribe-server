@@ -205,7 +205,9 @@ uv run --extra dev pytest tests/ -q                # full suite
 uv run --extra dev ruff check app/                 # lint
 ```
 
-No test touches a real microphone, real database, or the network. Every adapter has a fake.
+No test touches a real microphone or the network, and no test touches the engine's database: tests use their own
+database (`VOXSCRIBE_TEST_DATABASE_URL`, default `ideascribe_test`), created once with `make test-db`, and refuse to
+run when it is the engine's database. See `tests/README.md`.
 
 ## Project structure
 

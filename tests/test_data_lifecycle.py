@@ -20,7 +20,7 @@ import pytest
 from app.local.config import Config
 from app.local.migrations import run_migrations
 
-_DB_URL = "postgresql://localhost:5432/ideascribe_dev"
+from tests.testdb import TEST_DATABASE_URL as _DB_URL
 
 
 # ---------------------------------------------------------------------------

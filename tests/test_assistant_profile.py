@@ -21,7 +21,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-DB_URL = "postgresql://localhost:5432/ideascribe_dev"
+from tests.testdb import TEST_DATABASE_URL as DB_URL
 ISSUER, AUDIENCE = "http://issuer.test", "ideascribe"
 
 

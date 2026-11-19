@@ -36,7 +36,7 @@ from app.local.voice.host import VoiceConfig, VoiceHost
 
 from .fakes import FakeDelegate, FakeGate, fake_ports, policy_gate, shipped_profile
 
-DB_URL = "postgresql://localhost:5432/ideascribe_dev"
+from tests.testdb import TEST_DATABASE_URL as DB_URL
 MIGRATIONS = Path(reply_chain.__file__).parent / "migrations"
 SENIORCARE_LINE = "Let's set that aside so your caregiver can look it over."
 CLASSROOM_LINE = "Let's bring your teacher into this."

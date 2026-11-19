@@ -10,8 +10,15 @@ import pytest
 
 from app.local.config import Config
 from app.local.migrations import run_migrations
+from tests.testdb import TEST_DATABASE_URL as _DB_URL
+from tests.testdb import unsafe_reason
 
-_DB_URL = "postgresql://localhost:5432/ideascribe_dev"
+
+def pytest_sessionstart(session):
+    """Refuse the whole run before any test when the test database could be someone's live data (see tests/testdb.py)."""
+    reason = unsafe_reason()
+    if reason:
+        pytest.exit(f"refusing to run the tests: {reason}", returncode=pytest.ExitCode.USAGE_ERROR)
 
 
 @pytest.fixture

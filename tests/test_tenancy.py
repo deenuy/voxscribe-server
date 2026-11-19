@@ -21,7 +21,7 @@ from app.local.identity import IdentityError, IdentityVerifier
 from app.local.job_runner import JobRunner
 from app.local.migrations import run_migrations
 
-DB_URL = "postgresql://localhost:5432/ideascribe_dev"
+from tests.testdb import TEST_DATABASE_URL as DB_URL
 ISSUER, AUDIENCE = "http://issuer.test", "ideascribe"
 
 

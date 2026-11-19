@@ -8,6 +8,7 @@ import pytest
 
 from app.local.app import create_app
 from app.local.config import Config
+from tests.testdb import TEST_DATABASE_URL
 
 TOKEN = "test-token-abc123"
 ORIGIN = "http://localhost:3000"
@@ -20,7 +21,7 @@ async def secure_client(throwaway_schema, monkeypatch):
     data_dir = Path("/tmp/voxscribe_test")
     data_dir.mkdir(parents=True, exist_ok=True)
     settings = Config(
-        database_url="postgresql://localhost:5432/ideascribe_dev",
+        database_url=TEST_DATABASE_URL,
         data_dir=str(data_dir),
         providers="fake",
         allowed_origins=ORIGIN,
@@ -164,7 +165,7 @@ async def test_pool_resets_the_row_factory_between_borrowers(throwaway_schema):
 
     from app.local.db import create_pool
 
-    pool = await create_pool("postgresql://localhost:5432/ideascribe_dev", min_size=1, max_size=1, schema=throwaway_schema)
+    pool = await create_pool(TEST_DATABASE_URL, min_size=1, max_size=1, schema=throwaway_schema)
     try:
         async with pool.connection() as conn:
             conn.row_factory = dict_row  # what the meetings store does
