@@ -2,21 +2,29 @@
 
 The model is asked for a short list of things someone agreed or was asked to do, never for anything it was not told
 (a made-up task is worse than none). Its answer is parsed defensively: a reply that is not usable is an error the
-person can retry, not an empty list that looks like "nothing to do"."""
+person can retry, not an empty list that looks like "nothing to do".
+
+draft_and_store() is the one way tasks are drafted and kept, after a summary and from the Generate route: it
+reports the tasks step to the pipeline (working, then ready or failed with a reason) and bounds the model's time."""
 
 import asyncio
+import os
 import re
 from datetime import date
 
 from voxscribe.meeting.llm_json import complete_json
 
+from . import pipeline
 from .errors import EngineError, ProviderUnavailableError
+from .store_tasks import TaskStore
 
 MAX_TASKS = 5  # SMART ceiling: max 5 tasks regardless of transcript length (see _task_ceiling)
 # Room for a model that reasons before it answers: that reasoning counts against the limit, and a reply cut off
 # before the answer is empty. Not retried automatically: a retry would double a wait that is already long.
 MAX_REPLY_TOKENS = 4096
 MAX_TRANSCRIPT_CHARS = 30000
+# Wall-clock cap on drafting. The same model as the summary and a prompt of the same size, so the same cap by default.
+TASKS_TIMEOUT_S = int(os.getenv("VOXSCRIBE_TASKS_TIMEOUT_S", os.getenv("VOXSCRIBE_SUMMARY_TIMEOUT_S", "120")))
 
 # Word count → max task ceiling (never a target; return fewer if fewer real actions exist)
 def _task_ceiling(word_count: int) -> int:
@@ -125,3 +133,40 @@ async def draft_tasks(llm, *, lines: list[str], project: dict | None, fake: bool
     if parsed is None or not isinstance(parsed.get("tasks"), list):
         raise EngineError("ai_unreadable", "the AI did not return a usable task list; try again", 502)
     return clean_drafts(parsed["tasks"], ceiling=_task_ceiling(word_count))
+
+
+def failure_reason(exc: BaseException) -> str:
+    """The pipeline reason for a drafting failure: a code, never the exception's text."""
+    if isinstance(exc, asyncio.TimeoutError):
+        return pipeline.MODEL_TIMEOUT
+    if isinstance(exc, ProviderUnavailableError):
+        return pipeline.MODEL_UNAVAILABLE
+    if isinstance(exc, EngineError) and exc.code == "ai_unreadable":
+        return pipeline.UNUSABLE_OUTPUT
+    return pipeline.MODEL_ERROR
+
+
+async def draft_and_store(pool, llm, meeting_id: str, *, lines: list[str], labelled: list[str] | None,
+                          project: dict | None, fake: bool, held_on: str | None,
+                          timeout: float | None = None) -> tuple[list, int]:
+    """Draft tasks and add the new ones to the scribe. Returns (created, skipped).
+
+    Reports the tasks step: working, then ready, or failed with failure_reason(); the error is raised again for the
+    caller. A timeout (TASKS_TIMEOUT_S unless given) is asyncio.TimeoutError, reported as model_timeout."""
+    run = pipeline.start_run(meeting_id, "tasks")
+    await pipeline.report(pool, meeting_id, "tasks", pipeline.WORKING)
+    try:
+        drafts = await asyncio.wait_for(
+            draft_tasks(llm, lines=lines, labelled=labelled, project=project, fake=fake, held_on=held_on),
+            timeout=TASKS_TIMEOUT_S if timeout is None else timeout,
+        )
+        created, skipped = await TaskStore(pool).add_generated(meeting_id, drafts)
+    except asyncio.CancelledError:
+        raise                               # an erase or a shutdown: nothing more is written for this scribe
+    except Exception as exc:
+        await pipeline.report(pool, meeting_id, "tasks", pipeline.FAILED, failure_reason(exc))
+        raise
+    finally:
+        pipeline.end_run(meeting_id, "tasks", run)
+    await pipeline.report(pool, meeting_id, "tasks", pipeline.READY)
+    return created, skipped

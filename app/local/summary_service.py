@@ -1,16 +1,21 @@
-"""Summary generation service for meetings."""
+"""Summary generation service for meetings, and the tasks drafted after it.
+
+Every state change of the summary and of the tasks is reported to the pipeline (pipeline.py), which records it and
+publishes `meeting.pipeline` to the meeting's tenant. Tasks come after the summary and cannot undo it: once the
+summary is written it stays ready whatever happens to the tasks.
+"""
 
 import asyncio
 import logging
 import os
 from datetime import datetime
 
+from voxscribe.knowledge.llm_stream import ProviderUnavailable
 from voxscribe.meeting.summary import PROMPT_VERSION, generate_meeting_title, summarize_meeting
 
-from . import meeting_bus
+from . import meeting_bus, pipeline
 from .store_meetings import MeetingStore
-from .store_tasks import TaskStore
-from .task_service import draft_tasks
+from .task_service import draft_and_store
 
 log = logging.getLogger(__name__)
 
@@ -41,8 +46,20 @@ class SummaryService:
         self.store = store
         self.llm = llm
 
+    @property
+    def _pool(self):
+        return getattr(self.store, "pool", None)
+
+    async def _status(self, meeting_id: str, status: str, reason: str | None = None) -> None:
+        """Set summaries.status and report the summary step it means."""
+        await self.store.set_summary_status(meeting_id, status)
+        await pipeline.report(self._pool, meeting_id, "summary", *pipeline.summary_state(status, reason))
+
+    async def _tasks_skipped(self, meeting_id: str, reason: str) -> None:
+        await pipeline.report(self._pool, meeting_id, "tasks", pipeline.SKIPPED, reason)
+
     async def generate_summary(self, meeting_id: str) -> None:
-        """Generate a summary for a meeting.
+        """Generate a summary for a meeting, then draft its tasks.
 
         Status path:
           pending (set by caller before scheduling) ->
@@ -51,11 +68,18 @@ class SummaryService:
 
         Never raises; whatever goes wrong the meeting still transitions to done.
         """
+        segments_models = await self._summary(meeting_id)
+        if segments_models is not None:
+            await self._draft_tasks(meeting_id, segments_models)
+
+    async def _summary(self, meeting_id: str):
+        """The summary step. Returns the transcript when the summary is ready and tasks should follow, else None."""
         try:
             if SUMMARY_DISABLED or not self.llm:
                 log.info("Summary disabled or LLM unavailable for meeting %s", meeting_id)
-                await self.store.set_summary_status(meeting_id, "unavailable")
-                return
+                await self._status(meeting_id, "unavailable", pipeline.MODEL_UNAVAILABLE)
+                await self._tasks_skipped(meeting_id, pipeline.MODEL_UNAVAILABLE)
+                return None
 
             segments_models = await self.store.get_transcript(meeting_id)
             notes_models = await self.store.get_notes(meeting_id)
@@ -85,17 +109,20 @@ class SummaryService:
                     details=[],
                     generated_at=datetime.utcnow().isoformat() + "Z",
                 )
+                await pipeline.report(self._pool, meeting_id, "summary", pipeline.SKIPPED, pipeline.NO_SPEECH)
+                await self._tasks_skipped(meeting_id, pipeline.NO_SPEECH)
                 await meeting_bus.publish(meeting_id, "summary.ready", {})
                 log.info("No speech in meeting %s; summary skipped", meeting_id)
-                return
+                return None
 
             if _word_count(segments, notes) < MIN_WORDS_FOR_SUMMARY:
-                await self.store.set_summary_status(meeting_id, "skipped")
+                await self._status(meeting_id, "skipped", pipeline.TOO_SHORT)
+                await self._tasks_skipped(meeting_id, pipeline.TOO_SHORT)
                 log.info(
                     "Meeting %s has fewer than %d words; summary skipped",
                     meeting_id, MIN_WORDS_FOR_SUMMARY,
                 )
-                return
+                return None
 
             enhanced_resp = await self.store.get_enhanced(meeting_id)
             enhanced = [
@@ -103,11 +130,12 @@ class SummaryService:
                 for b in enhanced_resp["blocks"]
             ]
 
-            await self.store.set_summary_status(meeting_id, "running")
+            await self._status(meeting_id, "running")
 
             # Call core's summarize function off the event loop with a hard timeout.
             # A model that returns nothing usable (still loading) gets one retry.
             summary = None
+            failure = pipeline.MODEL_ERROR
             for attempt in (1, 2):
                 try:
                     summary = await asyncio.wait_for(
@@ -127,20 +155,23 @@ class SummaryService:
                         "Summary for meeting %s timed out after %ds (attempt %d)",
                         meeting_id, SUMMARY_TIMEOUT_S, attempt,
                     )
+                    failure = pipeline.MODEL_TIMEOUT
                     if attempt == 2:
-                        await self.store.set_summary_status(meeting_id, "failed")
-                        return
-                except ValueError as e:
+                        break
+                except ProviderUnavailable:
+                    log.error("Summary for meeting %s: the model could not be reached", meeting_id)
+                    failure = pipeline.MODEL_UNAVAILABLE
+                    break
+                except ValueError:
+                    failure = pipeline.UNUSABLE_OUTPUT
                     if attempt == 2:
-                        raise
-                    log.warning(
-                        "Summary for meeting %s was not usable, retrying: %s",
-                        meeting_id, e,
-                    )
+                        break
+                    log.warning("Summary for meeting %s was not usable, retrying", meeting_id)
 
             if summary is None:
-                await self.store.set_summary_status(meeting_id, "failed")
-                return
+                await self._status(meeting_id, "failed", failure)
+                await self._tasks_skipped(meeting_id, pipeline.SUMMARY_FAILED)
+                return None
 
             details = [
                 {"title": d.title, "body": d.body}
@@ -160,55 +191,52 @@ class SummaryService:
                 generated_at=now,
                 prompt_version=PROMPT_VERSION,
             )
-
-            # AI title: best-effort; never blocks or raises
-            try:
-                ai_title = await asyncio.wait_for(
-                    asyncio.to_thread(generate_meeting_title, self.llm, segments, notes),
-                    timeout=30.0,
-                )
-                if ai_title:
-                    await self.store.update_meeting(meeting_id, title=ai_title)
-                    log.info("AI title set for meeting %s: %r", meeting_id, ai_title)
-            except Exception as title_err:
-                log.warning("AI title generation failed for meeting %s: %s", meeting_id, title_err)
-
-            await meeting_bus.publish(meeting_id, "summary.ready", {})
-            log.info("Summary generated for meeting %s", meeting_id)
-
-            # SMART task auto-generation: best-effort, never blocks or raises
-            try:
-                spoken = [s for s in segments_models if s.text and s.text.strip()]
-                if spoken:
-                    lines = [s.text.strip() for s in spoken]
-                    labelled = [
-                        f"{s.speaker}: {s.text.strip()}" if s.speaker else s.text.strip()
-                        for s in spoken
-                    ]
-                    held = datetime.utcnow().strftime("%Y-%m-%d")
-                    drafts = await asyncio.wait_for(
-                        draft_tasks(
-                            self.llm,
-                            lines=lines,
-                            labelled=labelled,
-                            project=None,
-                            fake=False,
-                            held_on=held,
-                        ),
-                        timeout=45.0,
-                    )
-                    if drafts:
-                        created, skipped = await TaskStore(self.store.pool).add_generated(meeting_id, drafts)
-                        log.info(
-                            "Auto-generated %d task(s) for meeting %s (%d skipped)",
-                            len(created), meeting_id, skipped,
-                        )
-            except Exception as task_err:
-                log.warning("Auto task generation failed for meeting %s: %s", meeting_id, task_err)
-
         except Exception as e:
-            log.error("Summary generation error for meeting %s: %s", meeting_id, e, exc_info=True)
+            log.error("Summary generation error for meeting %s: %s", meeting_id, type(e).__name__, exc_info=True)
             try:
-                await self.store.set_summary_status(meeting_id, "failed")
+                await self._status(meeting_id, "failed", pipeline.MODEL_ERROR)
+                await self._tasks_skipped(meeting_id, pipeline.SUMMARY_FAILED)
             except Exception:
                 pass
+            return None
+
+        # The summary is written: from here on nothing changes its state.
+        await pipeline.report(self._pool, meeting_id, "summary", pipeline.READY)
+        try:
+            # AI title: best-effort; never blocks or raises
+            ai_title = await asyncio.wait_for(
+                asyncio.to_thread(generate_meeting_title, self.llm, segments, notes),
+                timeout=30.0,
+            )
+            if ai_title:
+                await self.store.update_meeting(meeting_id, title=ai_title)
+                log.info("AI title set for meeting %s (%d chars)", meeting_id, len(ai_title))
+        except Exception as title_err:
+            log.warning("AI title generation failed for meeting %s: %s", meeting_id, type(title_err).__name__)
+        try:
+            await meeting_bus.publish(meeting_id, "summary.ready", {})
+        except Exception:
+            log.warning("Could not publish summary.ready for meeting %s", meeting_id, exc_info=True)
+        log.info("Summary generated for meeting %s", meeting_id)
+        return segments_models
+
+    async def _draft_tasks(self, meeting_id: str, segments_models) -> None:
+        """SMART task auto-generation: best-effort, never raises, and never touches the summary."""
+        try:
+            spoken = [s for s in segments_models if s.text and s.text.strip()]
+            if not spoken:
+                await self._tasks_skipped(meeting_id, pipeline.NO_SPEECH)
+                return
+            lines = [s.text.strip() for s in spoken]
+            labelled = [
+                f"{s.speaker}: {s.text.strip()}" if getattr(s, "speaker", None) else s.text.strip()
+                for s in spoken
+            ]
+            held = datetime.utcnow().strftime("%Y-%m-%d")
+            created, skipped = await draft_and_store(
+                self._pool, self.llm, meeting_id, lines=lines, labelled=labelled, project=None, fake=False,
+                held_on=held,
+            )
+            log.info("Auto-generated %d task(s) for meeting %s (%d skipped)", len(created), meeting_id, skipped)
+        except Exception as task_err:  # the reason is already on the pipeline
+            log.warning("Auto task generation failed for meeting %s: %s", meeting_id, type(task_err).__name__)

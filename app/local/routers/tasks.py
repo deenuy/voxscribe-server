@@ -1,5 +1,6 @@
 """Tasks: a to-do list per scribe, by hand or drafted by the AI from the transcript."""
 
+import asyncio
 import logging
 from datetime import date
 from typing import Literal
@@ -7,11 +8,11 @@ from typing import Literal
 from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field
 
-from app.local.errors import ConflictError, InvalidRequestError
+from app.local.errors import ConflictError, EngineError, InvalidRequestError
 from app.local.http_utils import json_object, parse_model
 from app.local.store_meetings import MeetingStore
 from app.local.store_tasks import TaskStore
-from app.local.task_service import draft_tasks
+from app.local.task_service import draft_and_store
 
 router = APIRouter(prefix="/v1", tags=["tasks"])
 log = logging.getLogger(__name__)
@@ -72,7 +73,9 @@ async def generate_tasks(request: Request, meeting_id: str) -> dict:
 
     Adds only titles the scribe does not have yet, so it is safe to run again: tasks that are done, edited or written
     by hand are never touched or repeated. Answers `{created, skipped}`. 409 until the scribe has finished and has a
-    transcript; 503 when the AI is not running; 502 when its answer cannot be used (try again)."""
+    transcript; 503 when the AI is not running; 502 when its answer cannot be used; 504 `model_timeout` when it does
+    not answer in time (try again). The tasks step of the pipeline shows working, then ready or failed with its
+    reason, so this is also how a failed step is retried."""
     pool = request.app.state.store.pool
     meetings = MeetingStore(pool)
     meeting = await meetings.get_meeting(meeting_id)
@@ -94,8 +97,12 @@ async def generate_tasks(request: Request, meeting_id: str) -> dict:
             project = None
     providers = getattr(request.app.state, "providers", {})
     held = next((str(v)[:10] for v in (getattr(meeting, "startedAt", None), getattr(meeting, "scheduledStart", None), getattr(meeting, "createdAt", None)) if v), None)
-    drafts = await draft_tasks(providers.get("llm"), lines=lines, project=project, held_on=held, labelled=labelled, fake=request.app.state.settings.providers == "fake")
-    created, skipped = await TaskStore(pool).add_generated(meeting_id, drafts)
+    try:
+        created, skipped = await draft_and_store(
+            pool, providers.get("llm"), meeting_id, lines=lines, project=project, held_on=held, labelled=labelled,
+            fake=request.app.state.settings.providers == "fake")
+    except asyncio.TimeoutError:
+        raise EngineError("model_timeout", "the on-device AI did not answer in time; try again", 504) from None
     return {"created": created, "skipped": skipped}
 
 

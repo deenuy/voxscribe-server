@@ -145,6 +145,17 @@ class CaptureHealthPayload(_Payload):
     value: float | None = None
 
 
+class MeetingPipeline(_Payload):
+    """A step after Stop changed state (app/local/pipeline.py), published to the meeting's tenant. `reason` is a
+    short code, never model or transcript text; null when there is nothing to add. GET
+    /v1/meetings/{id}/pipeline answers the same for every step at once."""
+
+    meetingId: str
+    step: Literal["transcript", "summary", "tasks"]
+    state: Literal["working", "ready", "failed", "skipped"]
+    reason: str | None
+
+
 class StreamReset(_Payload):
     """Sent instead of a replay when the events a reconnecting client missed are no longer held
     (or its last id is not from this stream: the engine restarted). The client reloads the state
@@ -163,6 +174,7 @@ STREAM_EVENTS: dict[str, type[BaseModel]] = {
     "idea.delete": IdeaDelete,
     "project.update": ProjectUpdate,
     "meeting.update": Meeting,
+    "meeting.pipeline": MeetingPipeline,
     "wake_state": WakeStatePayload,
     "wake.transcript": WakeTranscript,
     "wake.reply": WakeReply,

@@ -36,6 +36,14 @@ frame), the debug trigger (behind --debug-trigger, see routers/wake.py), barge-i
 speculative reply start with its drift rule.
 No transcript text, audio or prompt is logged.
 
+End and Mute from the app (routers/wake.py). end_session() stops playback at once and asks the
+session to stop; the session closes through the path a spoken stop phrase takes (the turn returns
+False and the conversation's finally closes the session row), and a reply in progress ends the way
+a barge-in ends one, so its gate records and stored turn say how much was heard. The wake listener
+goes back to what it was. set_muted() keeps the session open while captured audio is dropped
+before the recognizer and the turn detector, so nothing reaches the model; a muted session is not
+ended by the idle timeout until MUTE_HOLD_S has passed. Mute ends with the session.
+
 A session belongs to someone (PL05). SessionBinding says who and what a session is for (tenant,
 product, device); SessionContext is the one object per session that carries it, the profile
 version in force and the turn state. The host enters the binding's scope while it is armed and
@@ -117,6 +125,9 @@ ARMED_POLL_S = 0.25
 CRASH_RESET_S = 1.0
 TRIGGER_POLL_S = 0.1
 TRIGGER_POLL_TRIES = 20
+MUTE_HOLD_S = 300.0             # a muted session is not ended by the idle timeout for this long
+END_WAIT_S = 2.0                # end_session() waits at most this long for the session to close
+END_POLL_S = 0.02
 INT16_SCALE = 32767
 
 CHIME_ACK = "/System/Library/Sounds/Glass.aiff"
@@ -709,6 +720,18 @@ class SessionContext:
     pre_roll: np.ndarray | None = None   # the interjection's start, captured during the reply
     held_empty: bool = False       # one wordless turn after a barge-in did not end the session
     seq: int = 0                   # sequence number of the last event the session published
+    stop_requested: bool = False   # End from the app: the session closes at its next step
+    muted_until: float | None = None    # Mute from the app: monotonic end of the hold, None unmuted
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+    @property
+    def muted(self) -> bool:
+        return self.muted_until is not None
+
+    def request_stop(self) -> None:
+        self.stop_requested = True
+        self.muted_until = None
+        self.stop_event.set()
 
     def next_seq(self) -> int:
         """The sequence number for the session's next event: 1, 2, 3, ... with no gap."""
@@ -802,6 +825,7 @@ class VoiceHost:
         self._served: SessionBinding | None = None      # the binding the adapters last worked for
         self._open: SessionContext | None = None        # the device's session, while one runs
         self._claimed = False                           # a session took its binding: starting or running
+        self._stop_pending = False                      # End arrived while a session was still opening
         self._rebound = False                           # bind() changed it: the armed loop re-enters
         self._task: asyncio.Task | None = None
         self._cues: set[asyncio.Task] = set()      # cues playing off the hot path
@@ -1175,6 +1199,8 @@ class VoiceHost:
                          session.tenant, session.product, session.device,
                          session.profile_version)
                 self._open = session
+                if self._stop_pending:
+                    session.request_stop()
                 try:
                     await self._conversation(audio_q, session, score=score, detector=detector,
                                              speech_ratio=speech_ratio)
@@ -1182,6 +1208,7 @@ class VoiceHost:
                     self._open = None
         finally:
             self._claimed = False
+            self._stop_pending = False
 
     async def _conversation(self, audio_q, session: SessionContext, *, score: float,
                             detector: str, speech_ratio: float | None) -> None:
@@ -1262,8 +1289,14 @@ class VoiceHost:
             listen_q = PreRollQueue(session.pre_roll, audio_q)
         session.pre_roll = None
 
-        if await self._listen(p, listen_q, ring, turn_n, use_turns):
+        if await self._listen(p, listen_q, ring, turn_n, use_turns, session):
             heard = bool(texts) or bool(partial.text)
+            if session.stop_requested:
+                log.info("[Vox Stopped] ended from the app (turn=%d)", turn_n)
+                session.silent = turn_n == 1 and not texts
+                ring.close()
+                recognize.cancel()
+                return False
             if turn_n == 1 and heard:
                 # The wait ran out while the person was still talking, or before the pause that
                 # closes a turn. They said something: answer it. Closing in silence here deleted
@@ -1314,6 +1347,11 @@ class VoiceHost:
         log.info("voice host: asr final +%d ms from turn end source=%s turn=%d",
                  asr_final_ms - turn_end_ms, source, turn_n)
 
+        if session.stop_requested:
+            log.info("[Vox Stopped] ended from the app (turn=%d)", turn_n)
+            if speculation is not None:
+                speculation.cancel()
+            return False
         if not turn_text and session.barge_in and not session.held_empty:
             # A cough or a door can interrupt a reply; it should not also end the conversation.
             session.held_empty = True
@@ -1384,6 +1422,9 @@ class VoiceHost:
             _drain(audio_q)
         if result.text and last_reply is not None:
             last_reply[0] = result.text
+        if session.stop_requested:
+            log.info("[Vox Stopped] ended from the app during the reply (turn=%d)", turn_n)
+            return False
         return True
 
     async def _handle_control(self, p: VoicePorts, intent, control_state, last_reply: list[str]) -> bool:
@@ -1464,10 +1505,12 @@ class VoiceHost:
                  len(done), len(pending), session.session_id)
 
     async def _listen(self, p: VoicePorts, audio_q, ring: _TurnRing, turn_n: int,
-                      use_turns: bool) -> bool:
+                      use_turns: bool, session: SessionContext | None = None) -> bool:
         """Stage turn: feed capture to the recognizer and the turn policy until the turn ends.
 
-        Returns True when the turn timed out (no audio, or idle past the deadline)."""
+        Returns True when the turn timed out (no audio, or idle past the deadline) or the session
+        was ended from the app. While the session is muted capture is read and dropped: nothing
+        reaches the recognizer or the turn policy, and the deadline is the end of the mute hold."""
         pause_s = self.config.end_of_turn_pause_s
         silence_needed = int(pause_s * SAMPLE_RATE / CHUNK_FRAMES)
         cap_chunks = int(CAP_S * SAMPLE_RATE / CHUNK_FRAMES)
@@ -1485,9 +1528,17 @@ class VoiceHost:
         clock_error_logged = False
         pre_roll_pending = getattr(audio_q, "pre_roll_pending", lambda: False)
         log.info("[Vox Listening] turn=%d (say your question, or %r to stop)", turn_n, STOP_HINT)
+        was_muted = False
         try:
             while True:
-                remaining = idle_deadline - time.monotonic()
+                if session is not None and session.stop_requested:
+                    return True
+                muted = session is not None and session.muted
+                if was_muted and not muted:         # unmuted: a fresh wait for the person to speak
+                    idle_deadline = time.monotonic() + conv_idle_s
+                was_muted = muted
+                deadline = session.muted_until if muted else idle_deadline
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return True
                 from_pre_roll = pre_roll_pending()
@@ -1495,7 +1546,11 @@ class VoiceHost:
                     chunk = await asyncio.wait_for(audio_q.get(),
                                                    timeout=min(remaining, QUEUE_POLL_S))
                 except asyncio.TimeoutError:
+                    if session is not None and session.muted:
+                        continue                    # a capture gap while muted ends nothing
                     return True
+                if session is not None and (session.muted or session.stop_requested):
+                    continue                        # Mute (as of this chunk): not recognised, not a turn
 
                 rms = _rms(chunk)
                 if turn_n > 1 and rms > RMS_FLOOR * IDLE_SPEECH_RMS_FACTOR:
@@ -1702,10 +1757,15 @@ class VoiceHost:
             try:
                 if audio_q is not None and self._barge_in_enabled(p):
                     pre_roll = await self._watch_barge_in(p, audio_q, speak)
+                else:
+                    pre_roll = await self._until_ended(p, speak)
                 completed = await self._settle(speak, interrupted=pre_roll is not None)
             finally:
                 if not speak.done():
                     speak.cancel()
+            ended = current_session()
+            if pre_roll is not None and ended is not None and ended.stop_requested:
+                p.audio_out.stop_playback()         # a clause queued while the stage was cancelled
 
             interruption = None
             if pre_roll is not None:
@@ -1780,21 +1840,48 @@ class VoiceHost:
                 raise
             return None
 
+    @staticmethod
+    async def _until_ended(p: VoicePorts, speak: asyncio.Task):
+        """Without the barge-in watch: wait for the reply stage, or for End from the app.
+
+        Returns an empty pre-roll when the session was ended (the reply is then interrupted like
+        a barge-in interrupts it), None when the reply stage finished first."""
+        session = current_session()
+        if session is None:
+            return None
+        ended = asyncio.ensure_future(session.stop_event.wait())
+        try:
+            await asyncio.wait({speak, ended}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            ended.cancel()
+        if session.stop_requested:
+            p.audio_out.stop_playback()
+            return np.zeros(0, dtype=np.float32)
+        return None
+
     async def _watch_barge_in(self, p: VoicePorts, audio_q, speak: asyncio.Task):
         """Stage barge-in: read capture until the reply has been generated and played.
 
         Returns the capture held from just before the interruption (the start of the
         interjection, for the next turn), or None when the reply played to its end.
         Playback is stopped here, on the frame that decides, before anything else runs.
+        End from the app interrupts the reply the same way (an empty pre-roll). While the session
+        is muted capture is read but not fed to the detector: a muted person cannot interrupt.
         """
         out = p.audio_out
+        session = current_session()
         detector = BargeInDetector(SAMPLE_RATE)
         held: deque = deque(maxlen=max(1, BARGE_IN_PRE_ROLL_MS * SAMPLE_RATE
                                        // (1000 * CHUNK_FRAMES)))
         while not (speak.done() and not out.is_playing):
+            if session is not None and session.stop_requested:
+                out.stop_playback()
+                return np.zeros(0, dtype=np.float32)
             try:
                 chunk = await asyncio.wait_for(audio_q.get(), timeout=BARGE_IN_POLL_S)
             except asyncio.TimeoutError:
+                continue
+            if session is not None and session.muted:
                 continue
             held.append(chunk)
             for event in detector.feed(chunk, playing=out.is_playing):
@@ -1807,6 +1894,44 @@ class VoiceHost:
         return None
 
     # ------------------------------------------------------------------ hooks
+
+    @property
+    def muted(self) -> bool:
+        """True while the running session is muted from the app."""
+        return self._open is not None and self._open.muted
+
+    async def end_session(self, wait_s: float = END_WAIT_S) -> bool:
+        """End the running session now (End in an app). False when none is running.
+
+        Playback stops before anything else; the session is asked to stop and closes through the
+        stop phrase's path, a reply in progress ending as an interruption. Waits up to `wait_s`
+        for the session to close, so the state returned after it is the listener's again."""
+        session = self._open
+        if session is None and not self._claimed:
+            return False
+        if self.ports is not None:
+            self.ports.audio_out.stop_playback()
+        if session is not None:
+            session.request_stop()
+        else:
+            self._stop_pending = True        # still opening: it stops as soon as it is open
+        log.info("voice host: end requested from the app meeting_id=%s",
+                 session.session_id if session is not None else None)
+        deadline = time.monotonic() + wait_s
+        while (self._claimed or self._open is not None) and time.monotonic() < deadline:
+            await asyncio.sleep(END_POLL_S)
+        return True
+
+    def set_muted(self, muted: bool) -> bool:
+        """Mute or unmute the running session (Mute in an app). Returns whether it is muted now:
+        False when no session is running, since mute lasts only as long as its session."""
+        session = self._open
+        if session is None or session.stop_requested:
+            return False
+        session.muted_until = time.monotonic() + MUTE_HOLD_S if muted else None
+        log.info("voice host: %s from the app meeting_id=%s", "muted" if muted else "unmuted",
+                 session.session_id)
+        return session.muted
 
     async def start_now(self) -> str | None:
         """Start a session because a person asked for one (a button in an app), with no wake

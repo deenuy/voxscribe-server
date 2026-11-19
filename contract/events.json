@@ -628,6 +628,54 @@
       "title": "Meeting",
       "type": "object"
     },
+    "MeetingPipeline": {
+      "additionalProperties": true,
+      "description": "A step after Stop changed state (app/local/pipeline.py), published to the meeting's tenant. `reason` is a\nshort code, never model or transcript text; null when there is nothing to add. GET\n/v1/meetings/{id}/pipeline answers the same for every step at once.",
+      "properties": {
+        "meetingId": {
+          "title": "Meetingid",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "state": {
+          "enum": [
+            "working",
+            "ready",
+            "failed",
+            "skipped"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "step": {
+          "enum": [
+            "transcript",
+            "summary",
+            "tasks"
+          ],
+          "title": "Step",
+          "type": "string"
+        }
+      },
+      "required": [
+        "meetingId",
+        "step",
+        "state",
+        "reason"
+      ],
+      "title": "MeetingPipeline",
+      "type": "object"
+    },
     "MeetingStatus": {
       "additionalProperties": true,
       "properties": {
@@ -1268,6 +1316,7 @@
     "idea.delete": "#/$defs/IdeaDelete",
     "idea.update": "#/$defs/IdeaUpdate",
     "job.update": "#/$defs/JobUpdate",
+    "meeting.pipeline": "#/$defs/MeetingPipeline",
     "meeting.update": "#/$defs/Meeting",
     "model.progress": "#/$defs/Model",
     "project.update": "#/$defs/ProjectUpdate",
