@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from app.local import connector_tokens, store_misc
 from app.local.models import GoogleAccount, GoogleConnector, GoogleConnectorPutRequest
+from app.local.timefmt import iso_z
 
 router = APIRouter(prefix="/v1/connectors", tags=["connectors"])
 

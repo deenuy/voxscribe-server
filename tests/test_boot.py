@@ -95,9 +95,9 @@ def test_subprocess_without_token_fails_with_auth():
     try:
         if port:
             time.sleep(0.5)
-            # Request without token should fail
+            # /v1/health is public (commit 8acc390); use a protected route to verify auth is enforced
             resp = httpx.get(
-                f"http://127.0.0.1:{port}/v1/health",
+                f"http://127.0.0.1:{port}/v1/meetings",
                 timeout=5,
             )
             assert resp.status_code == 401

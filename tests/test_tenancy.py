@@ -3,6 +3,7 @@ another person. These tests run the real engine with identity switched on."""
 
 import asyncio
 import base64
+import re
 import time
 import uuid
 from pathlib import Path
@@ -227,6 +228,23 @@ async def test_settings_and_delete_all_are_per_person(tenant_engine):
     assert len((await client.get("/v1/tasks", headers=bob)).json()["items"]) == 1
 
 
+def _migration_table_names() -> set:
+    """Return the set of table names defined across all migration SQL files.
+
+    The public schema may contain tables that no migration created (for example a
+    developer-only table such as fixture_renders created for rendering test fixtures,
+    documented in PRD/SCOREBOARD.md row 8).  Comparing against the public schema
+    caused false failures whenever such a table existed.  Comparing against the
+    migration SQL files is the correct reference: every table the engine manages
+    must exist in every tenant schema."""
+    migrations_dir = Path(__file__).parent.parent / "app" / "local" / "migrations"
+    tables = set()
+    for f in sorted(migrations_dir.glob("*.sql")):
+        for m in re.finditer(r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+(\w+)", f.read_text(), re.I):
+            tables.add(m.group(1).lower())
+    return tables
+
+
 @pytest.mark.asyncio
 async def test_a_new_person_gets_a_complete_schema_even_when_two_requests_arrive_together(tenant_engine):
     client, _, as_user = tenant_engine
@@ -236,9 +254,11 @@ async def test_a_new_person_gets_a_complete_schema_even_when_two_requests_arrive
     async with await psycopg.AsyncConnection.connect(DB_URL) as conn:
         tenant = tenancy.tenant_key("carol-uuid")
         theirs = {r[0] for r in await (await conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = %s", (tenant,))).fetchall()}
-        shared = {r[0] for r in await (await conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'schema_migrations'")).fetchall()}
-    # Every table the engine uses exists in the person's own schema, so a lookup can never fall through to a shared one.
-    assert shared <= theirs
+    # Every table that migrations define must exist in the person's own schema so a lookup
+    # can never fall through to the shared schema.  We compare against the migration files,
+    # not the public schema, to avoid false failures from manually-added developer tables.
+    expected = _migration_table_names()
+    assert expected <= theirs, f"Tenant schema is missing tables: {expected - theirs}"
 
 
 @pytest.mark.asyncio

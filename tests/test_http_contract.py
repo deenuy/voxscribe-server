@@ -50,7 +50,9 @@ async def test_preflight_succeeds_without_a_token(secure_client):
 
 @pytest.mark.asyncio
 async def test_unauthorised_answers_still_carry_cors_headers(secure_client):
-    r = await secure_client.get("/v1/health", headers={"Origin": ORIGIN})
+    # /v1/health is public (commit 8acc390); use a protected route to verify that
+    # 401 responses still carry CORS headers so the browser does not hide the error.
+    r = await secure_client.get("/v1/meetings", headers={"Origin": ORIGIN})
     assert r.status_code == 401
     assert r.headers["access-control-allow-origin"] == ORIGIN  # otherwise the browser reports a network error
 
