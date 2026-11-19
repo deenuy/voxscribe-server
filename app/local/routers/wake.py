@@ -1,6 +1,6 @@
 """Wake word state API, read from the voice host (app.state.voice_host).
 
-GET  /v1/wake/state     → {state, model, phrase, trigger, meeting_id, bound_to_caller}
+GET  /v1/wake/state     → {state, model, phrase, trigger, meeting_id, bound_to_caller, muted}
                           states: armed | listening | off | error
                           meeting_id is the running session's, and only the tenant the device is
                           bound to gets it. Any other verified caller still learns whether the
@@ -15,6 +15,18 @@ POST /v1/wake/disarm    → set state to off; the armed loop closes its subscrip
                           and a token not tied to another device: else 403 role_not_permitted or
                           device_mismatch. With isolation off nothing is checked, as before
 POST /v1/wake/start     → start a session now, no wake phrase (the button in an app)
+POST /v1/wake/stop      → end the running session now (End in an app): playback stops at once,
+                          the session closes as a spoken stop phrase closes it, and the listener
+                          goes back to what it was. {stopped, state}; stopped is false when no
+                          session was running
+POST /v1/wake/mute      → {"muted": bool}: while muted the session stays open, captured audio is
+                          not recognised and nothing reaches the model; the idle timeout leaves a
+                          muted session open for up to voice/host.py MUTE_HOLD_S. Mute ends with
+                          the session. {muted, state}
+                          Stop and mute need what arming needs (a device role, a token not tied
+                          to another device), and the caller must be the tenant the device is
+                          bound to: anyone else gets 409 voice_session_in_progress whether or not
+                          a session runs, and learns nothing about it
 POST /v1/wake/trigger   → DEBUG ONLY (--debug-trigger). Bypass the wake gate, start a session
                           immediately. Returns {meeting_id}. Use for automated roomplay tests.
 POST /v1/wake/power     → sleep | wake | lock | unlock from the app, for the capture watchdog
@@ -39,10 +51,13 @@ from app.local.errors import EngineError
 from app.local.identity import require_device_control
 from app.local.models import (
     WakeArmResponse,
+    WakeMuteRequest,
+    WakeMuteResponse,
     WakePowerResponse,
     WakeProfileResponse,
     WakeStartResponse,
     WakeStateResponse,
+    WakeStopResponse,
     WakeTriggerResponse,
 )
 from app.local.voice.host import (
@@ -96,6 +111,20 @@ def _refused(exc: SessionTenantRequiredError | SessionInProgressError) -> Engine
     return EngineError(exc.code, str(exc), 409)
 
 
+def _require_bound_caller(request: Request, host) -> None:
+    """Stop and mute act on the session of the tenant the device is bound to, so only that tenant
+    may send them. Anyone else is refused the same way whether or not a session runs. Without
+    tenant isolation there is no person on the request and nothing is checked."""
+    _require_device_control(request, host)
+    tenant = getattr(request.state, "tenant", None)
+    if tenant is None or host is None:
+        return
+    if not host.bound:
+        raise _refused(SessionTenantRequiredError("no tenant has armed the device yet"))
+    if host.binding.tenant != tenant:
+        raise _refused(SessionInProgressError("the voice device is working for someone else"))
+
+
 @router.get("/profile", response_model=WakeProfileResponse)
 async def wake_profile(request: Request):
     """Return a summary of the current product profile (mode and key settings)."""
@@ -115,7 +144,7 @@ async def wake_state(request: Request):
     if host is None:
         return {"state": WakeState.OFF.value, "model": _OFF_CONFIG.detector,
                 "phrase": _OFF_CONFIG.wake_phrase, "trigger": _OFF_CONFIG.trigger_phrase,
-                "meeting_id": None, "bound_to_caller": False}
+                "meeting_id": None, "bound_to_caller": False, "muted": False}
     s = host.snapshot()
     # A session is its tenant's: the meeting id goes to the tenant the device is bound to and to
     # nobody else. With isolation off both sides are None, the one shared scope.
@@ -127,6 +156,7 @@ async def wake_state(request: Request):
         "trigger":    s.get("trigger"),
         "meeting_id": s.get("meeting_id") if mine else None,
         "bound_to_caller": mine,
+        "muted": host.muted if mine else False,
     }
 
 
@@ -203,6 +233,31 @@ async def start_session(request: Request):
     except (SessionTenantRequiredError, SessionInProgressError) as exc:
         raise _refused(exc) from None
     return {"started": True, "state": _value(host.state), "meeting_id": mid}
+
+
+@router.post("/stop", status_code=200, response_model=WakeStopResponse)
+async def stop_session(request: Request):
+    """End the running voice session now: the End button. Playback stops at once and the session
+    closes through the spoken stop phrase's path; the wake listener is left as it was before the
+    session. Answers once the session has closed (bounded by END_WAIT_S)."""
+    host = _host(request)
+    _require_bound_caller(request, host)
+    if host is None:
+        return {"stopped": False, "state": WakeState.OFF.value}
+    stopped = await host.end_session()
+    return {"stopped": stopped, "state": _value(host.state)}
+
+
+@router.post("/mute", status_code=200, response_model=WakeMuteResponse)
+async def mute_session(body: WakeMuteRequest, request: Request):
+    """Mute or unmute the running voice session: the Mute button. Muted, the session stays open,
+    captured audio is not recognised and nothing is sent to the model; the idle timeout does not
+    end it for up to MUTE_HOLD_S. Mute ends with the session; with none running, muted is false."""
+    host = _host(request)
+    _require_bound_caller(request, host)
+    if host is None:
+        return {"muted": False, "state": WakeState.OFF.value}
+    return {"muted": host.set_muted(body.muted), "state": _value(host.state)}
 
 
 class PowerEvent(BaseModel):

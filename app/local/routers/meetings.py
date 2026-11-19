@@ -3,12 +3,20 @@
 import asyncio
 import logging
 import uuid
-from datetime import UTC, datetime
 
 from fastapi import APIRouter, Header, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-from app.local.errors import ConflictError, ConsentRequiredError, EngineError, InvalidRequestError, NetworkDisabledError, NotFoundError
+from app.local import pipeline
+from app.local.errors import (
+    ConflictError,
+    ConsentRequiredError,
+    EngineError,
+    InvalidRequestError,
+    NetworkDisabledError,
+    NotFoundError,
+    ProviderUnavailableError,
+)
 from app.local.http_utils import json_object, parse_model
 from app.local.export import export_meeting_markdown
 from app.local.models import (
@@ -25,9 +33,11 @@ from app.local.models import (
     NotesAcceptedResponse,
     NotesRequest,
     NotesResponse,
+    PipelineResponse,
     StartMeetingRequest,
     StartMeetingResponse,
     Summary,
+    SummaryJobResponse,
     TranscriptResponse,
     UpdateMeetingRequest,
 )
@@ -167,6 +177,8 @@ async def stop_meeting(request: Request, meeting_id: str):
     if stopped_now:
         from app.local import meeting_bus as _bus
         await _bus.publish(meeting_id, "status", {"state": "processing"})
+        # Saving the transcript: the live socket drains and flushes, then finalisation marks it ready.
+        await pipeline.report(request.app.state.store.pool, meeting_id, "transcript", pipeline.WORKING)
         # schedule_finalize is NOT called here. The live WS session's finally block
         # calls it after the ring drains and the flush is written, ensuring the full
         # transcript is in the DB before finalization starts. Meetings that stop
@@ -286,82 +298,60 @@ async def get_summary(request: Request, meeting_id: str):
     return Summary(**summary).model_dump(exclude_none=True)
 
 
-@router.post("/{meeting_id}/summary/regenerate")
+@router.post("/{meeting_id}/summary/regenerate", status_code=202, response_model=SummaryJobResponse)
 async def regenerate_summary(request: Request, meeting_id: str):
-    """Regenerate the summary for a meeting.
+    """Write the summary again (and then draft tasks again), in the background.
 
-    Returns 202 Accepted if the provider is available.
-    Returns 503 Provider Unavailable if the LLM provider is down.
-    Returns 409 `summary_edited` when a person wrote or changed the summary: regenerating replaces their words, so it
-    needs a body of `{"overwriteEdits": true}`.
-    """
-    from fastapi import Response
-
-    store = MeetingStore(request.app.state.store.pool)
+    202 `{jobId}`. While a summary is being written (after Stop, or by an earlier request) this attaches to that
+    run instead of starting another: the same 202 with that run's jobId, and the pipeline's summary step is
+    published again as it stands (working). 409 `summary_edited` when a person wrote or changed the summary:
+    regenerating replaces their words, so it needs a body of `{"overwriteEdits": true}`. 503 when the on-device AI
+    is not available. Progress is the `meeting.pipeline` event and GET /pipeline."""
+    pool = request.app.state.store.pool
+    store = MeetingStore(pool)
     await store.get_meeting(meeting_id)  # Verify exists
-    if (await store.get_summary(meeting_id)).get("edited"):
-        try:
-            sent = await request.json()
-        except ValueError:
-            sent = {}
-        if not (isinstance(sent, dict) and sent.get("overwriteEdits") is True):
-            raise EngineError("summary_edited", "this summary was edited by hand; regenerating replaces it. Send overwriteEdits: true to confirm", 409)
 
-    job_id = str(uuid.uuid4())
-    # Mark summary as pending
-    await store.set_summary_pending(meeting_id)
-
-    # Trigger async regeneration job in background
+    run = pipeline.running(meeting_id, "summary")
+    if run is not None:
+        steps = await pipeline.read(pool, meeting_id)
+        if steps:
+            pipeline.announce(steps[1], meeting_id)
+        log.info("regenerate: attached to the summary run in progress meeting=%s", meeting_id)
+        return JSONResponse({"jobId": run.job_id}, status_code=202)
+    run = pipeline.start_run(meeting_id, "summary")      # taken before any await: a second request attaches
     try:
-        asyncio.create_task(_regenerate_summary_async(store, meeting_id))
-    except Exception:
-        # If background task can't be created, still return 202
-        pass
+        if (await store.get_summary(meeting_id)).get("edited"):
+            try:
+                sent = await request.json()
+            except ValueError:
+                sent = {}
+            if not (isinstance(sent, dict) and sent.get("overwriteEdits") is True):
+                raise EngineError("summary_edited", "this summary was edited by hand; regenerating replaces it. Send overwriteEdits: true to confirm", 409)
+        llm = getattr(request.app.state, "providers", {}).get("llm")
+        if llm is None:
+            raise ProviderUnavailableError("the on-device AI is not available")
+        await store.set_summary_pending(meeting_id)
+        await pipeline.report(pool, meeting_id, "summary", pipeline.WORKING, pipeline.QUEUED)
+    except BaseException:
+        pipeline.end_run(meeting_id, "summary", run)
+        raise
 
-    return Response(
-        content=f'{{"jobId": "{job_id}"}}',
-        status_code=202,
-        media_type="application/json",
-    )
+    from app.local.summary_service import SummaryService
+
+    task = asyncio.create_task(SummaryService(store, llm).generate_summary(meeting_id), name="summary-regenerate")
+    pipeline.bind_task(meeting_id, "summary", run, task)
+    return JSONResponse({"jobId": run.job_id}, status_code=202)
 
 
-async def _regenerate_summary_async(store: MeetingStore, meeting_id: str):
-    """Background task to regenerate meeting summary."""
-    try:
-        from voxscribe.meeting.summary import SummaryGenerator
-
-        from app.local import meeting_bus
-
-        meeting = await store.get_meeting(meeting_id)
-        transcript = await store.get_transcript(meeting_id)
-
-        if not transcript:
-            # No transcript, can't summarize
-            return
-
-        # Create summary generator (would use the app's llm provider)
-        # For now, this is a placeholder that would be filled in
-        generator = SummaryGenerator(None)  # Would pass llm provider
-
-        # Generate summary
-        summary_result = generator.summarize(
-            text=" ".join(s.text for s in transcript),
-            style=meeting.enhanceStyle,
-        )
-
-        # Store summary
-        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        await store.set_summary(
-            meeting_id=meeting_id,
-            overview=summary_result.overview,
-            details=summary_result.details or [],
-            generated_at=now,
-        )
-
-        # Publish event
-        await meeting_bus.publish(meeting_id, "summary.ready", {})
-    except Exception as e:
-        log.error(f"Summary regeneration failed for {meeting_id}: {e}", exc_info=True)
+@router.get("/{meeting_id}/pipeline", response_model=PipelineResponse)
+async def get_pipeline(request: Request, meeting_id: str):
+    """The steps after Stop as they stand: transcript, summary and tasks, each `working`, `ready`, `failed` or
+    `skipped` with a reason code (or null). The same states the `meeting.pipeline` event carries, read from what is
+    stored, so a screen opened later shows the truth without waiting for an event."""
+    steps = await pipeline.read(request.app.state.store.pool, meeting_id)
+    if steps is None:
+        raise NotFoundError(f"meeting {meeting_id} not found")
+    return {"meetingId": meeting_id, "steps": steps}
 
 
 # ============================================================================

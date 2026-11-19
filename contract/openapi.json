@@ -1161,6 +1161,69 @@
         "title": "NotesRequest",
         "type": "object"
       },
+      "PipelineResponse": {
+        "description": "GET /v1/meetings/{id}/pipeline: every step, in order (transcript, summary, tasks).",
+        "properties": {
+          "meetingId": {
+            "title": "Meetingid",
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/PipelineStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "meetingId",
+          "steps"
+        ],
+        "title": "PipelineResponse",
+        "type": "object"
+      },
+      "PipelineStep": {
+        "description": "One step after Stop. `reason` is a short code (app/local/pipeline.py REASONS), never model or transcript text:\nqueued, recording, not_started, too_short, no_speech, model_unavailable, model_timeout, model_error,\nunusable_output, edited_by_hand, summary_failed, not_generated, interrupted. Null when there is nothing to add.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "working",
+              "ready",
+              "failed",
+              "skipped"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "step": {
+            "enum": [
+              "transcript",
+              "summary",
+              "tasks"
+            ],
+            "title": "Step",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "state"
+        ],
+        "title": "PipelineStep",
+        "type": "object"
+      },
       "PowerEvent": {
         "properties": {
           "event": {
@@ -1238,6 +1301,20 @@
           "liveUrl"
         ],
         "title": "StartMeetingResponse",
+        "type": "object"
+      },
+      "SummaryJobResponse": {
+        "description": "POST /summary/regenerate: the run writing the summary (a new one, or the one already in progress).",
+        "properties": {
+          "jobId": {
+            "title": "Jobid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "jobId"
+        ],
+        "title": "SummaryJobResponse",
         "type": "object"
       },
       "TicketRequest": {
@@ -1580,6 +1657,38 @@
         "title": "WakeArmResponse",
         "type": "object"
       },
+      "WakeMuteRequest": {
+        "properties": {
+          "muted": {
+            "title": "Muted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "muted"
+        ],
+        "title": "WakeMuteRequest",
+        "type": "object"
+      },
+      "WakeMuteResponse": {
+        "description": "POST /v1/wake/mute. `muted` is whether the running session is muted now: false when none is running.",
+        "properties": {
+          "muted": {
+            "title": "Muted",
+            "type": "boolean"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "muted",
+          "state"
+        ],
+        "title": "WakeMuteResponse",
+        "type": "object"
+      },
       "WakePowerResponse": {
         "properties": {
           "event": {
@@ -1696,6 +1805,11 @@
             ],
             "title": "Model"
           },
+          "muted": {
+            "default": false,
+            "title": "Muted",
+            "type": "boolean"
+          },
           "phrase": {
             "anyOf": [
               {
@@ -1733,6 +1847,25 @@
           "state"
         ],
         "title": "WakeStateResponse",
+        "type": "object"
+      },
+      "WakeStopResponse": {
+        "description": "POST /v1/wake/stop. `stopped` is false when no session was running; `state` is the wake listener's after.",
+        "properties": {
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "stopped": {
+            "title": "Stopped",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "stopped",
+          "state"
+        ],
+        "title": "WakeStopResponse",
         "type": "object"
       },
       "WakeTriggerResponse": {
@@ -2136,7 +2269,7 @@
     },
     "/v1/chat/threads/{thread_id}/messages": {
       "post": {
-        "description": "Send a message and stream the response.",
+        "description": "Send a message and stream the answer as server-sent events.\n\n`event: token` {\"text\"} for each piece of the answer, then `event: citations` {\"citations\"} and `event: done`\n{\"messageId\"}; or `event: error` {\"error\", \"detail\"}. A scribe thread (scope.meetingId) is answered from that\nscribe's transcript, any other from the person's sources (chat_grounding.py). Every database read goes through\nthe tenant pool, and the model runs on a worker thread, never on the event loop.",
         "operationId": "send_message_v1_chat_threads__thread_id__messages_post",
         "parameters": [
           {
@@ -4192,6 +4325,49 @@
         ]
       }
     },
+    "/v1/meetings/{meeting_id}/pipeline": {
+      "get": {
+        "description": "The steps after Stop as they stand: transcript, summary and tasks, each `working`, `ready`, `failed` or\n`skipped` with a reason code (or null). The same states the `meeting.pipeline` event carries, read from what is\nstored, so a screen opened later shows the truth without waiting for an event.",
+        "operationId": "get_pipeline_v1_meetings__meeting_id__pipeline_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "meeting_id",
+            "required": true,
+            "schema": {
+              "title": "Meeting Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Pipeline",
+        "tags": [
+          "meetings"
+        ]
+      }
+    },
     "/v1/meetings/{meeting_id}/start": {
       "post": {
         "description": "Start recording a meeting.",
@@ -4331,7 +4507,7 @@
     },
     "/v1/meetings/{meeting_id}/summary/regenerate": {
       "post": {
-        "description": "Regenerate the summary for a meeting.\n\nReturns 202 Accepted if the provider is available.\nReturns 503 Provider Unavailable if the LLM provider is down.\nReturns 409 `summary_edited` when a person wrote or changed the summary: regenerating replaces their words, so it\nneeds a body of `{\"overwriteEdits\": true}`.",
+        "description": "Write the summary again (and then draft tasks again), in the background.\n\n202 `{jobId}`. While a summary is being written (after Stop, or by an earlier request) this attaches to that\nrun instead of starting another: the same 202 with that run's jobId, and the pipeline's summary step is\npublished again as it stands (working). 409 `summary_edited` when a person wrote or changed the summary:\nregenerating replaces their words, so it needs a body of `{\"overwriteEdits\": true}`. 503 when the on-device AI\nis not available. Progress is the `meeting.pipeline` event and GET /pipeline.",
         "operationId": "regenerate_summary_v1_meetings__meeting_id__summary_regenerate_post",
         "parameters": [
           {
@@ -4345,10 +4521,12 @@
           }
         ],
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SummaryJobResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -4455,7 +4633,7 @@
     },
     "/v1/meetings/{meeting_id}/tasks/generate": {
       "post": {
-        "description": "Draft tasks from the transcript (and the scribe's project, when it has one).\n\nAdds only titles the scribe does not have yet, so it is safe to run again: tasks that are done, edited or written\nby hand are never touched or repeated. Answers `{created, skipped}`. 409 until the scribe has finished and has a\ntranscript; 503 when the AI is not running; 502 when its answer cannot be used (try again).",
+        "description": "Draft tasks from the transcript (and the scribe's project, when it has one).\n\nAdds only titles the scribe does not have yet, so it is safe to run again: tasks that are done, edited or written\nby hand are never touched or repeated. Answers `{created, skipped}`. 409 until the scribe has finished and has a\ntranscript; 503 when the AI is not running; 502 when its answer cannot be used; 504 `model_timeout` when it does\nnot answer in time (try again). The tasks step of the pipeline shows working, then ready or failed with its\nreason, so this is also how a failed step is retried.",
         "operationId": "generate_tasks_v1_meetings__meeting_id__tasks_generate_post",
         "parameters": [
           {
@@ -5849,6 +6027,48 @@
         ]
       }
     },
+    "/v1/wake/mute": {
+      "post": {
+        "description": "Mute or unmute the running voice session: the Mute button. Muted, the session stays open,\ncaptured audio is not recognised and nothing is sent to the model; the idle timeout does not\nend it for up to MUTE_HOLD_S. Mute ends with the session; with none running, muted is false.",
+        "operationId": "mute_session_v1_wake_mute_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WakeMuteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WakeMuteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mute Session",
+        "tags": [
+          "wake"
+        ]
+      }
+    },
     "/v1/wake/power": {
       "post": {
         "description": "Power and session events forwarded by the app (Electron powerMonitor).\n\nsleep pauses the capture watchdog; wake (or an unlock that follows a missed wake) reopens the\nmicrophone stream after a short delay so the voice host is armed on a live stream. Lock alone\nchanges nothing. Returns handled=False when the engine runs without an audio engine.",
@@ -5951,6 +6171,28 @@
           }
         },
         "summary": "Wake State",
+        "tags": [
+          "wake"
+        ]
+      }
+    },
+    "/v1/wake/stop": {
+      "post": {
+        "description": "End the running voice session now: the End button. Playback stops at once and the session\ncloses through the spoken stop phrase's path; the wake listener is left as it was before the\nsession. Answers once the session has closed (bounded by END_WAIT_S).",
+        "operationId": "stop_session_v1_wake_stop_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WakeStopResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Stop Session",
         "tags": [
           "wake"
         ]

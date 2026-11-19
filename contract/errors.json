@@ -122,6 +122,16 @@
       "status": 409
     },
     {
+      "code": "summary_edited",
+      "detail": "the summary was edited by hand; regenerating needs overwriteEdits: true",
+      "status": 409
+    },
+    {
+      "code": "model_timeout",
+      "detail": "the on-device AI did not answer in time; try again",
+      "status": 504
+    },
+    {
       "code": "assistant_field_fixed",
       "detail": "the assistant setting is fixed for this engine or product mode and cannot be changed",
       "status": 400

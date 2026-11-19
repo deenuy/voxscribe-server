@@ -5,12 +5,13 @@ Tables owned by this module:
 - chat_messages
 """
 
-from .timefmt import iso_z
 from datetime import datetime
 
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from .models import ChatScope, Citation, Message, Thread
+from .timefmt import iso_z
 
 
 def _to_iso_string(dt):
@@ -103,7 +104,7 @@ class ChatStore:
             await conn.execute(
                 """INSERT INTO chat_messages (id, thread_id, role, text, citations, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s)""",
-                (message_id, thread_id, role, text, citations_list, now),
+                (message_id, thread_id, role, text, Jsonb(citations_list), now),  # a list of objects needs the JSON adapter
             )
             await conn.commit()
         return Message(

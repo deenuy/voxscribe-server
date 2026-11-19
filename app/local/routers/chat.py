@@ -1,16 +1,19 @@
 """Chat endpoints."""
 
 import json
+import logging
 import uuid
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
+from voxscribe.knowledge.llm_stream import ProviderUnavailable
 
-from app.local.chat_grounding import AsyncAnswerComposer
-from app.local.errors import NotFoundError
+from app.local.chat_grounding import ground_in_scribe, ground_in_sources, stream_off_loop
+from app.local.errors import NotFoundError, ProviderUnavailableError
 from app.local.models import Citation, CreateThreadRequest, SendMessageRequest
-from app.local.pg_sync_index import PostgresKnowledgeIndexSync, PostgresSyncRetriever
 from app.local.store_chat import ChatStore
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
 
@@ -67,9 +70,14 @@ async def delete_thread(request: Request, thread_id: str):
 
 @router.post("/threads/{thread_id}/messages")
 async def send_message(request: Request, thread_id: str, body: SendMessageRequest):
-    """Send a message and stream the response."""
+    """Send a message and stream the answer as server-sent events.
 
-    store = ChatStore(request.app.state.store.pool)
+    `event: token` {"text"} for each piece of the answer, then `event: citations` {"citations"} and `event: done`
+    {"messageId"}; or `event: error` {"error", "detail"}. A scribe thread (scope.meetingId) is answered from that
+    scribe's transcript, any other from the person's sources (chat_grounding.py). Every database read goes through
+    the tenant pool, and the model runs on a worker thread, never on the event loop."""
+    pool = request.app.state.store.pool
+    store = ChatStore(pool)
     providers = request.app.state.providers
 
     thread = await store.get_thread(thread_id)
@@ -80,65 +88,49 @@ async def send_message(request: Request, thread_id: str, body: SendMessageReques
 
     user_message_id = str(uuid.uuid4())
     assistant_message_id = str(uuid.uuid4())
-
-    # Save user message
     await store.add_message(user_message_id, thread_id, "user", text, [])
 
-    # Determine scope for retrieval
-    scope_source_ids = thread.scope.sourceIds if thread.scope else None
+    scope = thread.scope
+    llm = providers["llm_provider"]
+    fake = getattr(request.app.state.settings, "providers", "") == "fake"
 
-    # Sync index and retriever (the composer runs off the event loop)
-    embedder = providers["embedding_provider"]
-    llm_provider = providers["llm_provider"]
-    db_url = request.app.state.settings.database_url
-
-    # Use sync index for core's Retriever
-    sync_index = PostgresKnowledgeIndexSync(db_url)
-    sync_retriever = PostgresSyncRetriever(sync_index, embedder)
-
-    # Wrap with async composer
-    composer = AsyncAnswerComposer(llm_provider, sync_retriever)
-
-    # Stream response
     async def response_generator():
         try:
-            # Get token stream and citations (async)
-            token_stream, citations = await composer.stream(text, scope_source_ids=scope_source_ids)
-
-            # Stream tokens (stream is synchronous generator)
-            collected_text = ""
-            for token in token_stream:
+            if scope and scope.meetingId:
+                grounding = await ground_in_scribe(pool, llm, scope.meetingId, text)
+            else:
+                grounding = await ground_in_sources(pool, llm, providers["embedding_provider"], text,
+                                                    scope.sourceIds if scope else None, fake_embedder=fake)
+            pieces: list[str] = []
+            async for token in stream_off_loop(grounding.tokens):
+                token = (token or "").replace("\x00", "")    # PostgreSQL text cannot hold NUL; sent as stored
                 if token:
-                    escaped = token.replace('"', '\\"').replace('\n', '\\n')
-                    yield f'event: token\ndata: {{"text": "{escaped}"}}\n\n'
-                    collected_text += token
+                    pieces.append(token)
+                    yield _sse("token", {"text": token})
 
-            # Yield citations
             citation_models = [
-                Citation(
-                    kind=c.kind,
-                    sourceId=c.source_id,
-                    chunkId=c.chunk_id,
-                    title=c.title,
-                    locator=c.locator,
-                    segmentId=c.segment_id,
-                    startMs=c.start_ms,
-                    endMs=c.end_ms,
-                )
-                for c in citations
+                Citation(kind=c.kind, sourceId=c.source_id, chunkId=c.chunk_id, title=c.title, locator=c.locator,
+                         segmentId=c.segment_id, startMs=c.start_ms, endMs=c.end_ms)
+                for c in grounding.citations
             ]
-            citations_data = [c.model_dump(exclude_none=True) for c in citation_models]
-            yield f'event: citations\ndata: {json.dumps({"citations": citations_data})}\n\n'
-
-            # Save assistant message with citations
-            await store.add_message(assistant_message_id, thread_id, "assistant", collected_text, citation_models)
-
-            # Emit done event
-            yield f'event: done\ndata: {json.dumps({"messageId": assistant_message_id})}\n\n'
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            yield f'event: error\ndata: {json.dumps({"error": "internal_error", "detail": str(e)})}\n\n'
+            yield _sse("citations", {"citations": [c.model_dump(exclude_none=True) for c in citation_models]})
+            answer = "".join(pieces)
+            await store.add_message(assistant_message_id, thread_id, "assistant", answer, citation_models)
+            log.info("chat: answered thread=%s scribe=%s model=%s answer_chars=%d citations=%d",
+                     thread_id, bool(scope and scope.meetingId), grounding.model, len(answer), len(citation_models))
+            yield _sse("done", {"messageId": assistant_message_id})
+        except Exception as exc:  # noqa: BLE001 - the stream has started: the error goes in it
+            # The exception's text can carry a prompt or a model's words: only its type is logged or sent.
+            log.error("chat: answer failed thread=%s error=%s", thread_id, type(exc).__name__)
+            code, detail = (("provider_unavailable", "the on-device AI could not be reached")
+                            if isinstance(exc, (ProviderUnavailable, ProviderUnavailableError))
+                            else ("internal_error", "the answer could not be generated"))
+            yield _sse("error", {"error": code, "detail": detail})
 
     return StreamingResponse(response_generator(), media_type="text/event-stream")
+
+
+def _sse(event: str, data: dict) -> str:
+    """One server-sent event. json.dumps escapes quotes, backslashes, newlines and every control character, so the
+    data is always one valid JSON line."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
