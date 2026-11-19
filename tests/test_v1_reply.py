@@ -16,6 +16,9 @@ from __future__ import annotations
 import pytest
 from app.local import gate
 from app.local.gate import (
+import shutil
+
+needs_say = pytest.mark.skipif(shutil.which("say") is None, reason="needs the macOS say command")
     CLASSROOM_REFUSAL_PHRASE,
     DEFAULT_REFUSAL_PHRASE,
     SENIORCARE_ESCALATION_PHRASE,
@@ -79,6 +82,7 @@ def test_v1_e04_safe_content_passes_gate():
 
 # ── V1-E05: pre-rendered phrase cache is idempotent ─────────────────────────
 
+@needs_say
 def test_v1_e05_prerender_phrase_is_idempotent(monkeypatch, tmp_path):
     """Two calls for the same phrase produce the same path without re-synthesizing."""
     import asyncio
@@ -124,6 +128,7 @@ def test_v1_e06_gate_refusal_masks_model_text():
 
 # ── V1-P03: all three fixed phrases pre-renderable ───────────────────────────
 
+@needs_say
 def test_v1_p03_all_fixed_phrases_prerenderable(monkeypatch, tmp_path):
     """Three fixed phrases all synthesize to WAV files without error."""
     import asyncio

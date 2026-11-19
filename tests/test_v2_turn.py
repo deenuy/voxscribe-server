@@ -22,6 +22,10 @@ import wave
 from pathlib import Path
 
 import pytest
+import shutil
+
+# Every test here synthesises its audio with the macOS say command.
+pytestmark = pytest.mark.skipif(shutil.which("say") is None, reason="needs the macOS say command")
 
 _SAMPLE_RATE = 16_000
 _CHUNK_FRAMES = 512
