@@ -13,10 +13,13 @@ Both run behind the same two-stage gate (voice check, then recognizer confirm on
 """
 from __future__ import annotations
 
+import logging
 import os
 
 from voxscribe.session.ports import WakeDetector
 from voxscribe.wake.gate import ASR_CONFIRM_PHRASE, GateConfig, WakeGate
+
+log = logging.getLogger("app.local.voice.wake_setup")
 
 DETECTOR_ENV = "VOXSCRIBE_WAKE_DETECTOR"
 HYBRID = "hybrid"
@@ -44,8 +47,11 @@ def make_detector(name: str | None = None, *, oww_model: str | None = None,
 
         try:
             spotter = OpenVocabWakeDetector(keyword=phrase)
-        except KwsModelMissing:
-            spotter = None      # the onset path needs no spotter model; it only helps mid-sentence
+        except (KwsModelMissing, ImportError) as exc:
+            # The onset path needs neither the spotter's model nor its libraries; the spotter only
+            # helps with a phrase said mid-sentence.
+            log.warning("wake: keyword spotter unavailable (%s); speech onset only", type(exc).__name__)
+            spotter = None
         return HybridWakeDetector(OnsetPhraseDetector(phrase, transcribe=transcribe), spotter)
     if name == OPENVOCAB:
         from app.local.voice.adapters.wake_openvocab import OpenVocabWakeDetector
