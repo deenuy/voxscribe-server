@@ -67,7 +67,9 @@ class WhisperConfirm:
                 log.info("wake confirm model loaded model=%s", self.model_size)
             return self._model
 
-    def __call__(self, window: np.ndarray) -> list[WordTiming]:
+    def __call__(self, window: np.ndarray, prompt: str | None = None) -> list[WordTiming]:
+        """`prompt` primes the recognizer with the phrase being listened for ("Hey Vox."), so an
+        unusual name comes back spelled as written instead of as its nearest common word."""
         model = self._load()
         audio = np.asarray(window, dtype=np.float32)
         if audio.shape[0] == 0:
@@ -79,6 +81,7 @@ class WhisperConfirm:
             word_timestamps=True,
             vad_filter=False,
             condition_on_previous_text=False,
+            initial_prompt=prompt or None,
         )
         out: list[WordTiming] = []
         for seg in segments:

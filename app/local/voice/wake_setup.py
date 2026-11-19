@@ -2,8 +2,10 @@
 
 VOXSCRIBE_WAKE_DETECTOR picks the stage 1 adapter:
 
-  openvocab  sherpa-onnx keyword spotting on the plain-text phrase (default, chosen by the T02
-             bake-off: equal fixture recall, better held-out recall, no training step)
+  hybrid     speech onset plus a primed recognizer pass that must begin with the phrase, with the
+             keyword spotter beside it for a phrase said mid-sentence (default: the spotter alone
+             fired on 8 of 20 unseen voices, this on 20 of 20; see adapters/wake_onset.py)
+  openvocab  sherpa-onnx keyword spotting on the plain-text phrase, alone (the T02 choice)
   oww        an openWakeWord model, by default the synthetic "hey vox" head; VOXSCRIBE_WAKE_MODEL
              overrides the model
 
@@ -17,10 +19,11 @@ from voxscribe.session.ports import WakeDetector
 from voxscribe.wake.gate import ASR_CONFIRM_PHRASE, GateConfig, WakeGate
 
 DETECTOR_ENV = "VOXSCRIBE_WAKE_DETECTOR"
+HYBRID = "hybrid"
 OPENVOCAB = "openvocab"
 OWW = "oww"
-DEFAULT_DETECTOR = OPENVOCAB
-DETECTORS = (OPENVOCAB, OWW)
+DEFAULT_DETECTOR = HYBRID
+DETECTORS = (HYBRID, OPENVOCAB, OWW)
 
 
 def configured_detector() -> str:
@@ -31,8 +34,19 @@ def configured_detector() -> str:
 
 
 def make_detector(name: str | None = None, *, oww_model: str | None = None,
-                  phrase: str = ASR_CONFIRM_PHRASE) -> WakeDetector:
+                  phrase: str = ASR_CONFIRM_PHRASE, transcribe=None) -> WakeDetector:
+    """`transcribe(audio, prompt) -> words` is the recognizer pass the hybrid detector uses; left
+    out, it loads the confirm model itself (the offline harness)."""
     name = name or configured_detector()
+    if name == HYBRID:
+        from app.local.voice.adapters.wake_onset import HybridWakeDetector, OnsetPhraseDetector
+        from app.local.voice.adapters.wake_openvocab import KwsModelMissing, OpenVocabWakeDetector
+
+        try:
+            spotter = OpenVocabWakeDetector(keyword=phrase)
+        except KwsModelMissing:
+            spotter = None      # the onset path needs no spotter model; it only helps mid-sentence
+        return HybridWakeDetector(OnsetPhraseDetector(phrase, transcribe=transcribe), spotter)
     if name == OPENVOCAB:
         from app.local.voice.adapters.wake_openvocab import OpenVocabWakeDetector
         return OpenVocabWakeDetector(keyword=phrase)
@@ -51,8 +65,11 @@ def make_gate(detector: WakeDetector, *, voice: bool = True, confirm: bool = Tru
         from app.local.voice.adapters.wake_confirm import SileroVoiceRatio
         voice_ratio = SileroVoiceRatio()
     if confirm:
-        from app.local.voice.adapters.wake_confirm import WhisperConfirm
-        transcribe = WhisperConfirm()
-        transcribe.warm()
+        # A detector that runs its own recognizer pass hands the gate that pass (one decode a wake).
+        transcribe = getattr(detector, "confirm", None)
+        if transcribe is None:
+            from app.local.voice.adapters.wake_confirm import WhisperConfirm
+            transcribe = WhisperConfirm()
+            transcribe.warm()
     return WakeGate(detector, voice_ratio=voice_ratio, transcribe=transcribe,
                     config=GateConfig(phrase=phrase))

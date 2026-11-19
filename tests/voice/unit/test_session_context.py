@@ -491,3 +491,35 @@ def test_the_boundary_scan_catches_a_direct_borrow(tmp_path):
     reaches = _pool_reaches(bad)
     assert any(".pool" in r for r in reaches) and any(".state.store" in r for r in reaches)
     assert any("import psycopg" in r for r in reaches)
+
+
+async def test_a_session_started_by_hand_leaves_the_wake_listener_as_it_was():
+    """The button in an app: with the listener off, a session starts and the device is off again
+    when it ends; with the listener armed it is armed again. A second start while one runs is
+    refused."""
+    host = VoiceHost(VoiceConfig(), ports=fake_ports(recognizer=FakeRecognizer(TURNS)))
+    assert host.state == WakeState.OFF
+    session_id = await asyncio.wait_for(host.start_now(), SESSION_TIMEOUT_S)
+    assert session_id
+    with pytest.raises(SessionInProgressError):
+        await host.start_now()
+    for _ in range(200):
+        if host.state != WakeState.LISTENING and not host._claimed:
+            break
+        await asyncio.sleep(0.02)
+    assert host.state == WakeState.OFF
+
+    assert host.arm()
+    await asyncio.wait_for(host.start_now(), SESSION_TIMEOUT_S)
+    for _ in range(200):
+        if host.state != WakeState.LISTENING and not host._claimed:
+            break
+        await asyncio.sleep(0.02)
+    assert host.state == WakeState.ARMED
+
+
+async def test_starting_by_hand_with_nobody_bound_is_refused_before_anything_is_loaded():
+    host, scope, store, events = _bound_host(binding=None)
+    with pytest.raises(SessionTenantRequiredError):
+        await host.start_now()
+    assert host.state == WakeState.OFF

@@ -30,6 +30,11 @@ class WhisperRecognizer:
         words = tuple(self._confirm(pcm_float32_mono))
         return TranscriptionResult(text=" ".join(w.word.strip() for w in words), words=words)
 
+    def confirm_words(self, pcm_float32_mono: np.ndarray, prompt: str | None = None):
+        """The short confirm pass, primed with the phrase being listened for (the wake detector's
+        recognizer pass; one model, already loaded)."""
+        return self._confirm(pcm_float32_mono, prompt=prompt)
+
     def open_stream(self, session_id: str) -> _LiveStream | None:
         if self._asr is None:
             return None

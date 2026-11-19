@@ -496,7 +496,8 @@ def build_ports(app) -> VoicePorts:
     return VoicePorts(
         audio_in=audio_portaudio.PortAudioIn(engine),
         audio_out=audio_portaudio.PortAudioOut(engine),
-        wake=make_detector(phrase=ASR_CONFIRM_PHRASE),
+        wake=make_detector(phrase=ASR_CONFIRM_PHRASE,
+                           transcribe=getattr(recognizer, "confirm_words", None)),
         recognizer=recognizer,
         talker=KokoroTalker(get_voice_speed=_get_voice_speed),
         delegate=OllamaDelegate(app),
@@ -510,8 +511,10 @@ def build_ports(app) -> VoicePorts:
 def make_wake_gate(ports: VoicePorts, phrase: str = ASR_CONFIRM_PHRASE) -> WakeGate:
     """The two-stage gate over the ports: WakeDetector, then Speech's voice check, then a
     Recognizer confirm pass."""
-    return WakeGate(ports.wake, voice_ratio=ports.speech.voice_ratio,
-                    transcribe=lambda window: ports.recognizer.transcribe(window).words,
+    # A detector that runs its own recognizer pass hands the gate that pass (one decode a wake).
+    transcribe = getattr(ports.wake, "confirm", None) \
+        or (lambda window: ports.recognizer.transcribe(window).words)
+    return WakeGate(ports.wake, voice_ratio=ports.speech.voice_ratio, transcribe=transcribe,
                     config=GateConfig(phrase=phrase))
 
 
@@ -1731,12 +1734,24 @@ class VoiceHost:
 
     # ------------------------------------------------------------------ hooks
 
+    async def start_now(self) -> str | None:
+        """Start a session because a person asked for one (a button in an app), with no wake
+        phrase. The wake listener is left as it was: a device that was off is off again when the
+        session ends, so a person who prefers the button never has an open microphone between
+        sessions. Returns the session id once known."""
+        if self.state == WakeState.LISTENING or self._claimed:
+            raise SessionInProgressError("a voice session is already running")
+        self._device_binding()              # refused before any model is loaded
+        await self._ready()
+        return await self.trigger()
+
     async def trigger(self) -> str | None:
-        """Debug trigger: start a session without a wake. Returns the session id once known."""
+        """Start a session without a wake. Returns the session id once known."""
         if self.ports is None:
             raise RuntimeError("voice host is not ready")
         p = self.ports
         binding = self._device_binding()    # refused here, before a task or a subscription
+        resume = WakeState.OFF if self.state == WakeState.OFF else WakeState.ARMED
         audio_q = p.audio_in.subscribe()
         # Taken now, not when the task below first runs: a bind landing in between would give
         # the device to someone else while this session opens for `binding`. Released when the
@@ -1749,9 +1764,11 @@ class VoiceHost:
             except Exception:
                 log.exception("voice host: triggered session failed")
             finally:
-                # The trigger path never goes through the armed loop, so reset here.
+                # The trigger path never goes through the armed loop, so reset here, to what the
+                # wake listener was before: armed stays armed, off stays off.
                 self._claimed = False
-                self.set_state(WakeState.ARMED)
+                self.set_state(resume)
+                self._publish_device("wake_state", self.snapshot())
                 p.audio_in.unsubscribe(audio_q)
 
         asyncio.create_task(_session(), name="trigger-session")
