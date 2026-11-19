@@ -16,8 +16,7 @@ from app.local.config import Config
 from app.local.db import redact_password
 from app.local.log_redaction import install as redact_secrets_in_logs
 from app.local.migrations import run_migrations
-
-VERSION = "0.1.0"
+from app.local.version import engine_version
 
 _MONOTONIC_START = time.monotonic()
 
@@ -172,7 +171,7 @@ async def main():
             if self.started and self.servers:
                 port = self.servers[0].sockets[0].getsockname()[1]
                 # stdout carries exactly this one line; everything else goes to stderr.
-                print(json.dumps({"event": "ready", "port": port, "version": VERSION}), flush=True)
+                print(json.dumps({"event": "ready", "port": port, "version": engine_version()}), flush=True)
 
     # uvicorn installs its own SIGINT and SIGTERM handlers and shuts down cleanly.
     await ReadyServer(uvicorn_config).serve()

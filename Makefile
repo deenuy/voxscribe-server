@@ -53,9 +53,9 @@ health: ## Check the health endpoint
 	@curl -fsS $(BASE)/health && echo
 
 .PHONY: dev
-dev: ## Run locally with hot reload, no Docker
-	pip install -r requirements.txt
-	uvicorn app.main:app --reload --port 8000
+dev: ## Run the engine locally without Docker (no auth, port 8000)
+	uv sync --extra dev
+	uv run python -m app.local.engine --port 8000 --no-auth
 
 .PHONY: smoke
 smoke: ## End to end check: upload a transcript and follow progress
