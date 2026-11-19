@@ -1,9 +1,7 @@
-# VoxScribe processing backend. `make up` builds the image and starts the service.
+# VoxScribe local engine. `make up` builds the image and starts the engine.
 
 COMPOSE := docker compose
 BASE := http://localhost:8000
-TENANT := tnt-acme
-WORKSPACE := ws-discovery
 
 ENGINE_PORT          ?= 65364
 ENGINE_DB            ?= postgresql://localhost:5432/ideascribe_dev
@@ -23,19 +21,15 @@ help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  %-12s %s\n", $$1, $$2}'
 
-.PHONY: env
-env: ## Create .env from the template if missing
-	@test -f .env || cp .env.example .env
-	@echo ".env ready"
-
 .PHONY: build
-build: env ## Build the Docker image
+build: ## Build the Docker image
 	$(COMPOSE) build
 
 .PHONY: up
-up: env ## Build and start the service in the background (the main target)
+up: ## Build and start the engine in the background
 	$(COMPOSE) up -d --build
-	@echo "API on $(BASE)  (docs at $(BASE)/docs)"
+	@echo "Engine started. Health (inside container only): $(BASE)/v1/health"
+	@echo "Note: the engine binds to loopback; $(BASE) is not reachable from the host."
 
 .PHONY: down
 down: ## Stop and remove the container
@@ -49,23 +43,13 @@ logs: ## Tail service logs
 	$(COMPOSE) logs -f
 
 .PHONY: health
-health: ## Check the health endpoint
-	@curl -fsS $(BASE)/health && echo
+health: ## Check the engine health endpoint (requires the engine to be reachable at BASE)
+	@curl -fsS $(BASE)/v1/health && echo
 
 .PHONY: dev
 dev: ## Run the engine locally without Docker (no auth, port 8000)
 	uv sync --extra dev
 	uv run python -m app.local.engine --port 8000 --no-auth
-
-.PHONY: smoke
-smoke: ## End to end check: upload a transcript and follow progress
-	@echo "we should build voice capture. actually the real problem is idea readiness." > /tmp/vs_smoke.txt
-	@SID=$$(curl -fsS -X POST "$(BASE)/v1/sessions/from-file?title=Smoke&participants=2" \
-	  -H "X-Tenant-Id: $(TENANT)" -H "X-Workspace-Id: $(WORKSPACE)" \
-	  -F file=@/tmp/vs_smoke.txt | python3 -c "import sys,json;print(json.load(sys.stdin)['sessionId'])"); \
-	  echo "session $$SID"; \
-	  curl -fsS -N "$(BASE)/v1/sessions/$$SID/progress" \
-	  -H "X-Tenant-Id: $(TENANT)" -H "X-Workspace-Id: $(WORKSPACE)"
 
 CONSOLE := scripts/engine-console.sh
 
@@ -233,7 +217,7 @@ db-reset: ## Drop and recreate the engine schema (requires CONFIRM=yes)
 	@psql $${VOXSCRIBE_DATABASE_URL:-postgresql://localhost/ideascribe_dev} -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"
 
 .PHONY: clean
-clean: ## Remove the local data directory (sessions + sqlite db)
+clean: ## Remove the local data directory
 	rm -rf ./data
 
 # ---------------------------------------------------------------------------
