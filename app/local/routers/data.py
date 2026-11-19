@@ -206,12 +206,17 @@ async def delete_all_data(
 
     await _forget_in_memory(app, tenant_key)
 
-    if pool.enforced and tenant_key:
-        await pool.provisioner.drop(tenant_key)
-        log.info("erase: dropped schema tenant=%s", tenant_key)
-    else:
-        async with pool.connection() as conn:
-            await _truncate_tenant_tables(conn)
+    # The due-item scheduler is held while the rows go, so no delivery of theirs writes after
+    # the erase or makes their schema again (PL46).
+    scheduler = getattr(app.state, "due_scheduler", None)
+    held = scheduler.erasing(tenant_key) if scheduler is not None else contextlib.nullcontext()
+    async with held:
+        if pool.enforced and tenant_key:
+            await pool.provisioner.drop(tenant_key)
+            log.info("erase: dropped schema tenant=%s", tenant_key)
+        else:
+            async with pool.connection() as conn:
+                await _truncate_tenant_tables(conn)
 
     tenant_dir = tenant_files_dir(data_dir, tenant_key)
     if tenant_dir.exists():

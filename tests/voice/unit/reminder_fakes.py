@@ -8,6 +8,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from app.local.voice import reminder_store as rs
+from app.local.voice.adapters.store_postgres import PostgresSessionStore
 
 # Thursday 19 November 2026, 14:00 in Toronto.
 START = datetime(2026, 11, 19, 19, 0, tzinfo=UTC)
@@ -110,3 +111,19 @@ class FakeReminderStore:
 
     def of(self, kind: str) -> list[rs.Item]:
         return [i for i in self.rows.values() if i.kind == kind]
+
+
+class SessionRows(PostgresSessionStore):
+    """The real session store's turn, gate and receipt rows (over the in-memory pool), with no
+    meeting rows, so a whole session can run without a database."""
+
+    async def create_session(self, *_a, **_kw):
+        return "s1"
+
+    async def add_segment(self, *_a):
+        pass
+
+    async def close_session(self, *_a):
+        pass
+
+    discard_session = close_session

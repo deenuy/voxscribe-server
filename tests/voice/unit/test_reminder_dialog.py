@@ -40,7 +40,7 @@ from app.local.voice.adapters.gate_policy import CorePolicyGate, session_policy
 from app.local.voice.adapters.store_postgres import PostgresSessionStore
 from app.local.voice.host import VoiceConfig, VoiceHost
 from tests.voice.unit.fakes import fake_ports
-from tests.voice.unit.reminder_fakes import ZONE, FakeClock, FakeReminderStore
+from tests.voice.unit.reminder_fakes import ZONE, FakeClock, FakeReminderStore, SessionRows
 from tests.voice.unit.tool_fakes import ToolPool, load_profile, make_app
 
 VALIDATION = "remind me in two minutes, no, three minutes, to stretch"
@@ -425,20 +425,6 @@ async def test_a_spoken_yes_of_one_word_sets_the_reminder_through_the_host_loop(
     import asyncio
 
     from tests.voice.unit.fakes import EndlessQueue, FakeRecognizer
-
-    class SessionRows(PostgresSessionStore):
-        """The turn, gate and receipt rows of the real store; no meeting rows."""
-
-        async def create_session(self, *_a, **_kw):
-            return "s1"
-
-        async def add_segment(self, *_a):
-            pass
-
-        async def close_session(self, *_a):
-            pass
-
-        discard_session = close_session
 
     s = Session()
     turns = (VALIDATION + ".", "Yes.")

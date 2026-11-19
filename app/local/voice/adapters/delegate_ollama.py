@@ -7,8 +7,6 @@ host passes `system_note` (voice/barge_in.py), which reaches the reply model's s
 
 Routing, in order, all before the reply model is called (T14/T16):
 
-  due      reminders and timers that came due are spoken first (until the due-item scheduler
-           delivers them with no session open, PL46)
   reminder reminders and timers (voice/reminder_dialog.py, PL45): "remind me ..." is read back
            and set only on the next turn's yes; "set a timer for ..." starts at once; lists,
            the time left and cancelling. A turn that answers a read-back is the dialog's too.
@@ -127,23 +125,20 @@ class OllamaDelegate:
         text = turn_text.strip()
         hist = list(history) if history else None
 
-        # Reminders and timers that came due are spoken first (T16), then the turn itself.
-        fired_sentences = await self._due_lines()
-
         # Reminders and timers: deterministic, no model, every step through the tool runtime
         # (PL45). The read-back is spoken on one turn and acted on at the next.
         handled = await self.reminders.handle(text, session_id=session_id, turn_id=turn_id,
                                               history=hist, waited=_waited())
+        prefix: list[str] = list(handled.sentences) if handled is not None else []
         if handled is not None:
             log.info("voice delegate: route=%s answer_normally=%s session_id=%s",
                      handled.route, handled.answer_normally, session_id)
-            fired_sentences = [*fired_sentences, *handled.sentences]
             if not handled.answer_normally:
                 cancel = getattr(speculation, "cancel", None)
                 if cancel is not None:
                     cancel()
                 return ReplyStream(
-                    sentences=_each(fired_sentences),
+                    sentences=_each(prefix),
                     source="reminder",
                     cue=reply_chain.THINKING_PHRASE if text else None,
                     fallback=reply_chain.FALLBACK_PHRASE,
@@ -176,7 +171,7 @@ class OllamaDelegate:
                 cancel()
             own = _each(fixed)
         log.info("voice delegate: route=%s session_id=%s", source, session_id)
-        return ReplyStream(sentences=self._with_delivery(_prepend_then(fired_sentences, own),
+        return ReplyStream(sentences=self._with_delivery(_prepend_then(prefix, own),
                                                          deliver),
                            source=source,
                            cue=reply_chain.THINKING_PHRASE if text else None,
@@ -301,34 +296,6 @@ class OllamaDelegate:
     async def session_closed(self, session_id: str) -> None:
         """The host closed the session: a read-back still waiting for its yes is declined."""
         await self.reminders.session_closed(session_id)
-
-    # ------------------------------------------------------------------ due items (T16)
-
-    async def _due_lines(self) -> list[str]:
-        """The lines for reminders and timers that came due, each claimed once and marked
-        delivered. A reminder whose words the gate would refuse is announced by its time only."""
-        from app.local.voice import due_lines
-
-        dialog = self.reminders
-        now = dialog.now()
-        try:
-            due = await self._reminder_store.claim_due(now)
-        except Exception:
-            log.exception("reminders: failed to check due reminders")
-            return []
-        sentences: list[str] = []
-        for item in due:
-            line = due_lines.due_line(item, now=now)
-            if not dialog.speakable(line):
-                line = due_lines.neutral_line(item, now=now)
-            try:
-                await self._reminder_store.mark_delivered(item.id, at=now, spoken=True,
-                                                          owed=False, missed=False)
-            except Exception:
-                log.exception("reminders: failed to mark delivered id=%s", item.id)
-            sentences.append(line)
-        return sentences
-
 
 async def _prepend_then(prefix: list[str],
                         gen: AsyncIterator[str]) -> AsyncIterator[str]:

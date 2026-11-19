@@ -818,6 +818,57 @@
       "title": "ProjectUpdate",
       "type": "object"
     },
+    "ReminderDue": {
+      "additionalProperties": true,
+      "description": "A reminder or timer came due (PL46), to the item's tenant, for the app to show a\nnotification. `text` is the reminder's words as the person reads them in it, after the\nresponse gate: null for a timer, and null when the gate refused the words (the app then shows\na neutral line naming only the time). `dueAt` is ISO 8601 with the offset of the zone it was\nset in. `missed`: it came due while the engine was not running. `spoken`: its line was said\non the device (false inside quiet hours, on another person's device, or with no voice).",
+      "properties": {
+        "dueAt": {
+          "title": "Dueat",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "reminder",
+            "timer"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "missed": {
+          "title": "Missed",
+          "type": "boolean"
+        },
+        "spoken": {
+          "title": "Spoken",
+          "type": "boolean"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Text"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "text",
+        "dueAt",
+        "missed",
+        "spoken"
+      ],
+      "title": "ReminderDue",
+      "type": "object"
+    },
     "ReplyPayload": {
       "additionalProperties": true,
       "properties": {
@@ -1320,6 +1371,7 @@
     "meeting.update": "#/$defs/Meeting",
     "model.progress": "#/$defs/Model",
     "project.update": "#/$defs/ProjectUpdate",
+    "reminder.due": "#/$defs/ReminderDue",
     "source.update": "#/$defs/Source",
     "stream.reset": "#/$defs/StreamReset",
     "wake.delegate": "#/$defs/WakeDelegate",

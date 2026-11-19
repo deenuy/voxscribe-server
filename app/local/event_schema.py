@@ -156,6 +156,22 @@ class MeetingPipeline(_Payload):
     reason: str | None
 
 
+class ReminderDue(_Payload):
+    """A reminder or timer came due (PL46), to the item's tenant, for the app to show a
+    notification. `text` is the reminder's words as the person reads them in it, after the
+    response gate: null for a timer, and null when the gate refused the words (the app then shows
+    a neutral line naming only the time). `dueAt` is ISO 8601 with the offset of the zone it was
+    set in. `missed`: it came due while the engine was not running. `spoken`: its line was said
+    on the device (false inside quiet hours, on another person's device, or with no voice)."""
+
+    id: str
+    kind: Literal["reminder", "timer"]
+    text: str | None
+    dueAt: str
+    missed: bool
+    spoken: bool
+
+
 class StreamReset(_Payload):
     """Sent instead of a replay when the events a reconnecting client missed are no longer held
     (or its last id is not from this stream: the engine restarted). The client reloads the state
@@ -180,6 +196,7 @@ STREAM_EVENTS: dict[str, type[BaseModel]] = {
     "wake.reply": WakeReply,
     "wake.delegate": WakeDelegate,
     "capture_health": CaptureHealthPayload,
+    "reminder.due": ReminderDue,
     RESET: StreamReset,
 }
 

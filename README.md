@@ -116,6 +116,11 @@ BARGE_IN_MIN_FRAMES=4                 # 160ms
 STALE_RESULT_S=300                    # how long a delegate result stays fresh
 THINKER_TIMEOUT_S=30                  # max time for a background thinker
 
+# Reminders and timers (PL46)
+VOXSCRIBE_REMINDER_MISSED_WINDOW_S=43200   # what came due while the engine was off is said once at
+                                           # the next start if at most this old; older is only listed
+VOX_TIMEZONE=America/Toronto               # the device's zone for spoken times; unset: the OS zone
+
 # Clause streaming
 MIN_CLAUSE_WORDS=4
 MAX_CLAUSE_WORDS=25

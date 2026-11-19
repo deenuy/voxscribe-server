@@ -79,6 +79,62 @@ async def test_restart_helpers(store):
     assert await store.claim_owed(NOW - timedelta(hours=1)) == []   # spoken once
 
 
+async def test_a_due_item_is_delivered_once_and_its_gate_records_written(throwaway_schema):
+    """The scheduler over the real store and the real gate-record SQL, with a fake voice."""
+    from types import SimpleNamespace
+
+    from app.local.voice.adapters.store_postgres import PostgresSessionStore
+    from app.local.voice.due_scheduler import DueScheduler
+    from app.local.voice.host import InitiatedResult
+    from tests.voice.unit.tool_fakes import load_profile, settings
+
+    db = await Store.create(_DB_URL, schema=throwaway_schema, enforced=False)
+    app = SimpleNamespace(state=SimpleNamespace(store=db, settings=settings(vox_timezone=ZONE),
+                                                profile=load_profile("personal")))
+    sessions = PostgresSessionStore(app)
+
+    class Voice:
+        said: list = []
+
+        def on_session_open(self, _listener):
+            pass
+
+        async def speak_initiated(self, u):
+            self.said.append(u.line)
+            await sessions.record_initiated(u.item_id, [], decision="pass", category="ok")
+            await sessions.record_initiated(u.item_id, [], decision="pass", category="ok")
+            return InitiatedResult(True, False, "spoken", u.line)
+
+    class Clock:
+        def now(self):
+            return NOW
+
+        async def wait(self, changed, until):
+            await changed.wait()
+
+    voice, published = Voice(), []
+    store = rs.ReminderStore.for_pool(db.pool)
+    item = await _add(store, -1)
+    one = DueScheduler(app, clock=Clock(), speaker=voice, publish=lambda k, d: published.append(d))
+    two = DueScheduler(app, clock=Clock(), speaker=voice, publish=lambda k, d: published.append(d))
+    try:
+        await asyncio.gather(one.recover(NOW), two.recover(NOW))
+        await one.settle()
+        await two.settle()
+        assert voice.said == ["While I was off, you had a reminder today at one fifty-nine in the"
+                              " afternoon: stretch."]
+        assert [d["id"] for d in published] == [item.id] and published[0]["missed"] is True
+        assert (await store.get(item.id)).state == "missed"
+        async with db.pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT event FROM gate_records WHERE session_id=%s ORDER BY seq",
+                (f"due:{item.id}",))
+            events = [r[0] for r in await cur.fetchall()]
+        assert events == ["policy_applied", "outcome", "outcome"]      # one stamp per item
+    finally:
+        await db.close()
+
+
 # ── routes and isolation ─────────────────────────────────────────────────────────────────
 
 
