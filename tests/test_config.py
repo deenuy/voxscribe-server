@@ -9,8 +9,17 @@ import pytest
 from app.local.config import Config
 
 
-def test_config_defaults():
-    """Test that defaults match .env.example."""
+def test_config_defaults(monkeypatch, tmp_path):
+    """Built-in defaults, read with no dotenv file and no VOXSCRIBE_ or OLLAMA_HOST variables set.
+
+    Config.from_env() picks up a .env in the current directory and the process environment, so the
+    test runs from an empty directory with those variables cleared; a developer's own .env must not
+    decide whether it passes.
+    """
+    monkeypatch.chdir(tmp_path)
+    for key in list(os.environ):
+        if key.startswith("VOXSCRIBE_") or key == "OLLAMA_HOST":
+            monkeypatch.delenv(key)
     cfg = Config.from_env()
     assert cfg.database_url == "postgresql://localhost:5432/ideascribe_dev"
     assert cfg.providers == "local"
