@@ -1,7 +1,9 @@
 """Tool audit rows and receipts (PL43, TOOLS-CONNECTORS.md section 2.6).
 
 One tool_calls row per call through the tool runtime, whatever happened: executed, failed,
-timed_out, cancelled, invalid_args or refused (proposed and declined are the read-back's, PL44).
+timed_out, cancelled, invalid_args or refused; and one per read-back step of a tool that asks
+first: proposed when it is read back, declined when it gets no yes (runtime.propose and
+runtime.decline, PL45).
 A row with status `executed` is a receipt. The gate's action-claim rule (app/local/gate.py, G7)
 asks turn_receipts() for the write receipts of the turn that is speaking; a failed call, a refusal,
 a read, or a receipt from another turn backs nothing.
@@ -26,8 +28,8 @@ TIMED_OUT = "timed_out"
 CANCELLED = "cancelled"
 INVALID_ARGS = "invalid_args"
 REFUSED = "refused"
-PROPOSED = "proposed"        # read-back offered, not yet confirmed (PL44)
-DECLINED = "declined"        # read-back declined or abandoned (PL44)
+PROPOSED = "proposed"        # read-back offered, not yet confirmed (PL45)
+DECLINED = "declined"        # read-back declined or abandoned (PL45)
 STATUSES = (EXECUTED, FAILED, TIMED_OUT, CANCELLED, INVALID_ARGS, REFUSED, PROPOSED, DECLINED)
 
 WRITE_SIDE_EFFECTS = ("write", "irreversible")

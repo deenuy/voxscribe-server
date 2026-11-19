@@ -30,7 +30,8 @@ async def _timer(app, turn_id: str, *, fails: bool = False):
         return ToolResult(fields={"timer_id": "r1"}, ref="r1")
 
     return await runtime.call(app, builtin.TIMER_START,
-                              {"label": "5 minutes", "fire_at": FIRE_AT},
+                              {"duration_s": 300, "fire_at": FIRE_AT, "length": "Five minute",
+                               "time_zone": "America/Toronto"},
                               CallContext(session_id="s1", turn_id=turn_id, task_id=None),
                               execute)
 
@@ -61,7 +62,7 @@ async def test_rows_and_receipts_in_postgres(app):
                                             (builtin.TIMER_START, "failed"),
                                             (builtin.WEB_SEARCH, "refused")]
     executed = rows[0]
-    assert executed[2] and executed[3] == "write" and executed[4]["label"] == "5 minutes"
+    assert executed[2] and executed[3] == "write" and executed[4]["length"] == "Five minute"
     assert len(executed[5]) == 64 and executed[6] == "r1" and executed[8] >= 0
     assert executed[9] and executed[10] and executed[11] is None
     assert rows[1][7] == "raised:RuntimeError" and rows[2][7] == "privacy_offline"

@@ -192,8 +192,10 @@ class Config:
     # window is recorded as rejected and nothing is played.
     quiet_hours: QuietHours = dataclasses.field(default_factory=QuietHours)
 
-    # Context header injected into every reply turn
-    vox_timezone: str = "UTC"
+    # Context header injected into every reply turn. vox_timezone (VOX_TIMEZONE) is the device's
+    # IANA zone; empty means the operating system's (reminders and timers, voice/reminder_store.py
+    # device_zone), and UTC where nothing else can be read.
+    vox_timezone: str = ""
     vox_location: str = ""
     vox_user_name: str = ""
 

@@ -238,14 +238,25 @@ def partial_drift(previous: str, latest: str) -> float:
     return row[-1] / len(ref)
 
 
+# One-word answers that count as speech when the assistant has just asked a question (a
+# read-back's "Shall I set it?"): a plain "yes" must not end the session.
+SHORT_ANSWERS = frozenset({"yes", "yeah", "yep", "yup", "sure", "okay", "ok", "correct",
+                           "right", "no", "nope", "nah"})
+
+
 def is_genuine_speech(text: str, audio_duration_ms: int,
-                      no_speech_prob: float | None = None) -> bool:
+                      no_speech_prob: float | None = None, *,
+                      short_answer: bool = False) -> bool:
     """False for a chime transcript, fewer than MIN_REPLY_WORDS words, under MIN_AUDIO_MS of
-    unmuted audio, or a final decode Whisper itself scores as not speech."""
+    unmuted audio, or a final decode Whisper itself scores as not speech. With `short_answer`
+    (a question is waiting for its answer) one word of SHORT_ANSWERS is enough."""
     stripped = text.strip()
     if stripped.lower().rstrip(".!?,;:") in CHIME_TRANSCRIPTS:
         return False
-    if len(stripped.split()) < MIN_REPLY_WORDS:
+    words = stripped.split()
+    one_word_answer = (short_answer and len(words) == 1
+                       and words[0].lower().strip(".!?,;:") in SHORT_ANSWERS)
+    if len(words) < MIN_REPLY_WORDS and not one_word_answer:
         return False
     if audio_duration_ms < MIN_AUDIO_MS:
         return False
@@ -290,8 +301,9 @@ class QuietHours:
         self._start = datetime.time(sh, sm)
         self._end = datetime.time(eh, em)
 
-    def active(self) -> bool:
-        now = datetime.datetime.now().time().replace(second=0, microsecond=0)
+    def active(self, now: datetime.datetime | None = None) -> bool:
+        """Inside the window at `now` (its wall-clock time; the local clock when omitted)."""
+        now = (now or datetime.datetime.now()).time().replace(second=0, microsecond=0)
         s, e = self._start, self._end
         if s <= e:
             return s <= now < e
@@ -722,6 +734,11 @@ class SessionContext:
     seq: int = 0                   # sequence number of the last event the session published
     stop_requested: bool = False   # End from the app: the session closes at its next step
     muted_until: float | None = None    # Mute from the app: monotonic end of the hold, None unmuted
+    # The silence before a turn, for a read-back's window (voice/reminder_dialog.py): when the
+    # turn's capture was first unmuted (the last reply and its echo tail were over) and when
+    # the person's speech began, in seconds on the ports' mono clock.
+    reply_ended_mono: float | None = None
+    speech_onset_mono: float | None = None
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     @property
@@ -1256,6 +1273,14 @@ class VoiceHost:
         finally:
             self._state["meeting_id"] = None
             await self._await_late_finals(session)
+            # A read-back still waiting for its yes is declined: nothing is set by silence.
+            closed = getattr(p.delegate, "session_closed", None)
+            if closed is not None:
+                try:
+                    await closed(session_id)
+                except Exception:
+                    log.exception("voice host: delegate session close failed meeting_id=%s",
+                                  session_id)
             if session.silent:
                 log.info("wake: silent close -- no genuine speech in turn 1 meeting_id=%s",
                          session_id)
@@ -1288,6 +1313,7 @@ class VoiceHost:
         if session.pre_roll is not None and session.pre_roll.size:
             listen_q = PreRollQueue(session.pre_roll, audio_q)
         session.pre_roll = None
+        session.speech_onset_mono = session.reply_ended_mono = None
 
         if await self._listen(p, listen_q, ring, turn_n, use_turns, session):
             heard = bool(texts) or bool(partial.text)
@@ -1371,7 +1397,10 @@ class VoiceHost:
             return False
         # Speech guard (T03): chime echoes, sub-threshold audio, one-word transcripts and
         # decodes Whisper scores as not speech get no reply.
-        if not is_genuine_speech(turn_text, ring.pushed_ms, no_speech_prob):
+        awaiting = getattr(p.delegate, "awaiting_answer", None)
+        short_answer = bool(awaiting is not None and awaiting(session_id))
+        if not is_genuine_speech(turn_text, ring.pushed_ms, no_speech_prob,
+                                 short_answer=short_answer):
             log.info("wake: speech guard blocked turn=%d words=%d audio_ms=%d no_speech=%s",
                      turn_n, len(turn_text.split()), ring.pushed_ms,
                      "n/a" if no_speech_prob is None else f"{no_speech_prob:.2f}")
@@ -1562,6 +1591,13 @@ class VoiceHost:
                     silence_run = 0
                     continue
 
+                if session is not None:
+                    now_s = p.clock.mono_ms() / 1000
+                    if session.reply_ended_mono is None:
+                        session.reply_ended_mono = now_s
+                    if (session.speech_onset_mono is None
+                            and rms > RMS_FLOOR * IDLE_SPEECH_RMS_FACTOR):
+                        session.speech_onset_mono = now_s
                 ring.push(chunk)
                 chunks += 1
 

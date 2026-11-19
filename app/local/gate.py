@@ -31,7 +31,8 @@ from pathlib import Path
 log = logging.getLogger("app.local.gate")
 
 # Stamped on every record a floor rule decides. Bump it when a rule below changes.
-FLOOR_VERSION = "host-floor-v2"      # v2: G7 needs a receipt in this turn (PL43)
+FLOOR_VERSION = "host-floor-v3"      # v2: G7 needs a receipt in this turn (PL43); v3: the
+                                     # timer and cancel claim forms, a truthful replacement (PL45)
 
 # ── Fixed reply phrases (immutable per VOICE-AUTOPILOT.md) ──────────────────
 
@@ -133,7 +134,9 @@ def check(user_text: str, reply_text: str, mode: str = "default") -> tuple[str, 
 # engine's own tools are claims too, so they pass only after the store committed.
 # Extend the tuples below; the control flow does not change.
 
-ACTION_CLAIM_PHRASE = "I can't set reminders or alarms yet, but I can help answer questions."
+# Reminders and timers exist now (PL45), so the replacement says only what is true: nothing was
+# set by that sentence.
+ACTION_CLAIM_PHRASE = "I haven't set anything."
 ACTION_CLAIM_REASON = "no_receipt"
 ACTION_CLAIM_BACKED = "receipt"
 
@@ -168,6 +171,13 @@ ACTION_CLAIM_KEYWORDS: tuple[str, ...] = (
     "reminder set",
     "alarm set",
     "added to your calendar",
+    # The timer announcement and the cancel lines of the PL45 tools (app/local/tools/builtin.py).
+    "timer, starting now",
+    "timer starting now",
+    "timer cancelled",
+    "timer is cancelled",
+    "reminder cancelled",
+    "reminder is cancelled",
 )
 
 # Tool types that can back an action claim, each with the words that name it in a sentence.

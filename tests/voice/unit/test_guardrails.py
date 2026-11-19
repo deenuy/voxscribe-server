@@ -252,11 +252,19 @@ async def _tokens(text: str):
         yield word + " "
 
 
+async def _not_ours(*_args, **_kw):
+    return None
+
+
 async def _run(prompt: str, model_reply: str, pool: _FakePool) -> str:
-    """One turn through the voice host's reply stage, with the real gate, store and delegate."""
+    """One turn through the voice host's reply stage, with the real gate, store and delegate.
+
+    The reminder dialog (PL45) is set aside so the turn reaches the reply model: these are the
+    model's own claims, made with no tool, which the gate must replace."""
     app = SimpleNamespace(state=SimpleNamespace(store=SimpleNamespace(pool=pool)))
-    ports = fake_ports(gate=CorePolicyGate(), store=PostgresSessionStore(app),
-                       delegate=OllamaDelegate(app))
+    delegate = OllamaDelegate(app)
+    delegate.reminders.handle = _not_ours
+    ports = fake_ports(gate=CorePolicyGate(), store=PostgresSessionStore(app), delegate=delegate)
     host = VoiceHost(VoiceConfig(), ports=ports)
     return await host.reply_turn("m-g2", 1, prompt, turn_end_ms=0,
                                  speculation=_tokens(model_reply))

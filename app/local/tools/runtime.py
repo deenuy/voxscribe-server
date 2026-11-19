@@ -1,8 +1,10 @@
 """The tool runtime (PL43): the one way the engine runs a tool.
 
     call(app, name, args, ctx, execute)
+    propose(app, name, args, ctx)          a read-back offered: one `proposed` row, nothing runs
+    decline(app, name, args, ctx, reason)  a read-back that got no yes: one `declined` row
 
-  1. the record       an unknown tool is refused
+  1. the record      an unknown tool is refused
   2. the registry     the session's product mode and, for a remote tool, the network decision
                       (PL41); a tool that is not offered is refused, so calling it directly
                       runs nothing either
@@ -151,6 +153,66 @@ async def preflight(app, name: str, ctx: CallContext) -> ToolOutcome | None:
         return None
     return await _finish(app, pool, spec, name, ctx, status=audit.REFUSED, line=refusal[1],
                          error_code=refusal[0], called_at=_now_z(), started=time.monotonic())
+
+
+async def propose(app, name: str, raw_args: Any, ctx: CallContext) -> ToolOutcome:
+    """Offer a read-back for a tool that asks first (confirm: ask). The registry and the schema
+    check it exactly as call() would; then one `proposed` row is written and nothing runs. The
+    outcome's line is the record's read-back, filled only from the validated arguments. Its
+    status is `proposed`, or refused / invalid_args with that row instead."""
+    registry = tool_registry(app)
+    spec = registry.get(name)
+    pool = _audit_pool(app)
+    called_at, started = _now_z(), time.monotonic()
+
+    def done(status: str, line: str, **kw) -> Awaitable[ToolOutcome]:
+        return _finish(app, pool, spec, name, ctx, status=status, line=line,
+                       called_at=called_at, started=started, **kw)
+
+    if spec is None:
+        return await done(audit.REFUSED, UNKNOWN_TOOL_LINE, error_code=REASON_UNKNOWN_TOOL)
+    if spec.confirm not in ("ask", "ask_strict"):
+        raise ValueError(f"{name} does not ask before it runs")
+    refusal = await _refusal(app, registry, spec)
+    if refusal is not None:
+        return await done(audit.REFUSED, refusal[1], error_code=refusal[0])
+    try:
+        args = spec.validate_args(raw_args)
+    except ArgsError as exc:
+        return await done(audit.INVALID_ARGS, spec.templates["invalid"],
+                          error_code=f"{exc.code}:{exc.field}" if exc.field else exc.code,
+                          raw_args=raw_args)
+    return await done(audit.PROPOSED, spec.render("readback", args), args=args)
+
+
+_RECORDED = (audit.DECLINED, audit.REFUSED, audit.INVALID_ARGS)
+
+
+async def record(app, name: str, ctx: CallContext, *, status: str, reason: str,
+                 args: Mapping[str, Any] | None = None) -> ToolOutcome:
+    """One row for a step that runs nothing, with its reason code:
+
+      declined      a read-back that ended without a yes (no, silence, another turn, a
+                    correction that replaced it); `args` are the proposal's
+      refused       a read-back the engine will not offer (the gate would refuse its words)
+      invalid_args  the words gave no valid arguments, and the parser asks its one question
+
+    `args`, when given, are checked against the record again and kept as its audit list says."""
+    if status not in _RECORDED:
+        raise ValueError(f"record() writes {_RECORDED}, not {status}")
+    spec = tool_registry(app).get(name)
+    if spec is None:
+        raise ValueError(f"unknown tool {name}")
+    checked = spec.validate_args(args) if args is not None else None
+    return await _finish(app, _audit_pool(app), spec, name, ctx, status=status, line="",
+                         called_at=_now_z(), started=time.monotonic(), error_code=reason,
+                         args=checked)
+
+
+async def decline(app, name: str, args: Mapping[str, Any], ctx: CallContext,
+                  reason: str) -> ToolOutcome:
+    """A read-back that ends without a yes: one `declined` row with the reason code."""
+    return await record(app, name, ctx, status=audit.DECLINED, reason=reason, args=args)
 
 
 async def call(app, name: str, raw_args: Any, ctx: CallContext,

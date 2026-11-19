@@ -39,8 +39,9 @@ OFFLINE = decide(mode="personal", profile_allowed=True, privacy_mode="offline")
 def test_every_first_party_record_validates_with_its_own_version():
     registry = default_registry()
     names = [s.name for s in registry.specs()]
-    assert names == [builtin.WEB_SEARCH, builtin.REMINDER_CREATE, builtin.TIMER_START,
-                     builtin.REMINDER_LIST]
+    assert names == [builtin.WEB_SEARCH, builtin.REMINDER_CREATE, builtin.REMINDER_LIST,
+                     builtin.REMINDER_CANCEL, builtin.TIMER_START, builtin.TIMER_STATUS,
+                     builtin.TIMER_CANCEL]
     versions = [s.version for s in registry.specs()]
     assert all(len(v) == 16 for v in versions) and len(set(versions)) == len(versions)
     assert default_registry().get(builtin.WEB_SEARCH).version == versions[0]   # stable
@@ -134,15 +135,19 @@ def test_templates_are_filled_only_from_arguments_and_the_receipt():
 
 
 def test_an_asking_tool_needs_a_readback_line():
+    record = _record()
+    assert record["confirm"] == "ask"            # PL45: a reminder is read back first
+    del record["templates"]["readback"]
     with pytest.raises(ToolSpecError) as err:
-        _spec(confirm="ask")
+        ToolSpec.from_record(record)
     assert err.value.field == "templates.readback"
 
 
 def test_the_audit_list_must_cover_every_argument_exactly_once():
-    for audit in ({"store": ["fire_at"], "hash": []},
-                  {"store": ["fire_at", "text"], "hash": ["text"]},
-                  {"store": ["fire_at"], "hash": ["text", "who"]},
+    rest = ["when", "time_zone"]
+    for audit in ({"store": ["fire_at", *rest], "hash": []},
+                  {"store": ["fire_at", "text", *rest], "hash": ["text"]},
+                  {"store": ["fire_at", *rest], "hash": ["text", "who"]},
                   {"keep": ["fire_at"]}):
         with pytest.raises(ToolSpecError) as err:
             _spec(audit=audit)
@@ -160,14 +165,17 @@ def test_hashed_arguments_are_kept_as_a_digest_and_a_length():
 # ── arguments ────────────────────────────────────────────────────────────────
 
 
-GOOD = {"text": "call the dentist", "fire_at": "2026-11-19T15:00:00+00:00"}
+GOOD = {"text": "call the dentist", "fire_at": "2026-11-19T15:00:00+00:00",
+        "when": "Today at ten in the morning", "time_zone": "America/Toronto"}
 
 
 @pytest.mark.parametrize("args,code,field_name", [
     ({**GOOD, "priority": "high"}, "unknown_field", "priority"),
     ({"text": "x"}, "missing_field", "fire_at"),
     ({**GOOD, "text": 7}, "wrong_type", "text"),
-    ({**GOOD, "text": "x" * 501}, "too_long", "text"),
+    ({**GOOD, "text": "x" * 201}, "too_long", "text"),
+    ({**GOOD, "text": "line one\nline two"}, "pattern_mismatch", "text"),
+    ({**GOOD, "when": "at 10:00"}, "pattern_mismatch", "when"),
     ({**GOOD, "fire_at": "tomorrow at nine"}, "pattern_mismatch", "fire_at"),
     ("call the dentist", "not_an_object", ""),
 ])
@@ -209,7 +217,10 @@ def test_which_tools_a_session_may_use():
     for mode in ("senior_care", "classroom", "seniorcare"):
         decision = decide(mode=mode, profile_allowed=True, privacy_mode="connectors")
         offered = _names(registry.offered(mode, decision))
-        assert builtin.WEB_SEARCH not in offered and builtin.REMINDER_CREATE in offered
+        assert builtin.WEB_SEARCH not in offered and builtin.TIMER_START in offered
+        reminders = {builtin.REMINDER_CREATE, builtin.REMINDER_LIST, builtin.REMINDER_CANCEL}
+        # Classroom has timers only (TC12); senior care has reminders and timers.
+        assert (reminders & set(offered)) == (set() if mode == "classroom" else reminders)
     assert registry.offered("dictation", ALLOWED) == ()
 
 
