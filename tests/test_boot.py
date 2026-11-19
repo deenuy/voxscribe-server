@@ -40,7 +40,8 @@ def test_subprocess_boot_and_health():
         assert ready_line is not None, "No ready JSON line printed"
         ready_data = json.loads(ready_line)
         assert ready_data["event"] == "ready"
-        assert ready_data["version"] == "0.1.0"
+        from importlib.metadata import version as _pkg_version
+        assert ready_data["version"] == _pkg_version("voxscribe-server")
         assert isinstance(ready_data["port"], int)
         assert ready_data["port"] > 0
 

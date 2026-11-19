@@ -64,6 +64,21 @@ uv run --extra wake python -m app.local.engine --wake --no-auth --debug-trigger
 
 The engine listens on a free port (printed at startup). Connect ideascribe-app to it via `VOXSCRIBE_ENGINE_URL` in the app's `.env`.
 
+## Running with Docker
+
+```bash
+make build      # build the container image
+make up         # build and start in the background
+make health     # GET /v1/health (from outside the container: see note)
+make down       # stop and remove
+```
+
+The engine binds to `127.0.0.1` (loopback) inside the container by design, so the port
+exposed by Docker (`8000:8000`) is not reachable from the host or from other containers.
+The `HEALTHCHECK` runs from inside the container and succeeds. External bind address and
+authentication are owned by task PL08/PL27. `VOXSCRIBE_DATABASE_URL` must be set via
+`env_file` or `-e` before the engine will start.
+
 ## Running with the app
 
 ```bash
@@ -87,7 +102,7 @@ VOXSCRIBE_WAKE_VAD_THRESHOLD=0.3      # Silero speech ratio in 1s pre-roll
 VOXSCRIBE_WAKE_CONFIRM_DURATION_S=2.0 # Whisper confirm window
 
 # Echo cancellation (requires pywebrtc-audio)
-VOXSCRIBE_AEC_ENABLED=false           # true to enable WebRTC AEC3
+VOXSCRIBE_AEC_ENABLED=true            # false to disable WebRTC AEC3 (default: true)
 VOXSCRIBE_NOISE_SUPPRESS_ENABLED=false # noise suppression (raises WER on fan fixture)
 
 # Finalize timing
@@ -136,19 +151,21 @@ POST /v1/wake/trigger               open a debug session (requires --debug-trigg
 ### Meetings / scribes
 
 ```
-POST /v1/meetings/start             begin a meeting (voice session)
-POST /v1/meetings/{id}/stop         end a meeting
+POST /v1/meetings                   create a meeting record
+POST /v1/meetings/{id}/start        begin recording a meeting (voice session)
+POST /v1/meetings/{id}/stop         end a meeting recording
 GET  /v1/meetings                   list meetings
 GET  /v1/meetings/{id}              one meeting with transcript, summary, tasks
 PATCH /v1/meetings/{id}             edit title, notes, project
 POST /v1/meetings/{id}/edits        atomic edit commit (transcript + summary + tasks)
-POST /v1/meetings/from-file         import audio, text, or YouTube URL
+DELETE /v1/meetings/{id}            delete a meeting
+POST /v1/meetings/import            import audio, text, or YouTube URL
 ```
 
 ### Live transcription
 
 ```
-WS  /v1/live                        WebSocket; streams ASR chunks and voice events
+WS  /v1/meetings/{id}/live          WebSocket; streams ASR chunks and voice events
 GET /v1/health                      engine status, model states, speech activity
 ```
 
@@ -183,7 +200,7 @@ Current pin: `voxscribe-core==0.5.0` (`wheels/voxscribe_core-0.5.0-py3-none-any.
 ## Tests
 
 ```bash
-uv run --extra dev pytest tests/voice/unit/ -q     # 301 unit tests, no mic, no DB
+uv run --extra dev pytest tests/voice/unit/ -q     # unit tests, no mic, no DB
 uv run --extra dev pytest tests/ -q                # full suite
 uv run --extra dev ruff check app/                 # lint
 ```
