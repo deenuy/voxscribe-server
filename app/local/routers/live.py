@@ -110,7 +110,6 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
             await websocket.close(code=1011, reason="provider unavailable")
             return
         last_level_ms = -LEVEL_INTERVAL_MS  # session time of the last vad.level sent
-        send_levels = bool(levels)
         # Set to True when schedule_finalize is called from inside the session (auto-stop
         # path) so the finally block does not schedule a second finalization.
         finalize_scheduled = False
@@ -195,7 +194,7 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
 
         # Consumer: drains the ring and calls push_audio off the event loop
         async def audio_consumer():
-            nonlocal last_level_ms
+            nonlocal last_level_ms, finalize_scheduled
             _auto_stop_silence_start_ms = None
 
             while True:
