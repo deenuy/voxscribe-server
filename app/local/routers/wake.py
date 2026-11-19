@@ -14,6 +14,7 @@ POST /v1/wake/disarm    → set state to off; the armed loop closes its subscrip
                           the device (identity.DEVICE_CONTROL_ROLES: owner, admin, member, user)
                           and a token not tied to another device: else 403 role_not_permitted or
                           device_mismatch. With isolation off nothing is checked, as before
+POST /v1/wake/start     → start a session now, no wake phrase (the button in an app)
 POST /v1/wake/trigger   → DEBUG ONLY (--debug-trigger). Bypass the wake gate, start a session
                           immediately. Returns {meeting_id}. Use for automated roomplay tests.
 POST /v1/wake/power     → sleep | wake | lock | unlock from the app, for the capture watchdog
@@ -173,6 +174,26 @@ async def trigger_wake_session(request: Request):
     except (SessionTenantRequiredError, SessionInProgressError) as exc:
         raise _refused(exc) from None
     return {"triggered": True, "state": _value(host.state), "meeting_id": mid}
+
+
+@router.post("/start", status_code=202)
+async def start_session(request: Request):
+    """Start a voice session now, with no wake phrase: the button in an app.
+
+    The same person may do this who may arm the device, and the device becomes theirs the same
+    way. The wake listener is left as it was, so with the listener off this is the only way a
+    session starts. Returns {meeting_id} once the session has one (up to about 2 s).
+    """
+    host = _host(request)
+    _require_device_control(request, host)
+    if host is None or getattr(request.app.state, "audio_engine", None) is None:
+        raise EngineError("voice_unavailable", "the voice assistant is not running on this engine", 503)
+    try:
+        _bind_caller(request, host)
+        mid = await host.start_now()
+    except (SessionTenantRequiredError, SessionInProgressError) as exc:
+        raise _refused(exc) from None
+    return {"started": True, "state": _value(host.state), "meeting_id": mid}
 
 
 class PowerEvent(BaseModel):
