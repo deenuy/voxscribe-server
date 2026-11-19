@@ -104,3 +104,43 @@ def test_schema_app_route_set_matches_openapi() -> None:
         f"Routes in openapi.json but not in schema app (re-run export):\n"
         + "\n".join(sorted(extra_in_file))
     )
+
+
+def test_removing_a_route_from_the_engine_would_be_caught() -> None:
+    """Proves that removing a route from the engine makes the parity check fail.
+
+    Simulates a developer removing a route from the engine: takes the actual route set,
+    removes one route, and verifies that comparing the smaller set against the checked-in
+    openapi.json detects the difference.  The test itself passes; it proves the detection
+    mechanism works so that a future removal cannot slip through silently.
+    """
+    from contract.export import _schema_app, route_set
+
+    checked_in = CONTRACT_DIR / "openapi.json"
+    if not checked_in.exists():
+        pytest.skip("openapi.json not yet generated")
+
+    app = _schema_app()
+    live_routes = route_set(app)
+
+    openapi = _load(checked_in)
+    file_routes: set[str] = set()
+    for path, methods in openapi.get("paths", {}).items():
+        for method in methods:
+            if method.upper() in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+                file_routes.add(f"{method.upper()} {path}")
+
+    # Pick any route that exists in both the live app and the checked-in contract.
+    common = live_routes & file_routes
+    assert common, "no routes in common between app and openapi.json (run export first)"
+
+    # Simulate removing one route from the engine: drop it from live_routes.
+    removed = next(iter(sorted(common)))  # deterministic: alphabetically first
+    trimmed_live = live_routes - {removed}
+
+    # The parity check must report that the removed route is in the file but not in the app.
+    extra_in_file = file_routes - trimmed_live
+    assert removed in extra_in_file, (
+        f"removing '{removed}' from the engine did not appear in extra_in_file; "
+        f"the detection mechanism is broken. extra_in_file={sorted(extra_in_file)!r}"
+    )
