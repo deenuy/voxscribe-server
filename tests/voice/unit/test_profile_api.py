@@ -2,8 +2,8 @@
 
 Fakes only: no database, no audio engine, no real TTS or LLM.
 Tests cover:
-  - PATCH with a new wake_phrase
-  - Validation errors: single-word wake phrase, speed out of range, empty name
+  - PATCH with a new wake_phrase is refused: the wake phrase is fixed (PL35)
+  - Validation errors: speed out of range, empty name
   - GET returns current profile
   - POST /reset reverts to startup
   - voice and speed are read per synthesis call
@@ -59,30 +59,32 @@ def app_instance():
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_patch_wake_phrase(client):
-    """PATCH with a new wake_phrase; GET returns the updated value."""
+def test_patch_wake_phrase_is_refused_because_it_is_fixed(client):
+    """PL35: the wake phrase is fixed. A new one is refused by name; GET still has the fixed
+    one and says so."""
     resp = client.patch(
         "/v1/assistant/profile",
         json={"assistant": {"wake_phrase": "hey aria"}},
     )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["assistant"]["wake_phrase"] == "hey aria"
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "assistant_field_fixed"
+    assert resp.json()["field"] == "wake_phrase"
 
     get_resp = client.get("/v1/assistant/profile")
     assert get_resp.status_code == 200
-    assert get_resp.json()["assistant"]["wake_phrase"] == "hey aria"
+    assert get_resp.json()["assistant"]["wake_phrase"] == "hey vox"
+    assert get_resp.json()["fields"]["wake_phrase"]["state"] == "fixed"
 
 
-def test_patch_wake_phrase_too_short(client):
-    """Single-word wake phrase must return 400 invalid_request (D18)."""
+def test_patch_wake_phrase_single_word_is_refused_as_fixed(client):
+    """A one-word phrase was invalid_request (D18); every other phrase is now fixed."""
     resp = client.patch(
         "/v1/assistant/profile",
         json={"assistant": {"wake_phrase": "aria"}},
     )
     assert resp.status_code == 400
     body = resp.json()
-    assert body.get("error") == "invalid_request"
+    assert body.get("error") == "assistant_field_fixed"
     assert "wake_phrase" in body.get("detail", "")
 
 
@@ -112,10 +114,10 @@ def test_patch_name_empty(client):
 
 def test_reset_reverts(client):
     """PATCH then POST /reset; GET returns startup values."""
-    client.patch(
+    assert client.patch(
         "/v1/assistant/profile",
-        json={"assistant": {"name": "aria", "wake_phrase": "hey aria", "speed": 1.5}},
-    )
+        json={"assistant": {"name": "aria", "speed": 1.5}},
+    ).status_code == 200
     reset_resp = client.post("/v1/assistant/profile/reset")
     assert reset_resp.status_code == 200
     data = reset_resp.json()
@@ -200,10 +202,11 @@ def test_patch_speed_below_minimum(client):
 
 
 def test_patch_preserves_unmentioned_fields(client):
-    """PATCH with only speed preserves name and wake_phrase."""
-    client.patch("/v1/assistant/profile", json={"assistant": {"name": "aria", "wake_phrase": "hey aria"}})
+    """PATCH with only speed preserves name and persona_label."""
+    client.patch("/v1/assistant/profile",
+                 json={"assistant": {"name": "aria", "persona_label": "companion"}})
     client.patch("/v1/assistant/profile", json={"assistant": {"speed": 1.3}})
     data = client.get("/v1/assistant/profile").json()
     assert data["assistant"]["name"] == "aria"
-    assert data["assistant"]["wake_phrase"] == "hey aria"
+    assert data["assistant"]["persona_label"] == "companion"
     assert data["assistant"]["speed"] == 1.3

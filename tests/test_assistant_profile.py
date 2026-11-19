@@ -116,9 +116,7 @@ async def test_ac1_change_by_tenant_a_not_visible_to_tenant_b():
 
             # A patches their profile inside their scope.
             with tenancy.tenant_scope(tenant_a):
-                await save_profile_for_request(
-                    app, {"assistant": {"name": "aria", "wake_phrase": "hey aria"}}, tenant_a
-                )
+                await save_profile_for_request(app, {"assistant": {"name": "aria"}}, tenant_a)
 
             # B reads their profile inside their scope -- should still have defaults.
             with tenancy.tenant_scope(tenant_b):
@@ -132,7 +130,7 @@ async def test_ac1_change_by_tenant_a_not_visible_to_tenant_b():
             with tenancy.tenant_scope(tenant_a):
                 view_a = await load_profile_for_request(app, tenant_a)
             assert view_a.assistant.name == "aria"
-            assert view_a.assistant.wake_phrase == "hey aria"
+            assert view_a.assistant.wake_phrase == "hey vox"     # fixed (PL35)
         finally:
             await lifespan.__aexit__(None, None, None)
     finally:
@@ -347,20 +345,20 @@ def test_ac5_cloud_voice_allowed_in_personal():
 # ---------------------------------------------------------------------------
 
 
-def test_product_profile_defaults_wake_phrase_used():
-    """When the product profile has a custom wake phrase, the store uses it as default."""
+def test_the_wake_phrase_reported_is_the_one_the_wake_gate_confirms():
+    """PL35: the wake phrase is fixed. Whatever the product profile names, the gate confirms
+    ASR_CONFIRM_PHRASE (host.build_ports), so that is what the store reports, and a patched
+    phrase does not stick."""
     from voxscribe.profile.schema import Profile, WakeConfig
+    from voxscribe.wake.gate import ASR_CONFIRM_PHRASE
     from app.local.voice.profile_store import AssistantProfileStore
 
-    profile = Profile(wake=WakeConfig(phrase="hey robot"))
-    store = AssistantProfileStore(profile)
-    assert store.startup.wake_phrase == "hey robot"
-    # get() returns startup when no patch has been applied.
-    assert store.get().assistant.wake_phrase == "hey robot"
-    # reset() reverts to startup.
-    store.patch({"assistant": {"wake_phrase": "other phrase"}})
-    reverted = store.reset()
-    assert reverted.assistant.wake_phrase == "hey robot"
+    store = AssistantProfileStore(Profile(wake=WakeConfig(phrase="hey robot")))
+    assert store.startup.wake_phrase == ASR_CONFIRM_PHRASE == "hey vox"
+    assert store.get().assistant.wake_phrase == ASR_CONFIRM_PHRASE
+    assert store.patch({"assistant": {"wake_phrase": "other phrase"}}).assistant.wake_phrase \
+        == ASR_CONFIRM_PHRASE
+    assert store.reset().assistant.wake_phrase == ASR_CONFIRM_PHRASE
 
 
 # ---------------------------------------------------------------------------
@@ -423,8 +421,9 @@ async def test_a_stored_row_reaches_a_session_clamped_in_a_restricted_mode(mode)
     from app.local.voice.profile_store import _SPEED_MAX
 
     app = _app_with_row(mode)
-    voice_id, speed, revision = await TenantSessionScope(app).prepare(SessionBinding())
-    assert (voice_id, speed, revision) == ("", _SPEED_MAX, 3)
+    prepared = await TenantSessionScope(app).prepare(SessionBinding())
+    assert (prepared.voice_id, prepared.speed, prepared.revision) == ("", _SPEED_MAX, 3)
+    assert prepared.system_prompt == ""
 
     cached = app.state.profile_store.get(None).assistant
     assert (cached.voice_id, cached.speed, cached.system_prompt) == ("", _SPEED_MAX, "")
@@ -439,7 +438,9 @@ async def test_a_stored_row_keeps_its_voice_and_prompt_in_personal_mode_but_not_
     from app.local.voice.profile_store import _SPEED_MAX
 
     app = _app_with_row("personal")
-    assert await TenantSessionScope(app).prepare(SessionBinding()) == ("cloud_tts_v1", _SPEED_MAX, 3)
+    prepared = await TenantSessionScope(app).prepare(SessionBinding())
+    assert (prepared.voice_id, prepared.speed, prepared.revision) == ("cloud_tts_v1", _SPEED_MAX, 3)
+    assert prepared.system_prompt == _LOOSE_ROW[5]
     assert app.state.profile_store.get(None).assistant.system_prompt == _LOOSE_ROW[5]
 
 
@@ -452,9 +453,8 @@ async def test_a_stored_speed_outside_the_range_never_reaches_the_synthesizer(st
 
     want = {"min": _SPEED_MIN, "default": AssistantConfig().speed}.get(expected, expected)
     row = _LOOSE_ROW[:4] + (stored,) + _LOOSE_ROW[5:]
-    _voice, speed, _rev = await TenantSessionScope(_app_with_row("personal", row)).prepare(
-        SessionBinding())
-    assert speed == want
+    prepared = await TenantSessionScope(_app_with_row("personal", row)).prepare(SessionBinding())
+    assert prepared.speed == want
 
 
 def test_a_patch_in_a_restricted_mode_does_not_keep_a_system_prompt():
@@ -487,3 +487,59 @@ def test_dropping_a_tenants_cached_profile_leaves_the_defaults_and_other_tenants
     assert (store.get("t_erased").assistant.speed, store.revision("t_erased")) == (1.0, 0)
     assert (store.get("t_other").assistant.speed, store.revision("t_other")) == (0.75, 1)
     drop_cached_profile(SimpleNamespace(state=SimpleNamespace()), "t_erased")    # no store: no-op
+
+
+# ---------------------------------------------------------------------------
+# PL35: what a tenant saved reaches that tenant's next session, against PostgreSQL
+# ---------------------------------------------------------------------------
+
+
+async def test_settings_saved_by_tenant_a_reach_a_session_of_a_and_not_of_b():
+    """With isolation on: A's name, persona label, system prompt and end phrases come back from
+    A's schema when A's session opens; B's session opens with the defaults. A reset moves the
+    revision forward, so the stamp never repeats one an earlier profile used."""
+    from app.local import tenancy
+    from app.local.voice.adapters.scope import (
+        TenantSessionScope,
+        reset_profile_for_request,
+        save_profile_for_request,
+    )
+    from app.local.voice.host import SessionBinding
+
+    base = await _fresh_schema("pl35base")
+    tenant_a = tenancy.tenant_key(f"alice-pl35-{base}")
+    tenant_b = tenancy.tenant_key(f"bob-pl35-{base}")
+    try:
+        app = await _make_app_enforced(base)
+        lifespan = app.router.lifespan_context(app)
+        await lifespan.__aenter__()
+        try:
+            pool = app.state.store.pool
+            for tenant in (tenant_a, tenant_b):
+                with tenancy.tenant_scope(tenant):
+                    await pool.provisioner.ensure(tenant)
+
+            with tenancy.tenant_scope(tenant_a):
+                await save_profile_for_request(app, {"assistant": {
+                    "name": "Aria", "persona_label": "companion", "system_prompt": "Be brief.",
+                    "end_phrases": ["see you later"]}}, tenant_a)
+
+            scope = TenantSessionScope(app)
+            a = await scope.prepare(SessionBinding(tenant=tenant_a))
+            b = await scope.prepare(SessionBinding(tenant=tenant_b))
+            assert (a.assistant_name, a.persona_label, a.system_prompt, a.end_phrases) == (
+                "Aria", "companion", "Be brief.", ("see you later",))
+            assert (b.assistant_name, b.system_prompt, b.end_phrases) == (
+                "vox", "", ("goodbye", "stop listening"))
+
+            with tenancy.tenant_scope(tenant_a):
+                await reset_profile_for_request(app, tenant_a)
+            after_reset = await scope.prepare(SessionBinding(tenant=tenant_a))
+            assert after_reset.assistant_name == "vox"
+            assert after_reset.revision > a.revision
+        finally:
+            await lifespan.__aexit__(None, None, None)
+    finally:
+        await _drop_schema(tenant_a)
+        await _drop_schema(tenant_b)
+        await _drop_schema(base)

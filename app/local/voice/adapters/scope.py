@@ -11,12 +11,17 @@ what a tenant is. This adapter does, and it is the only voice module that does:
                        isolation on it hands the pool out only inside a tenant's scope, and
                        only the session's own tenant when a session is in scope
   profile_version()    a fingerprint of the product profile combined with the tenant's row
-                       revision, recorded on the session row
+                       revision, recorded on the session row. Every successful PATCH and every
+                       reset moves the revision forward, so the stamp changes whenever a field
+                       that takes effect changes
+  prepare()            reads the tenant's row once as a session opens and hands the session
+                       its SessionSettings: voice, speed, assistant name, persona label, system
+                       prompt (empty in restricted modes) and end phrases
 
 Also provides DB helpers for the assistant profile table (migration 022):
   load_profile_for_request()   router GET -- load from DB, populate store cache
   save_profile_for_request()   router PATCH -- validate, write to DB, return updated view
-  reset_profile_for_request()  router POST reset -- delete from DB, clear cache
+  reset_profile_for_request()  router POST reset -- write the defaults at the next revision
 
 With isolation off (no identity configured) there is no tenant: nothing is entered and nothing
 is refused, as before.
@@ -37,6 +42,7 @@ from app.local import tenancy
 from app.local.voice.host import (
     SessionBinding,
     SessionScope,
+    SessionSettings,
     SessionTenantRequiredError,
     current_session,
 )
@@ -132,11 +138,6 @@ async def _upsert_profile_row(conn, cfg, revision: int) -> None:
     )
 
 
-async def _delete_profile_row(conn) -> None:
-    """Remove the singleton row (reset path)."""
-    await conn.execute("DELETE FROM assistant_profiles")
-
-
 def _row_to_config(row, startup, product_profile=None) -> "tuple[AssistantConfig, int]":
     """Convert a DB row to (AssistantConfig, revision). Falls back to startup defaults.
 
@@ -152,7 +153,9 @@ def _row_to_config(row, startup, product_profile=None) -> "tuple[AssistantConfig
     cfg = AssistantConfig(
         name=name,
         wake_phrase=wake_phrase,
-        end_phrases=_end_phrases_from_db(end_phrases_str or _DEFAULT_END_PHRASES),
+        # An empty column is a list the person emptied, not a missing value.
+        end_phrases=_end_phrases_from_db(
+            _DEFAULT_END_PHRASES if end_phrases_str is None else end_phrases_str),
         voice_id=voice_id or "",
         speed=float(speed),
         system_prompt=system_prompt or "",
@@ -196,22 +199,25 @@ async def save_profile_for_request(app, partial: dict, tenant: str | None):
     """Validate and persist a profile patch; update the cache; return the updated view.
 
     Product-profile limits: the row is clamped as it is loaded (_row_to_config) and the store's
-    patch() applies the clamp again to the merged config before it is written.
+    patch() applies the clamp again to the merged config before it is written. Before either,
+    check_patch() refuses by name a change to a field that is fixed (AssistantFieldFixedError).
+    The returned view's `changed` names the fields this patch changed.
     """
-    from app.local.voice.profile_store import _ProfileView
+    from app.local.voice.profile_store import _ProfileView, check_patch
 
     store = getattr(getattr(app, "state", None), "profile_store", None)
     if store is None:
         raise RuntimeError("profile store not initialised")
 
+    product_profile = getattr(getattr(app, "state", None), "profile", None)
+    check_patch(partial, product_profile)
     pool = getattr(getattr(getattr(app, "state", None), "store", None), "pool", None)
     if pool is None:
-        return store.patch(partial, tenant=tenant)
+        return store.patch(partial, tenant=tenant, product_profile=product_profile)
 
     # Validate and apply patch in-memory first (raises ProfileValidationError on bad input).
     # We do this before touching the DB so an invalid request never writes.
-    base_view = await load_profile_for_request(app, tenant)
-    product_profile = getattr(getattr(app, "state", None), "profile", None)
+    await load_profile_for_request(app, tenant)
     new_view = store.patch(partial, tenant=tenant,
                            product_profile=product_profile)
     new_cfg = new_view.assistant
@@ -225,12 +231,16 @@ async def save_profile_for_request(app, partial: dict, tenant: str | None):
         async with pool.connection() as conn:
             await _upsert_profile_row(conn, new_cfg, new_revision)
 
-    return _ProfileView(copy.deepcopy(new_cfg))
+    return _ProfileView(copy.deepcopy(new_cfg), new_view.changed)
 
 
 async def reset_profile_for_request(app, tenant: str | None):
-    """Delete the tenant's profile row; clear the cache; return the defaults view."""
-    from app.local.voice.profile_store import _ProfileView
+    """Put the tenant's profile back to the product defaults; return the defaults view.
+
+    The row is kept and written with the defaults at the next revision, not deleted: a deleted
+    row starts again at revision 0, and the next patch would then stamp sessions with a
+    revision an earlier, different profile already used."""
+    from app.local.voice.profile_store import _ProfileView, apply_product_clamp
 
     store = getattr(getattr(app, "state", None), "profile_store", None)
     if store is None:
@@ -241,16 +251,19 @@ async def reset_profile_for_request(app, tenant: str | None):
     if pool is None:
         return store.reset(tenant=tenant)
 
+    await load_profile_for_request(app, tenant)
+    defaults = apply_product_clamp(store.startup, getattr(app.state, "profile", None))
+    revision = store.revision(tenant) + 1
     if tenant is not None:
         with tenancy.tenant_scope(tenant):
             async with pool.connection() as conn:
-                await _delete_profile_row(conn)
+                await _upsert_profile_row(conn, defaults, revision)
     else:
         async with pool.connection() as conn:
-            await _delete_profile_row(conn)
+            await _upsert_profile_row(conn, defaults, revision)
 
-    store.reset(tenant=tenant)
-    return _ProfileView(copy.deepcopy(store.startup))
+    store.set_config(tenant, defaults, revision)
+    return _ProfileView(copy.deepcopy(defaults))
 
 
 def drop_cached_profile(app, tenant: str | None) -> None:
@@ -263,6 +276,14 @@ def drop_cached_profile(app, tenant: str | None) -> None:
 
 
 # ---- tenant session scope ----------------------------------------------------
+
+
+def _session_settings(cfg: "AssistantConfig", revision: int) -> SessionSettings:
+    """What a session takes from a clamped config (scope._row_to_config or the store)."""
+    return SessionSettings(voice_id=cfg.voice_id, speed=cfg.speed, revision=revision,
+                           assistant_name=cfg.name, persona_label=cfg.persona_label,
+                           system_prompt=cfg.system_prompt,
+                           end_phrases=tuple(cfg.end_phrases))
 
 
 class TenantSessionScope(SessionScope):
@@ -286,24 +307,23 @@ class TenantSessionScope(SessionScope):
         rev = store.revision(tenant)
         return f"{base}+r{rev}" if rev else base
 
-    async def prepare(self, binding: SessionBinding) -> "tuple[str, float, int]":
+    async def prepare(self, binding: SessionBinding) -> SessionSettings:
         """Load the tenant's assistant profile from DB before the session opens.
 
-        Returns (voice_id, speed, revision) so the host can stamp the session.
-        Called once per session open, before the tenant scope is entered, so we
-        enter it explicitly here.  With no pool available (unit tests) falls back
-        to the in-memory store.
+        Returns the session's SessionSettings, read once here and fixed for the session: a
+        change saved while it runs applies to the next one. Called once per session open,
+        before the tenant scope is entered, so we enter it explicitly here. With no pool
+        available (unit tests) falls back to the in-memory store.
         """
         store = getattr(self._app.state, "profile_store", None)
         if store is None:
-            return ("", 1.0, 0)
+            return SessionSettings()
 
         pool = getattr(getattr(getattr(self._app, "state", None), "store", None), "pool", None)
         tenant = binding.tenant
 
         if pool is None:
-            cfg = store.get(tenant).assistant
-            return (cfg.voice_id, cfg.speed, store.revision(tenant))
+            return _session_settings(store.get(tenant).assistant, store.revision(tenant))
 
         if tenant is not None:
             with tenancy.tenant_scope(tenant):
@@ -316,7 +336,7 @@ class TenantSessionScope(SessionScope):
         cfg, revision = _row_to_config(row, store.startup,
                                        getattr(self._app.state, "profile", None))
         store.set_config(tenant, cfg, revision)
-        return (cfg.voice_id, cfg.speed, revision)
+        return _session_settings(cfg, revision)
 
     def device_binding(self, tenant: str | None = None) -> SessionBinding:
         """The binding for the engine's own audio devices."""

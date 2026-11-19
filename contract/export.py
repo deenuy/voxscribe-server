@@ -108,6 +108,8 @@ _ERRORS: list[dict] = [
     {"code": "voice_tenant_unbound", "status": 409, "detail": "no tenant has armed the device yet"},
     {"code": "voice_session_in_progress", "status": 409, "detail": "a voice session is already running"},
     {"code": "session_in_progress",  "status": 409, "detail": "a session is already in progress"},
+    # assistant profile
+    {"code": "assistant_field_fixed", "status": 400, "detail": "the assistant setting is fixed for this engine or product mode and cannot be changed"},
     # uploads
     {"code": "payload_too_large",    "status": 413, "detail": "the request body exceeds the configured size limit"},
     # HTTP infrastructure

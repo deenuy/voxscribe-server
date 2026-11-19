@@ -47,14 +47,199 @@
         "title": "AssistantConfigView",
         "type": "object"
       },
+      "AssistantFieldLimits": {
+        "description": "Bounds PATCH enforces, for a client to show beside the fields.",
+        "properties": {
+          "end_phrase_max_chars": {
+            "title": "End Phrase Max Chars",
+            "type": "integer"
+          },
+          "end_phrase_max_words": {
+            "title": "End Phrase Max Words",
+            "type": "integer"
+          },
+          "end_phrases_max": {
+            "title": "End Phrases Max",
+            "type": "integer"
+          },
+          "name_max_chars": {
+            "title": "Name Max Chars",
+            "type": "integer"
+          },
+          "persona_label_max_chars": {
+            "title": "Persona Label Max Chars",
+            "type": "integer"
+          },
+          "system_prompt_max_chars": {
+            "title": "System Prompt Max Chars",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name_max_chars",
+          "persona_label_max_chars",
+          "system_prompt_max_chars",
+          "end_phrases_max",
+          "end_phrase_max_chars",
+          "end_phrase_max_words"
+        ],
+        "title": "AssistantFieldLimits",
+        "type": "object"
+      },
+      "AssistantFieldState": {
+        "description": "Whether a saved field changes what the assistant does, so a client can show a fixed one\nas read-only. in_effect: a change applies to the tenant's next voice session (`applies`).\nfixed: PATCH refuses a change with 400 assistant_field_fixed; `reason` says why\n(wake_detector: the wake detector is tuned for one phrase; product_mode: this product\nmode allows no change).",
+        "properties": {
+          "applies": {
+            "anyOf": [
+              {
+                "const": "next_session",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applies"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "wake_detector",
+                  "product_mode"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "in_effect",
+              "fixed"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "AssistantFieldState",
+        "type": "object"
+      },
+      "AssistantFieldStates": {
+        "properties": {
+          "end_phrases": {
+            "$ref": "#/components/schemas/AssistantFieldState"
+          },
+          "name": {
+            "$ref": "#/components/schemas/AssistantFieldState"
+          },
+          "persona_label": {
+            "$ref": "#/components/schemas/AssistantFieldState"
+          },
+          "speed": {
+            "$ref": "#/components/schemas/AssistantFieldState"
+          },
+          "system_prompt": {
+            "$ref": "#/components/schemas/AssistantFieldState"
+          },
+          "voice_id": {
+            "$ref": "#/components/schemas/AssistantFieldState"
+          },
+          "wake_phrase": {
+            "$ref": "#/components/schemas/AssistantFieldState"
+          }
+        },
+        "required": [
+          "name",
+          "wake_phrase",
+          "end_phrases",
+          "voice_id",
+          "speed",
+          "system_prompt",
+          "persona_label"
+        ],
+        "title": "AssistantFieldStates",
+        "type": "object"
+      },
+      "AssistantProfileChange": {
+        "description": "What a PATCH changed and when it takes effect. Settings are read once as a voice session\nopens, so a change applies to the tenant's next session; a session already running for the\ntenant keeps the values it opened with (session_in_progress).",
+        "properties": {
+          "applies": {
+            "const": "next_session",
+            "title": "Applies",
+            "type": "string"
+          },
+          "changed": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Changed",
+            "type": "array"
+          },
+          "device_armed": {
+            "title": "Device Armed",
+            "type": "boolean"
+          },
+          "session_in_progress": {
+            "title": "Session In Progress",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "changed",
+          "applies",
+          "device_armed",
+          "session_in_progress"
+        ],
+        "title": "AssistantProfileChange",
+        "type": "object"
+      },
+      "AssistantProfilePatchResponse": {
+        "properties": {
+          "assistant": {
+            "$ref": "#/components/schemas/AssistantConfigView"
+          },
+          "change": {
+            "$ref": "#/components/schemas/AssistantProfileChange"
+          },
+          "fields": {
+            "$ref": "#/components/schemas/AssistantFieldStates"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/AssistantFieldLimits"
+          }
+        },
+        "required": [
+          "assistant",
+          "fields",
+          "limits",
+          "change"
+        ],
+        "title": "AssistantProfilePatchResponse",
+        "type": "object"
+      },
       "AssistantProfileResponse": {
         "properties": {
           "assistant": {
             "$ref": "#/components/schemas/AssistantConfigView"
+          },
+          "fields": {
+            "$ref": "#/components/schemas/AssistantFieldStates"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/AssistantFieldLimits"
           }
         },
         "required": [
-          "assistant"
+          "assistant",
+          "fields",
+          "limits"
         ],
         "title": "AssistantProfileResponse",
         "type": "object"
@@ -1580,14 +1765,14 @@
         ]
       },
       "patch": {
-        "description": "Merge a partial update into the current profile.\n\nAccepts a JSON body with the same shape as the profile (any subset of fields).\nReturns the full updated profile.\nReturns 400 when any field fails validation.\n\nExample::\n    PATCH /v1/assistant/profile\n    {\"assistant\": {\"name\": \"aria\", \"wake_phrase\": \"hey aria\", \"speed\": 1.2}}",
+        "description": "Merge a partial update into the current profile.\n\nAccepts a JSON body with the same shape as the profile (any subset of fields).\nReturns the full updated profile and `change`.\nReturns 400 invalid_request when any field fails validation, and 400 assistant_field_fixed\n(with `field`) when it asks to change a field that is fixed.\n\nExample::\n    PATCH /v1/assistant/profile\n    {\"assistant\": {\"name\": \"aria\", \"wake_phrase\": \"hey aria\", \"speed\": 1.2}}",
         "operationId": "patch_profile_v1_assistant_profile_patch",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AssistantProfileResponse"
+                  "$ref": "#/components/schemas/AssistantProfilePatchResponse"
                 }
               }
             },

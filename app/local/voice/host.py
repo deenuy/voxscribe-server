@@ -173,9 +173,28 @@ FUNCTION_WORDS = frozenset({
 })
 
 
-def is_stop_phrase(text: str, wake_phrase: str) -> bool:
+# A person's own end phrase (SessionSettings.end_phrases) ends the session when it is most of
+# the turn: the phrase's words in a row, and at most this many other words around them, so
+# "okay goodbye" ends it and "I said goodbye to my sister" does not.
+END_PHRASE_EXTRA_WORDS = 2
+
+
+def _turn_is_own_end_phrase(words: list[str], phrase: str) -> bool:
+    want = phrase.split()
+    if not want or len(words) > len(want) + END_PHRASE_EXTRA_WORDS:
+        return False
+    return any(words[i:i + len(want)] == want for i in range(len(words) - len(want) + 1))
+
+
+def is_stop_phrase(text: str, wake_phrase: str, end_phrases: tuple[str, ...] = ()) -> bool:
+    """True when the turn ends the conversation: a built-in stop phrase anywhere in it, or one
+    of the person's own end phrases as most of it. The person's phrases are added to the
+    built-in ones, never put in their place."""
     norm = re.sub(r"[^\w\s]", " ", text.lower()).strip()
-    return any(p in norm for p in STOP_PHRASES.get(wake_phrase, set()))
+    if any(p in norm for p in STOP_PHRASES.get(wake_phrase, set())):
+        return True
+    words = re.sub(r"[^\w\s']", " ", text.lower()).split()
+    return any(_turn_is_own_end_phrase(words, p) for p in end_phrases)
 
 
 def spec_text_changed(pre: str, final: str) -> bool:
@@ -637,6 +656,31 @@ class SessionBinding:
     role: str | None = None
 
 
+@dataclass(frozen=True)
+class SessionSettings:
+    """What the person's saved assistant settings give one session, read once as it opens
+    (SessionScope.prepare; the server's reads the tenant's row) and fixed for its length: a
+    change saved meanwhile applies to the next session. Values arrive inside the product's
+    limits (the server's profile_store.apply_product_clamp); this module only carries them.
+
+    voice_id, speed   the synthesizer's voice and speed
+    revision          the row's revision (0: no row); part of the stamped profile version
+    assistant_name    what the assistant is called in the reply prompt
+    persona_label     the role it is introduced as ("assistant", "companion"); an empty name
+                      leaves the engine's own wording
+    system_prompt     the owner's added instructions for the reply prompt, bounded; always
+                      empty in senior care and classroom
+    end_phrases       phrases that end the session in addition to STOP_PHRASES"""
+
+    voice_id: str = ""
+    speed: float = 1.0
+    revision: int = 0
+    assistant_name: str = ""
+    persona_label: str = ""
+    system_prompt: str = ""
+    end_phrases: tuple[str, ...] = ()
+
+
 @dataclass
 class SessionContext:
     """One voice session: who it is for, the profile it runs under, and its state across turns.
@@ -650,6 +694,7 @@ class SessionContext:
     profile_version: str = ""       # the profile in force when the session opened
     voice_id: str = ""              # synthesizer voice: tenant's row, read once at session open
     speed: float = 1.0             # synthesizer speed: tenant's row, read once at session open
+    settings: SessionSettings = field(default_factory=SessionSettings)   # the rest of the row
     history: list[dict] = field(default_factory=list)
     late_finals: list[asyncio.Task] = field(default_factory=list)   # final decodes past the window
     silent: bool = False            # turn 1 heard no genuine speech: leave no meeting behind
@@ -700,6 +745,11 @@ class SessionScope:
     def profile_version(self) -> str:
         """The profile in force for the tenant in scope. Read once, as a session opens."""
         return ""
+
+    async def prepare(self, binding: SessionBinding) -> SessionSettings:
+        """The binding's saved assistant settings, read once before its session opens. None
+        saved here: the engine's defaults."""
+        return SessionSettings()
 
     @contextmanager
     def bound(self, binding: SessionBinding) -> Iterator[None]:
@@ -1110,13 +1160,11 @@ class VoiceHost:
         try:
             # Load the tenant's assistant profile once before the session scope is entered.
             # prepare() may query the database; it is not on the audio path.
-            _prepare = getattr(self._scope, "prepare", None)
-            _voice_id, _speed = "", 1.0
-            if _prepare is not None:
-                _voice_id, _speed, _ = await _prepare(binding)
+            prepared = await self._scope.prepare(binding)
             with self._scope.session(binding) as session:
-                session.voice_id = _voice_id
-                session.speed = _speed
+                session.settings = prepared
+                session.voice_id = prepared.voice_id
+                session.speed = prepared.speed
                 log.info("voice host: session open tenant=%s product=%s device=%s profile=%s",
                          session.tenant, session.product, session.device,
                          session.profile_version)
@@ -1227,7 +1275,8 @@ class VoiceHost:
         prefetch = " ".join(texts).strip()
         speculation = None
         if (not session.barge_in and len(prefetch.split()) >= SPEC_MIN_WORDS
-                and not is_stop_phrase(prefetch, self.config.wake_phrase)):
+                and not is_stop_phrase(prefetch, self.config.wake_phrase,
+                                       session.settings.end_phrases)):
             speculation = p.delegate.speculate(prefetch, history or None)
             log.info("voice host: speculative reply started words=%d", len(prefetch.split()))
 
@@ -1264,7 +1313,7 @@ class VoiceHost:
             if speculation is not None:
                 speculation.cancel()
             return False
-        if is_stop_phrase(turn_text, self.config.wake_phrase):
+        if is_stop_phrase(turn_text, self.config.wake_phrase, session.settings.end_phrases):
             log.info("[Vox Stopped] stop phrase detected (turn=%d)", turn_n)
             if speculation is not None:
                 speculation.cancel()

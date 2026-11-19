@@ -708,8 +708,58 @@ class AssistantConfigView(BaseModel):
     persona_label: str
 
 
+class AssistantFieldState(BaseModel):
+    """Whether a saved field changes what the assistant does, so a client can show a fixed one
+    as read-only. in_effect: a change applies to the tenant's next voice session (`applies`).
+    fixed: PATCH refuses a change with 400 assistant_field_fixed; `reason` says why
+    (wake_detector: the wake detector is tuned for one phrase; product_mode: this product
+    mode allows no change)."""
+
+    state: Literal["in_effect", "fixed"]
+    applies: Literal["next_session"] | None = None
+    reason: Literal["wake_detector", "product_mode"] | None = None
+
+
+class AssistantFieldStates(BaseModel):
+    name: AssistantFieldState
+    wake_phrase: AssistantFieldState
+    end_phrases: AssistantFieldState
+    voice_id: AssistantFieldState
+    speed: AssistantFieldState
+    system_prompt: AssistantFieldState
+    persona_label: AssistantFieldState
+
+
+class AssistantFieldLimits(BaseModel):
+    """Bounds PATCH enforces, for a client to show beside the fields."""
+
+    name_max_chars: int
+    persona_label_max_chars: int
+    system_prompt_max_chars: int
+    end_phrases_max: int
+    end_phrase_max_chars: int
+    end_phrase_max_words: int
+
+
 class AssistantProfileResponse(BaseModel):
     assistant: AssistantConfigView
+    fields: AssistantFieldStates
+    limits: AssistantFieldLimits
+
+
+class AssistantProfileChange(BaseModel):
+    """What a PATCH changed and when it takes effect. Settings are read once as a voice session
+    opens, so a change applies to the tenant's next session; a session already running for the
+    tenant keeps the values it opened with (session_in_progress)."""
+
+    changed: list[str]
+    applies: Literal["next_session"]
+    device_armed: bool          # the audio device is armed for the caller's tenant
+    session_in_progress: bool   # a voice session is running for the caller's tenant now
+
+
+class AssistantProfilePatchResponse(AssistantProfileResponse):
+    change: AssistantProfileChange
 
 
 class AssistantVoicesResponse(BaseModel):

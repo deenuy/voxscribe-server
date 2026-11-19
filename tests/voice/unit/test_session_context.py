@@ -28,6 +28,7 @@ from app.local.voice.host import (
     SessionContext,
     SessionInProgressError,
     SessionScope,
+    SessionSettings,
     SessionTenantRequiredError,
     VoiceConfig,
     VoiceHost,
@@ -253,7 +254,7 @@ class SlowPrepareScope(RecordingScope):
         await self.release.wait()
         if self.fails:
             raise RuntimeError("profile read failed")
-        return ("", 1.0, 0)
+        return SessionSettings()
 
 
 async def test_a_bind_that_lands_while_a_session_is_starting_is_refused():

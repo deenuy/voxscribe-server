@@ -1,9 +1,16 @@
 """Assistant profile API.
 
-GET  /v1/assistant/profile       -- return the current profile (tenant-aware)
-PATCH /v1/assistant/profile      -- merge partial update; returns updated profile
+GET  /v1/assistant/profile       -- return the current profile (tenant-aware), with `fields`
+                                    (per field: in_effect or fixed) and `limits`
+PATCH /v1/assistant/profile      -- merge partial update; returns updated profile and `change`
+                                    (what changed, and that it applies to the next session)
 POST /v1/assistant/profile/reset -- revert to startup profile
 GET  /v1/assistant/voices        -- list available Kokoro voice IDs
+
+Every field either takes effect for the tenant's voice sessions or is fixed (profile_store:
+field_states, check_patch). A PATCH that changes a fixed field is refused with 400
+assistant_field_fixed and `field`; sending a fixed field's current value is accepted. Nothing a
+person typed into a field is logged here.
 
 The profile is persisted in the assistant_profiles table (migration 022), one row per
 tenant schema. app.state.profile_store holds the in-memory cache.
@@ -21,7 +28,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.local.errors import EngineError, InvalidRequestError
-from app.local.models import AssistantProfileResponse, AssistantVoicesResponse
+from app.local.models import (
+    AssistantProfilePatchResponse,
+    AssistantProfileResponse,
+    AssistantVoicesResponse,
+)
 
 log = logging.getLogger("app.local.routers.assistant")
 
@@ -57,8 +68,10 @@ KNOWN_KOKORO_VOICE_IDS: tuple[str, ...] = (
 )
 
 
-def _profile_to_dict(profile) -> dict:
+def _profile_to_dict(profile, request: Request) -> dict:
     """Serialize a profile view to a plain dict for JSON responses."""
+    from app.local.voice.profile_store import field_limits, field_states
+
     cfg = profile.assistant
     return {
         "assistant": {
@@ -69,7 +82,26 @@ def _profile_to_dict(profile) -> dict:
             "speed": cfg.speed,
             "system_prompt": cfg.system_prompt,
             "persona_label": cfg.persona_label,
-        }
+        },
+        "fields": field_states(getattr(request.app.state, "profile", None)),
+        "limits": field_limits(),
+    }
+
+
+def _change(request: Request, changed: tuple[str, ...]) -> dict:
+    """When a patch takes effect for the caller: settings are read as a session opens, so at the
+    next session, and a session running now for the caller's tenant keeps what it opened with."""
+    from app.local.voice.host import WakeState
+    from app.local.voice.profile_store import APPLIES_NEXT_SESSION
+
+    host = getattr(request.app.state, "voice_host", None)
+    mine = host is not None and host.binding.tenant == _current_tenant(request)
+    state = host.state if mine else WakeState.OFF
+    return {
+        "changed": list(changed),
+        "applies": APPLIES_NEXT_SESSION,
+        "device_armed": state in (WakeState.ARMED, WakeState.LISTENING),
+        "session_in_progress": state == WakeState.LISTENING,
     }
 
 
@@ -104,22 +136,27 @@ async def get_profile(request: Request):
     else:
         store = _get_store(request)
         view = store.get()
-    return JSONResponse(_profile_to_dict(view))
+    return JSONResponse(_profile_to_dict(view, request))
 
 
-@router.patch("/profile", response_model=AssistantProfileResponse)
+@router.patch("/profile", response_model=AssistantProfilePatchResponse)
 async def patch_profile(request: Request):
     """Merge a partial update into the current profile.
 
     Accepts a JSON body with the same shape as the profile (any subset of fields).
-    Returns the full updated profile.
-    Returns 400 when any field fails validation.
+    Returns the full updated profile and `change`.
+    Returns 400 invalid_request when any field fails validation, and 400 assistant_field_fixed
+    (with `field`) when it asks to change a field that is fixed.
 
     Example::
         PATCH /v1/assistant/profile
         {"assistant": {"name": "aria", "wake_phrase": "hey aria", "speed": 1.2}}
     """
-    from app.local.voice.profile_store import ProfileValidationError
+    from app.local.voice.profile_store import (
+        AssistantFieldFixedError,
+        ProfileValidationError,
+        check_patch,
+    )
 
     _get_store(request)   # validate store is present
 
@@ -138,14 +175,19 @@ async def patch_profile(request: Request):
             updated = await save_profile_for_request(request.app, body, tenant)
         else:
             store = _get_store(request)
-            updated = store.patch(body)
+            product_profile = getattr(request.app.state, "profile", None)
+            check_patch(body, product_profile)
+            updated = store.patch(body, product_profile=product_profile)
+    except AssistantFieldFixedError as exc:
+        raise EngineError(exc.code, str(exc), 400, {"field": exc.field})
     except ProfileValidationError as exc:
         raise InvalidRequestError(str(exc))
     except Exception:
         log.exception("patch_profile: unexpected error")
         raise InvalidRequestError("failed to update profile")
 
-    return JSONResponse(_profile_to_dict(updated))
+    return JSONResponse(_profile_to_dict(updated, request)
+                        | {"change": _change(request, updated.changed)})
 
 
 @router.post("/profile/reset", response_model=AssistantProfileResponse)
@@ -163,7 +205,7 @@ async def reset_profile(request: Request):
     else:
         store = _get_store(request)
         reverted = store.reset()
-    return JSONResponse(_profile_to_dict(reverted))
+    return JSONResponse(_profile_to_dict(reverted, request))
 
 
 @router.get("/voices", response_model=AssistantVoicesResponse)

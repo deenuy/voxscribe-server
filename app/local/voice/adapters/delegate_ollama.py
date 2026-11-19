@@ -39,6 +39,7 @@ from app.local.voice import delegate_lane as dl
 from app.local.voice.adapters.events_app import publish as publish_event
 from app.local.voice.adapters.store_postgres import PostgresDelegateTaskStore
 from app.local.voice.delegate_lane import DelegateLane, DelegateTask, IntentKind
+from app.local.voice.host import current_session
 from app.local.voice import reminder_store as rs
 
 log = logging.getLogger("app.local.voice.delegate")
@@ -46,6 +47,13 @@ log = logging.getLogger("app.local.voice.delegate")
 TASK_EVENT = "wake.delegate"     # status only: a result reaches a person through the gate
 
 Submit = Callable[[str], DelegateTask]
+
+
+def _persona():
+    """The session's assistant settings (name, persona label, system prompt), read once when it
+    opened; None outside a session. The thinker's task inherits the session it was started in."""
+    session = current_session()
+    return session.settings if session is not None else None
 
 
 class OllamaDelegate:
@@ -85,7 +93,7 @@ class OllamaDelegate:
 
         return _Speculation(stream_reply(
             partial_text, model=self.model, history=list(history) if history else None,
-            system_prompt=reply_chain.talker_system_prompt(self._settings)))
+            system_prompt=reply_chain.talker_system_prompt(self._settings, _persona())))
 
     async def reply(self, turn_text: str, session_id: str, *, turn_id: str | None = None,
                     history: Sequence[dict] | None = None, speculation=None,
@@ -143,7 +151,7 @@ class OllamaDelegate:
         if fixed is None:
             src = reply_chain.talker_sentences(self._app, session_id, text, history=hist,
                                                pre_stream=speculation, system_note=system_note,
-                                               system_prefix=system_prefix)
+                                               system_prefix=system_prefix, persona=_persona())
             own, source = _without_marker(src.sentences, submit), src.source
         else:
             cancel = getattr(speculation, "cancel", None)
@@ -230,7 +238,7 @@ class OllamaDelegate:
         history = self._contexts.pop(task.task_id, None)
         return await reply_chain.search_answer(
             self._app, task.session_id, task.request, dl.request_topic(task.request),
-            task_id=task.task_id, turn_id=task.turn_id, history=history)
+            task_id=task.task_id, turn_id=task.turn_id, history=history, persona=_persona())
 
     def _task_changed(self, task: DelegateTask) -> None:
         """Lane hook: keep the task's row current and tell the app its status."""
