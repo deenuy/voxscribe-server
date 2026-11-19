@@ -3,16 +3,10 @@
 Covers:
   - QuietHours.active() across window styles.
   - VoiceConfig.from_profile() reads wake phrase, quiet hours, max_turns and conv_idle_s.
-  - With the personal profile (quiet_hours_enabled=False) a wake inside the quiet-hours
-    window opens a session.
-  - With the senior_care profile (quiet_hours_enabled=True) a wake inside the
-    quiet-hours window is REJECTED.
-    DISCREPANCY: the acceptance criterion in the PL03 task description says
-    "with the senior care profile, a wake inside quiet hours opens a session;
-    with the personal profile it does not." The shipped senior_care profile has
-    quiet_hours_enabled=True, which causes the existing host code to reject wakes
-    during the window.  Following what the profiles say, the test below verifies
-    the OPPOSITE behaviour: senior_care rejects, personal accepts.
+  - Senior care always answers a wake (VX-H5); quiet_hours_block_wake=False for that mode.
+  - Personal profile with quiet_hours_enabled=True rejects wakes inside the window.
+  - Explicit server config (settings) wins over profile defaults for wake phrase and
+    quiet hours; senior care exception: settings can never enable wake-blocking there.
   - Changing voice or speed via the get_voice_speed callable changes the arguments
     tts_engine.synthesize receives.
   - Health profile mode matches the loaded Profile.mode, not a hardcoded string.
@@ -39,6 +33,7 @@ from app.local.voice.host import (
     VoiceConfig,
     VoiceHost,
     WakeState,
+    _CONFIG_DEFAULT_WAKE_PHRASE,
 )
 
 from .fakes import fake_ports
@@ -85,6 +80,22 @@ def test_from_profile_quiet_hours_enabled_builds_quiet_hours_object():
     config = VoiceConfig.from_profile(p)
     assert config.quiet_hours is not None
     assert isinstance(config.quiet_hours, QuietHours)
+
+
+def test_from_profile_senior_care_does_not_block_wake():
+    """Senior care always answers a wake (VX-H5); quiet_hours_block_wake must be False."""
+    sc = Profile(mode="senior_care", quiet_hours_enabled=True)
+    config = VoiceConfig.from_profile(sc)
+    assert config.quiet_hours is not None      # window is present
+    assert config.quiet_hours_block_wake is False  # but it never blocks a wake
+
+
+def test_from_profile_non_senior_care_blocks_wake_during_quiet_hours():
+    """All other modes block wakes when the window is active."""
+    for mode in ("personal", "ideascribe", "classroom"):
+        p = Profile(mode=mode, quiet_hours_enabled=True)  # type: ignore[arg-type]
+        config = VoiceConfig.from_profile(p)
+        assert config.quiet_hours_block_wake is True, f"mode={mode}"
 
 
 def test_from_profile_quiet_hours_disabled_is_none():
@@ -190,48 +201,56 @@ class _NeverActive:
         return False
 
 
-async def test_personal_profile_no_quiet_hours_wake_accepted():
-    """Personal profile: quiet_hours_enabled=False -> wake opens a session regardless of time."""
-    personal = Profile(mode="personal")
-    config = VoiceConfig.from_profile(personal)
-    # Quiet hours are disabled in personal; replace the None with a "never active" stub
-    # to prove it is the absence of quiet_hours that lets the wake through.
-    assert config.quiet_hours is None
-
-    sessions, wakes = await _drive_armed_with_quiet(config)
-    # No quiet_hours object -> wake is accepted -> session opened.
-    assert len(sessions) == 1
-
-
-async def test_senior_care_profile_quiet_hours_active_wake_rejected():
-    """Senior care has quiet_hours_enabled=True; a wake during the active window is rejected.
-
-    DISCREPANCY: the PL03 acceptance criterion says senior_care opens a session inside
-    quiet hours, but the shipped senior_care profile has quiet_hours_enabled=True, which
-    causes the host to reject wakes during the window.  This test follows what the profile
-    says.  Reported per the parenthetical in the task.
-    """
+async def test_senior_care_profile_quiet_hours_active_wake_opens_session():
+    """Senior care always answers a wake (VX-H5); window active does not block it."""
     senior_care = Profile(
         mode="senior_care",
         quiet_hours_enabled=True,
         quiet_hours_start="21:00",
         quiet_hours_end="08:00",
     )
-    # Build config but replace the real QuietHours with an always-active stub so the
-    # test does not depend on the wall clock.
     config = VoiceConfig.from_profile(senior_care)
-    assert config.quiet_hours is not None   # profile built a QuietHours object
-    # Override with always-active stub so the window is "open" regardless of clock.
+    assert config.quiet_hours is not None           # window is present
+    assert config.quiet_hours_block_wake is False   # but it must not block
+
+    # Replace the real QuietHours with an always-active stub so the test is clock-independent.
     config = VoiceConfig(
         wake_phrase=config.wake_phrase,
         detector=config.detector,
         quiet_hours=_AlwaysActive(),
+        quiet_hours_block_wake=False,   # senior care: never block
         max_turns=config.max_turns,
         conv_idle_s=config.conv_idle_s,
     )
 
     sessions, wakes = await _drive_armed_with_quiet(config)
-    # Quiet hours active -> wake rejected -> no session opened.
+    # Window active but block_wake=False -> wake opens a session.
+    assert len(sessions) == 1
+
+
+async def test_personal_profile_quiet_hours_active_wake_rejected():
+    """Personal mode with quiet_hours_enabled=True: wake inside window is rejected."""
+    personal_with_qh = Profile(
+        mode="personal",
+        quiet_hours_enabled=True,
+        quiet_hours_start="22:00",
+        quiet_hours_end="07:00",
+    )
+    config = VoiceConfig.from_profile(personal_with_qh)
+    assert config.quiet_hours_block_wake is True
+
+    # Replace with always-active stub.
+    config = VoiceConfig(
+        wake_phrase=config.wake_phrase,
+        detector=config.detector,
+        quiet_hours=_AlwaysActive(),
+        quiet_hours_block_wake=True,
+        max_turns=config.max_turns,
+        conv_idle_s=config.conv_idle_s,
+    )
+
+    sessions, wakes = await _drive_armed_with_quiet(config)
+    # Window active + block_wake=True -> rejected, no session, no chime.
     assert sessions == []
     assert len(wakes) == 1
     assert wakes[0]["accepted"] is False
@@ -330,3 +349,63 @@ def test_health_profile_name_no_profile_is_unknown():
     app_state = SimpleNamespace()
     name = getattr(getattr(app_state, "profile", None), "mode", "unknown")
     assert name == "unknown"
+
+
+# ── Settings-override tests ───────────────────────────────────────────────────
+# Config.QuietHours (server-side) has an enabled flag; it's built only when
+# VOXSCRIBE_QUIET_HOURS_ENABLED is set. Config.wake_phrase defaults to "hey vox".
+
+
+def _fake_settings(*, wake_phrase=_CONFIG_DEFAULT_WAKE_PHRASE, qh_enabled=False,
+                   qh_start="22:00", qh_end="07:00"):
+    """Minimal settings stub."""
+    from app.local.config import QuietHours as CfgQH
+    return SimpleNamespace(
+        wake_phrase=wake_phrase,
+        quiet_hours=CfgQH(enabled=qh_enabled, start=qh_start, end=qh_end),
+    )
+
+
+def test_settings_wake_phrase_wins_over_profile():
+    """An explicit VOXSCRIBE_WAKE_PHRASE overrides the profile's wake phrase."""
+    p = Profile(wake=WakeConfig(phrase="hey computer"))
+    settings = _fake_settings(wake_phrase="ok system")
+    config = VoiceConfig.from_profile(p, settings=settings)
+    assert config.wake_phrase == "ok system"
+
+
+def test_profile_wake_phrase_wins_when_settings_is_default():
+    """When settings.wake_phrase is the config default, the profile's phrase wins."""
+    p = Profile(wake=WakeConfig(phrase="hey computer"))
+    settings = _fake_settings(wake_phrase=_CONFIG_DEFAULT_WAKE_PHRASE)  # not explicitly set
+    config = VoiceConfig.from_profile(p, settings=settings)
+    assert config.wake_phrase == "hey computer"
+
+
+def test_settings_quiet_hours_enabled_wins_over_profile_default():
+    """VOXSCRIBE_QUIET_HOURS_ENABLED=true overrides a profile with no quiet hours."""
+    p = Profile(mode="personal", quiet_hours_enabled=False)   # no profile quiet hours
+    settings = _fake_settings(qh_enabled=True, qh_start="23:00", qh_end="06:00")
+    config = VoiceConfig.from_profile(p, settings=settings)
+    assert config.quiet_hours is not None
+    assert config.quiet_hours_block_wake is True  # personal mode: blocks
+
+
+def test_settings_quiet_hours_cannot_block_wake_in_senior_care():
+    """Even if the operator enables VOXSCRIBE_QUIET_HOURS_ENABLED, senior care never blocks."""
+    sc = Profile(mode="senior_care", quiet_hours_enabled=True)
+    settings = _fake_settings(qh_enabled=True, qh_start="21:00", qh_end="08:00")
+    config = VoiceConfig.from_profile(sc, settings=settings)
+    # Window is present (operator set it), but wake is never blocked for senior care.
+    assert config.quiet_hours is not None
+    assert config.quiet_hours_block_wake is False
+
+
+def test_settings_quiet_hours_disabled_does_not_override_profile():
+    """When settings.quiet_hours.enabled is False (not explicitly set), profile wins."""
+    p = Profile(mode="personal", quiet_hours_enabled=True, quiet_hours_start="20:00",
+                quiet_hours_end="07:00")
+    settings = _fake_settings(qh_enabled=False)   # not explicitly set
+    config = VoiceConfig.from_profile(p, settings=settings)
+    # Profile's quiet hours survive; settings did not override.
+    assert config.quiet_hours is not None

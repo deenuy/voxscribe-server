@@ -250,12 +250,20 @@ class QuietHours:
         return now >= s or now < e
 
 
+_CONFIG_DEFAULT_WAKE_PHRASE = "hey vox"   # the Config dataclass default; used to detect explicit overrides
+
+
 @dataclass(frozen=True)
 class VoiceConfig:
     wake_phrase: str = "hey vox"
     trigger_phrase: str = ASR_CONFIRM_PHRASE    # what a person must say; shown in the UI
     detector: str = "openvocab"                 # display name until the detector is loaded
     quiet_hours: object | None = None           # anything with active() -> bool
+    # When True, a wake inside the quiet-hours window is rejected and nothing plays.
+    # Senior care always answers a wake (VX-H5; PRODUCT-MAP.md: "must still answer a wake at
+    # night; only proactive speech and volume are restricted"), so this is False for that mode.
+    # TODO: this belongs in the core profile schema; move it there with the next core wheel.
+    quiet_hours_block_wake: bool = True
     max_turns: int = 0                          # 0 = no limit; from profile.reply.max_turns
     conv_idle_s: float = CONV_IDLE_S            # idle timeout per turn; from profile.reply.idle_timeout_s
 
@@ -270,9 +278,23 @@ class VoiceConfig:
         )
 
     @classmethod
-    def from_profile(cls, profile) -> VoiceConfig:
-        """Build from a voxscribe-core Profile; profile-driven fields replace defaults."""
+    def from_profile(cls, profile, settings=None) -> VoiceConfig:
+        """Build from a voxscribe-core Profile; profile-driven fields replace defaults.
+
+        When settings is supplied, explicitly configured server-config values win over
+        the profile's defaults:
+          - wake_phrase: settings.wake_phrase wins when it differs from the Config
+            dataclass default (i.e. VOXSCRIBE_WAKE_PHRASE was set by the operator).
+          - quiet_hours: settings.quiet_hours wins when settings.quiet_hours.enabled
+            is True (i.e. VOXSCRIBE_QUIET_HOURS_ENABLED=true was set by the operator).
+            Exception: settings can never turn on wake-blocking for senior_care mode.
+        """
         from app.local.voice.wake_setup import DEFAULT_DETECTOR, DETECTOR_ENV
+
+        mode = getattr(profile, "mode", "personal")
+
+        # Senior care must always answer a wake (VX-H5); only proactive speech is suppressed.
+        quiet_hours_block_wake = (mode != "senior_care")
 
         quiet_hours: QuietHours | None = None
         if getattr(profile, "quiet_hours_enabled", False):
@@ -288,10 +310,30 @@ class VoiceConfig:
         max_turns = int(getattr(reply, "max_turns", 0)) if reply else 0
         conv_idle_s = float(getattr(reply, "idle_timeout_s", CONV_IDLE_S)) if reply else CONV_IDLE_S
 
+        # Apply explicit server-config overrides on top of profile defaults.
+        if settings is not None:
+            # Wake phrase: explicit env override wins when it differs from the config default.
+            settings_phrase = getattr(settings, "wake_phrase", _CONFIG_DEFAULT_WAKE_PHRASE)
+            if settings_phrase and settings_phrase != _CONFIG_DEFAULT_WAKE_PHRASE:
+                wake_phrase = settings_phrase.lower().strip()
+
+            # Quiet hours: operator env override wins, but can never enable wake-blocking
+            # for senior care -- that would silence the person who needs it most.
+            cfg_qh = getattr(settings, "quiet_hours", None)
+            if cfg_qh is not None and getattr(cfg_qh, "enabled", False):
+                quiet_hours = QuietHours(
+                    getattr(cfg_qh, "start", "22:00"),
+                    getattr(cfg_qh, "end", "07:00"),
+                )
+                # Still cannot block wakes in senior care.
+                if mode == "senior_care":
+                    quiet_hours_block_wake = False
+
         return cls(
             wake_phrase=wake_phrase,
             detector=os.environ.get(DETECTOR_ENV, "").strip() or DEFAULT_DETECTOR,
             quiet_hours=quiet_hours,
+            quiet_hours_block_wake=quiet_hours_block_wake,
             max_turns=max_turns,
             conv_idle_s=conv_idle_s,
         )
@@ -579,10 +621,11 @@ class VoiceHost:
         from app.local.voice.adapters.events_app import publish_broadcast
 
         profile = getattr(getattr(app, "state", None), "profile", None)
+        settings = getattr(getattr(app, "state", None), "settings", None)
         if profile is not None:
-            config = VoiceConfig.from_profile(profile)
+            config = VoiceConfig.from_profile(profile, settings=settings)
         else:
-            config = VoiceConfig.from_settings(getattr(app.state, "settings", None))
+            config = VoiceConfig.from_settings(settings)
         return cls(config, build=lambda: build_ports(app), publish=publish_broadcast)
 
     # ------------------------------------------------------------------ state
@@ -759,9 +802,12 @@ class VoiceHost:
                                               speech_ratio=decision.speech_ratio)
                     continue
 
-                # Quiet hours: recorded as rejected; nothing is played or opened.
+                # Quiet hours: reject the wake when the window is active AND this mode
+                # blocks wakes during quiet hours.  Senior care never blocks a wake
+                # (quiet_hours_block_wake=False for that mode; VX-H5).
                 quiet = self.config.quiet_hours
-                if quiet is not None and quiet.active():
+                if (quiet is not None and quiet.active()
+                        and self.config.quiet_hours_block_wake):
                     log.info("wake: rejected (quiet hours) score=%.3f", decision.score)
                     await p.store.record_wake(score=decision.score, accepted=False,
                                               reject_reason=QUIET_HOURS_REASON,
