@@ -111,12 +111,15 @@ RMS_FLOOR = 0.005
 SILENCE_S = 6.0                 # end-of-turn silence when the turn detector is unavailable
 CAP_S = 300.0                   # hard cap per turn
 CONV_IDLE_S = 20.0              # how long to wait for the next turn of a conversation
+# A session ends after this long listening with no usable speech, however loud the room
+# (PL61; config VOXSCRIBE_VOICE_NO_SPEECH_LIMIT_S). Only recognised speech extends a wait.
+NO_SPEECH_LIMIT_S = 120.0
 FIRST_TURN_GRACE_S = 2.0        # first turn: SILENCE_S plus this before giving up
 # First turn: how long a person has to begin, never less than this. It applies only while nothing
 # has been recognised; once the person has said something the turn ends on their pause, and the
 # wait is the conversation's (conv_idle_s from the last words recognised), as in later turns.
 FIRST_TURN_WAIT_S = 8.0
-IDLE_SPEECH_RMS_FACTOR = 4      # audio this far above RMS_FLOOR keeps a conversation open
+IDLE_SPEECH_RMS_FACTOR = 4      # audio this far above RMS_FLOOR counts as a voice in the room
 QUEUE_POLL_S = 0.5              # a capture gap this long ends the turn as timed out
 TICK_EVERY_FRAMES = 5           # poll the turn detector for a pause every this many chunks
 TURN_RING_S = 60.0              # capture held for the recognizer, oldest dropped beyond this
@@ -228,6 +231,69 @@ def is_stop_phrase(text: str, wake_phrase: str, end_phrases: tuple[str, ...] = (
         return True
     words = re.sub(r"[^\w\s']", " ", text.lower()).split()
     return any(_turn_is_own_end_phrase(words, p) for p in end_phrases)
+
+
+# Plain ways a person closes a conversation (PL61), beside STOP_PHRASES and their own end
+# phrases. A turn closes the session when, with CLOSING_FILLERS taken off either end, it is one of
+# these, or when its last clause is one and the turn has at most CLOSING_MAX_WORDS words: "okay,
+# thanks, that's all" and "great, bye" close it; "I said goodbye to my sister" does not.
+CLOSING_PHRASES = frozenset({
+    "that's all", "that is all", "that's all for now", "that'll be all", "that will be all",
+    "that's it thanks", "that's it thank you", "okay i'm done", "i'm done", "i am done",
+    "goodbye", "good bye", "bye", "bye bye", "bye for now", "stop", "never mind bye",
+    "thanks bye", "thank you bye",
+})
+CLOSING_FILLERS = frozenset({"okay", "ok", "alright", "well", "so", "great", "cool", "perfect",
+                             "thanks", "thank", "you", "much", "a", "lot", "vox", "then", "now",
+                             "please", "oh", "um", "uh", "yeah", "for"})
+CLOSING_MAX_WORDS = 8
+# While the assistant is speaking these stop the speech and keep the session listening; while it
+# listens, "stop" closes the session (CLOSING_PHRASES) and the rest are the HOLD control.
+STOP_SPEAKING_PHRASES = frozenset({"stop", "wait", "hold on", "hang on", "stop talking",
+                                   "wait a second", "wait a minute", "stop stop"})
+
+
+def _closing_words(text: str) -> list[str]:
+    return re.sub(r"[^\w\s']", " ", text.lower().replace("’", "'").replace("-", " ")).split()
+
+
+def _without_fillers(words: list[str]) -> list[list[str]]:
+    """The words, and the words with fillers taken off the front, the back and both."""
+    front = list(words)
+    while front and front[0] in CLOSING_FILLERS:
+        front.pop(0)
+    back = list(words)
+    while back and back[-1] in CLOSING_FILLERS:
+        back.pop()
+    both = list(front)
+    while both and both[-1] in CLOSING_FILLERS:
+        both.pop()
+    return [words, front, back, both]
+
+
+def _is_one_of(words: list[str], phrases: frozenset[str]) -> bool:
+    return any(" ".join(w) in phrases for w in _without_fillers(words) if w)
+
+
+def is_closing(text: str, wake_phrase: str, end_phrases: tuple[str, ...] = ()) -> bool:
+    """True when the turn closes the conversation: a stop phrase (is_stop_phrase), or a plain
+    closing as the whole short turn or its ending clause, never inside a longer sentence."""
+    if is_stop_phrase(text, wake_phrase, end_phrases):
+        return True
+    words = _closing_words(text)
+    if not words or len(words) > CLOSING_MAX_WORDS:
+        return False
+    if _is_one_of(words, CLOSING_PHRASES):
+        return True
+    clauses = [c for c in re.split(r"[,.!?;:]+", text) if c.strip()]
+    return len(clauses) > 1 and _is_one_of(_closing_words(clauses[-1]), CLOSING_PHRASES)
+
+
+def is_stop_speaking(text: str) -> bool:
+    """"Stop", "wait" or "hold on" as the whole turn: said over the assistant, it stops the
+    speech and the session keeps listening."""
+    words = _closing_words(text)
+    return 0 < len(words) <= 4 and _is_one_of(words, STOP_SPEAKING_PHRASES)
 
 
 def spec_text_changed(pre: str, final: str) -> bool:
@@ -352,6 +418,7 @@ class VoiceConfig:
     # default here is plain; from_profile and from_settings resolve the product mode's default.
     expressiveness: str = "plain"
     thinking_after_s: float = THINKING_AFTER_S
+    no_speech_limit_s: float = NO_SPEECH_LIMIT_S
 
     @classmethod
     def from_settings(cls, settings) -> VoiceConfig:
@@ -366,6 +433,8 @@ class VoiceConfig:
             expressiveness=resolve_expressiveness(getattr(settings, "voice_expressiveness", None),
                                                   resolve_mode(None, settings)),
             thinking_after_s=float(getattr(settings, "voice_thinking_after_s", THINKING_AFTER_S)),
+            no_speech_limit_s=float(getattr(settings, "voice_no_speech_limit_s",
+                                            NO_SPEECH_LIMIT_S)),
         )
 
     @classmethod
@@ -440,6 +509,8 @@ class VoiceConfig:
             expressiveness=resolve_expressiveness(getattr(settings, "voice_expressiveness", None),
                                                   resolve_mode(profile, settings)),
             thinking_after_s=float(getattr(settings, "voice_thinking_after_s", THINKING_AFTER_S)),
+            no_speech_limit_s=float(getattr(settings, "voice_no_speech_limit_s",
+                                            NO_SPEECH_LIMIT_S)),
         )
 
 
@@ -712,13 +783,15 @@ class TurnHearing:
 
     def __init__(self) -> None:
         self.last_mono: float | None = None
+        self.marks = 0                  # how many times words came; the listener reads it
 
     @property
     def words(self) -> bool:
-        return self.last_mono is not None
+        return self.marks > 0
 
     def heard(self) -> None:
         self.last_mono = time.monotonic()
+        self.marks += 1
 
 
 class _TurnRing:
@@ -850,7 +923,6 @@ class SessionContext:
     barge_in: bool = False         # the user interrupted the previous reply
     played_text: str = ""          # what the user heard of it
     pre_roll: np.ndarray | None = None   # the interjection's start, captured during the reply
-    held_empty: bool = False       # one wordless turn after a barge-in did not end the session
     seq: int = 0                   # sequence number of the last event the session published
     stop_requested: bool = False   # End from the app: the session closes at its next step
     muted_until: float | None = None    # Mute from the app: monotonic end of the hold, None unmuted
@@ -864,6 +936,18 @@ class SessionContext:
     expressiveness: str = "plain"
     last_opener: str | None = None
     last_thinking: str | None = None
+    # The waits (PL61), in seconds of listening (capture read, not engine uptime): what is left
+    # of the current wait (None: a fresh one at the next listen), the listening since the last
+    # usable turn, and the last listen's length and what its wait had left after it.
+    wait_left_s: float | None = None
+    unused_s: float = 0.0
+    listened_s: float = 0.0
+    wait_after_s: float = 0.0
+    listen_end: str = ""            # how the last listen ended: closed | idle | limit | gap | ...
+    listen_heard: bool = False      # it heard words
+    usable_turns: int = 0           # turns the engine used (answered, closed, a control)
+    ignored: bool = False           # the last turn was not used: it takes no turn number
+    held_captions: list = field(default_factory=list)   # captions held until a turn is usable
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     @property
@@ -1007,6 +1091,7 @@ class VoiceHost:
         self._initiated_lock = asyncio.Lock()
         self._last_voice_mono: float | None = None   # armed: when capture last held a voice
         self._room = RoomTone()                        # what the room sounds like (PL59)
+        self._last_farewell: str | None = None         # the device's last farewell (PL61)
         self._session_listeners: list[Callable[[str | None], None]] = []
         self.initiated_hold_s = INITIATED_HOLD_S
         self._state: dict = {
@@ -1403,10 +1488,12 @@ class VoiceHost:
 
     async def _conversation(self, audio_q, session: SessionContext, *, score: float,
                             detector: str, speech_ratio: float | None) -> None:
-        """Many turns until a stop phrase, an empty turn or idle timeout.
+        """Many turns until a closing, End, the idle wait or the no-speech limit (PL61).
 
-        Silent close (T03): when turn 1 hears no genuine speech the meeting row is deleted (the
-        wake_events row is kept for audit with its link cleared) and nothing is stored."""
+        A turn the engine cannot use (no words, one word, noise) is ignored: it takes no turn
+        number and the wait goes on as it was. Silent close (T03): a session that never had a
+        usable turn is deleted (the wake_events row is kept for audit with its link cleared);
+        its captions were never published (_publish_segment), so nothing shown goes with it."""
         p = await self._ready()
         self.set_state(WakeState.LISTENING)
         try:
@@ -1444,7 +1531,14 @@ class VoiceHost:
                 if not await self._turn(p, audio_q, session_id, turn_n, use_turns, session,
                                         control_state, last_reply, memory):
                     break
+                if session.ignored:
+                    session.ignored = False
+                    turn_n -= 1                 # an unused turn takes no turn number
+            # Ended by a closing, End, a wait or the limit: a session that never had a usable
+            # turn leaves nothing behind. (One cancelled under it is closed as it stands.)
+            session.silent = session.usable_turns == 0
         finally:
+            session.held_captions.clear()
             self._state["meeting_id"] = None
             await self._await_late_finals(session)
             # A read-back still waiting for its yes is declined: nothing is set by silence.
@@ -1456,7 +1550,7 @@ class VoiceHost:
                     log.exception("voice host: delegate session close failed meeting_id=%s",
                                   session_id)
             if session.silent:
-                log.info("wake: silent close -- no genuine speech in turn 1 meeting_id=%s",
+                log.info("wake: silent close -- no usable speech in the session meeting_id=%s",
                          session_id)
                 # discard_session extends the SessionStore port in this server; a store
                 # without it closes the session normally.
@@ -1495,21 +1589,26 @@ class VoiceHost:
             heard = bool(texts) or bool(partial.text)
             if session.stop_requested:
                 log.info("[Vox Stopped] ended from the app (turn=%d)", turn_n)
-                session.silent = turn_n == 1 and not texts
                 ring.close()
                 recognize.cancel()
                 return False
-            if turn_n == 1 and heard:
-                # The wait ran out after the person said something (it is the conversation's
-                # wait from their last words by then, PL59): answer what they said. Closing in
-                # silence here deleted conversations in which the person had spoken.
-                log.info("wake: turn 1 closed at the first-turn wait with words heard")
+            if session.listen_end == "limit":
+                log.info("[Vox Stopped] no usable speech for %.0f s of listening (turn=%d)",
+                         self.config.no_speech_limit_s, turn_n)
+                ring.close()
+                recognize.cancel()
+                return False
+            if heard:
+                # The wait ran out after the person said something (by then it is the
+                # conversation's wait from their last words, PL59): answer what they said.
+                # Closing in silence here deleted conversations in which the person had spoken.
+                log.info("wake: turn %d closed at the %s wait with words heard", turn_n,
+                         "first-turn" if turn_n == 1 else "idle")
             else:
                 if turn_n > 1:
                     log.info("[Vox Stopped] idle timeout after %d turn(s)", turn_n - 1)
                 else:
                     log.info("[Vox Stopped] first-turn audio timeout")
-                    session.silent = True
                 ring.close()
                 recognize.cancel()
                 return False
@@ -1523,8 +1622,8 @@ class VoiceHost:
         prefetch = " ".join(texts).strip()
         speculation = None
         if (not session.barge_in and len(prefetch.split()) >= SPEC_MIN_WORDS
-                and not is_stop_phrase(prefetch, self.config.wake_phrase,
-                                       session.settings.end_phrases)):
+                and not is_closing(prefetch, self.config.wake_phrase,
+                                   session.settings.end_phrases)):
             speculation = p.delegate.speculate(prefetch, history or None)
             log.info("voice host: speculative reply started words=%d", len(prefetch.split()))
 
@@ -1549,41 +1648,48 @@ class VoiceHost:
         log.info("voice host: asr final +%d ms from turn end source=%s turn=%d",
                  asr_final_ms - turn_end_ms, source, turn_n)
 
+        def cancel_speculation() -> None:
+            if speculation is not None:
+                speculation.cancel()
+
         if session.stop_requested:
             log.info("[Vox Stopped] ended from the app (turn=%d)", turn_n)
-            if speculation is not None:
-                speculation.cancel()
+            cancel_speculation()
             return False
-        if not turn_text and session.barge_in and not session.held_empty:
-            # A cough or a door can interrupt a reply; it should not also end the conversation.
-            session.held_empty = True
-            log.info("[Vox Listening] the interruption held no words (turn=%d); listening on",
-                     turn_n)
-            return True
         if not turn_text:
-            log.info("[Vox Stopped] empty turn, no speech detected (turn=%d)", turn_n)
-            session.silent = turn_n == 1
-            if speculation is not None:
-                speculation.cancel()
-            return False
-        if is_stop_phrase(turn_text, self.config.wake_phrase, session.settings.end_phrases):
+            # No words: a cough, a door, the room. Never the end of a session (PL61).
+            log.info("[Vox Listening] the turn held no words (turn=%d); listening on", turn_n)
+            cancel_speculation()
+            return self._ignore_turn(session)
+        if session.barge_in and is_stop_speaking(turn_text):
+            # "Stop" said over the assistant: the speech stopped when it was interrupted, and
+            # the session goes on listening.
+            log.info("[Vox Listening] stop while speaking (turn=%d); listening on", turn_n)
+            cancel_speculation()
+            self._use_turn(session)
+            session.barge_in, session.played_text = False, ""
+            session.ignored = True              # no reply: the next words keep this number
+            return True
+        if is_closing(turn_text, self.config.wake_phrase, session.settings.end_phrases):
             log.info("[Vox Stopped] stop phrase detected (turn=%d)", turn_n)
-            if speculation is not None:
-                speculation.cancel()
+            cancel_speculation()
+            self._use_turn(session)
+            await self._farewell(p, session, session_id, turn_n, turn_text, history=history,
+                                 turn_end_ms=turn_end_ms, asr_final_ms=asr_final_ms,
+                                 audio_q=audio_q)
             return False
         # Speech guard (T03): chime echoes, sub-threshold audio, one-word transcripts and
-        # decodes Whisper scores as not speech get no reply.
+        # decodes Whisper scores as not speech get no reply, and end nothing (PL61).
         awaiting = getattr(p.delegate, "awaiting_answer", None)
         short_answer = bool(awaiting is not None and awaiting(session_id))
         if not is_genuine_speech(turn_text, ring.pushed_ms, no_speech_prob,
                                  short_answer=short_answer):
-            log.info("wake: speech guard blocked turn=%d words=%d audio_ms=%d no_speech=%s",
-                     turn_n, len(turn_text.split()), ring.pushed_ms,
+            log.info("wake: speech guard blocked turn=%d words=%d audio_ms=%d no_speech=%s; "
+                     "listening on", turn_n, len(turn_text.split()), ring.pushed_ms,
                      "n/a" if no_speech_prob is None else f"{no_speech_prob:.2f}")
-            session.silent = turn_n == 1
-            if speculation is not None:
-                speculation.cancel()
-            return False
+            cancel_speculation()
+            return self._ignore_turn(session)
+        self._use_turn(session)
         if speculation is not None:
             if spec_text_changed(prefetch, turn_text):
                 log.info("voice host: speculation cancelled, content drift")
@@ -1620,7 +1726,6 @@ class VoiceHost:
             history.append({"role": "assistant", "content": result.text})
         session.barge_in = interrupted
         session.played_text = result.text if interrupted else ""
-        session.held_empty = False
         if interrupted:
             session.pre_roll = result.pre_roll
         else:
@@ -1637,6 +1742,56 @@ class VoiceHost:
             log.info("[Vox Stopped] ended from the app during the reply (turn=%d)", turn_n)
             return False
         return True
+
+    def _use_turn(self, session: SessionContext) -> None:
+        """The turn is the engine's to use: its captions are shown, the no-speech count starts
+        again, and the next listen has a fresh wait."""
+        session.usable_turns += 1
+        session.unused_s = 0.0
+        session.wait_left_s = None
+        held, session.held_captions = session.held_captions, []
+        for payload in held:
+            self._publish("wake.transcript", payload)
+
+    @staticmethod
+    def _ignore_turn(session: SessionContext) -> bool:
+        """A turn the engine cannot use: ignored. The wait goes on from where it was (its time
+        listening counts, the words in it extend nothing), the no-speech count goes on, and while
+        the session has no usable turn its captions are never shown. Returns True: listen on."""
+        session.ignored = True
+        session.wait_left_s = session.wait_after_s
+        session.unused_s = session.listened_s + (0.0 if session.listen_heard
+                                                 else session.unused_s)
+        if session.usable_turns == 0:
+            session.held_captions.clear()
+        return True
+
+    async def _farewell(self, p: VoicePorts, session: SessionContext, session_id: str,
+                        turn_n: int, turn_text: str, *, history, turn_end_ms: int,
+                        asr_final_ms: int | None, audio_q) -> None:
+        """A closing phrase: one short farewell, through the gate like a reply, then the session
+        closes (PL61). Natural: from expression.FAREWELLS, never the device's last one. Plain:
+        expression.PLAIN_FAREWELL. Neither End from the app nor an idle end says anything."""
+        from app.local.voice.expression import NATURAL, farewells, pick  # lazy: boundary test
+
+        options = farewells(session.expressiveness)
+        name = pick(options, self._last_farewell if session.expressiveness == NATURAL else None)
+        if name is None:
+            return
+        stream = ReplyStream(sentences=_only(options[name]), source="farewell")
+        self._publish("wake.reply", {"meetingId": session_id, "turn": turn_n,
+                                     "phase": "thinking", "userText": turn_text, "text": ""})
+        result = await self._reply(session_id, turn_n, turn_text, history=history or None,
+                                   turn_end_ms=turn_end_ms, asr_final_ms=asr_final_ms,
+                                   audio_q=audio_q, scripted=stream)
+        self._publish("wake.reply", {"meetingId": session_id, "turn": turn_n,
+                                     "phase": "done", "userText": turn_text,
+                                     "text": result.text,
+                                     "interrupted": result.interruption is not None})
+        if result.text == options[name]:
+            self._last_farewell = name
+        log.info("voice host: farewell=%s spoken=%s turn=%d", name,
+                 result.text == options[name], turn_n)
 
     async def _handle_control(self, p: VoicePorts, intent, control_state, last_reply: list[str]) -> bool:
         """Execute a spoken control intent. Returns True (keep session open) always."""
@@ -1724,15 +1879,29 @@ class VoiceHost:
         was ended from the app. While the session is muted capture is read and dropped: nothing
         reaches the recognizer or the turn policy, and the deadline is the end of the mute hold.
 
-        The first turn's wait (FIRST_TURN_WAIT_S) is for a person to begin: once `hearing` has
-        words, the deadline is conv_idle_s after the last of them, so a person who is talking is
-        never cut off by it and the turn ends on their pause."""
+        The waits are measured in listening: capture read after the turn opened, 32 ms a chunk,
+        so they mean the same in a replay as on the device (PL61). The first turn's wait
+        (FIRST_TURN_WAIT_S) is for a person to begin; a later turn's is conv_idle_s. Only
+        recognised speech extends one: once `hearing` has words the wait is conv_idle_s after
+        the last of them, so a person who is talking is never cut off and the turn ends on
+        their pause (PL59). Loudness extends nothing. A wait carried over from an ignored turn
+        (session.wait_left_s) goes on from where it was. Past no_speech_limit_s of listening
+        with no recognised speech the session ends, however loud the room. Afterwards the
+        session says how long this listen was, what the wait had left and why it ended."""
         pause_s = self.config.end_of_turn_pause_s
         silence_needed = int(pause_s * SAMPLE_RATE / CHUNK_FRAMES)
         cap_chunks = int(CAP_S * SAMPLE_RATE / CHUNK_FRAMES)
         conv_idle_s = self.config.conv_idle_s
-        idle_deadline = time.monotonic() + (
-            max(pause_s + FIRST_TURN_GRACE_S, FIRST_TURN_WAIT_S) if turn_n == 1 else conv_idle_s)
+        if session is not None and session.wait_left_s is not None:
+            wait_s = session.wait_left_s
+        else:
+            wait_s = max(pause_s + FIRST_TURN_GRACE_S, FIRST_TURN_WAIT_S) if turn_n == 1 \
+                else conv_idle_s
+        unused_s = session.unused_s if session is not None else 0.0
+        limit_s = self.config.no_speech_limit_s
+        listened = 0.0
+        heard_marks = hearing.marks if hearing is not None else 0
+        heard_at: float | None = None
         if use_turns:
             set_pause = getattr(p.speech, "set_pause", None)
             if set_pause is not None:
@@ -1748,34 +1917,51 @@ class VoiceHost:
         pre_roll_pending = getattr(audio_q, "pre_roll_pending", lambda: False)
         log.info("[Vox Listening] turn=%d (say your question, or %r to stop)", turn_n, STOP_HINT)
         was_muted = False
+
+        def ended(reason: str) -> bool:
+            if session is not None:
+                session.listen_end = reason
+                session.wait_after_s = max(0.0, wait_s - listened)
+                session.listen_heard = heard_at is not None
+                session.listened_s = listened - heard_at if heard_at is not None else listened
+            return reason != "closed"
+
         try:
             while True:
                 if session is not None and session.stop_requested:
-                    return True
+                    return ended("stop")
                 muted = session is not None and session.muted
                 if was_muted and not muted:         # unmuted: a fresh wait for the person to speak
-                    idle_deadline = time.monotonic() + conv_idle_s
+                    wait_s = listened + conv_idle_s
                 was_muted = muted
-                if hearing is not None and hearing.last_mono is not None:
-                    idle_deadline = max(idle_deadline, hearing.last_mono + conv_idle_s)
-                deadline = session.muted_until if muted else idle_deadline
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return True
+                if hearing is not None and hearing.marks != heard_marks:
+                    heard_marks, heard_at = hearing.marks, listened
+                if muted:
+                    remaining = session.muted_until - time.monotonic()
+                    if remaining <= 0:
+                        return ended("idle")
+                    timeout = min(remaining, QUEUE_POLL_S)
+                else:
+                    idle_end = wait_s if heard_at is None else max(wait_s, heard_at + conv_idle_s)
+                    if listened >= idle_end:
+                        return ended("idle")
+                    unheard = unused_s + listened if heard_at is None else listened - heard_at
+                    if unheard >= limit_s:
+                        return ended("limit")
+                    timeout = QUEUE_POLL_S
                 from_pre_roll = pre_roll_pending()
                 try:
-                    chunk = await asyncio.wait_for(audio_q.get(),
-                                                   timeout=min(remaining, QUEUE_POLL_S))
+                    chunk = await asyncio.wait_for(audio_q.get(), timeout=timeout)
                 except asyncio.TimeoutError:
                     if session is not None and session.muted:
                         continue                    # a capture gap while muted ends nothing
-                    return True
+                    return ended("gap")
                 if session is not None and (session.muted or session.stop_requested):
                     continue                        # Mute (as of this chunk): not recognised, not a turn
+                if not from_pre_roll:
+                    listened += len(chunk) / SAMPLE_RATE
 
                 rms = _rms(chunk)
-                if turn_n > 1 and rms > RMS_FLOOR * IDLE_SPEECH_RMS_FACTOR:
-                    idle_deadline = time.monotonic() + conv_idle_s
 
                 # Echo guard: our own playback, cues and their tails never reach the recognizer.
                 # Pre-roll predates the acknowledgement chime and is never muted.
@@ -1809,19 +1995,19 @@ class VoiceHost:
                     if d is not None and d.closes_turn:
                         log.info("wake: turn %d closed action=%s silence_ms=%d",
                                  turn_n, d.action, d.silence_ms)
-                        return False
+                        return ended("closed")
                 else:
                     silence_run = silence_run + 1 if rms < RMS_FLOOR else 0
                     if silence_run >= silence_needed:
                         log.info("wake: turn %d end-of-silence chunks=%d", turn_n, chunks)
-                        return False
+                        return ended("closed")
 
                 if chunks >= cap_chunks:
                     log.info("wake: turn %d hard cap chunks=%d", turn_n, chunks)
-                    return False
+                    return ended("closed")
         except Exception:
             log.exception("voice host: audio collection error turn=%d", turn_n)
-            return True
+            return ended("error")
 
     async def _recognize(self, p: VoicePorts, ring: _TurnRing, stream, session_id: str,
                          turn_n: int, texts: list[str], partial: StablePartial,
@@ -1875,13 +2061,22 @@ class VoiceHost:
             texts.append(seg.text)
 
     def _publish_segment(self, session_id: str, turn_n: int, seg: TranscriptSegment) -> None:
+        """A caption. Until the session has a usable turn its captions are held and shown only
+        when the turn is used (_use_turn): a session that keeps nothing never showed anything
+        (PL61). Once one turn is used, captions are live again."""
         if not seg.text:
             return
-        self._publish("wake.transcript", {
+        payload = {
             "meetingId": session_id, "turn": turn_n,
             "segment": {"id": seg.id, "text": seg.text, "state": seg.state,
                         "startMs": seg.start_ms, "endMs": seg.end_ms},
-        })
+        }
+        session = current_session()
+        if (session is not None and session.session_id == session_id
+                and session.usable_turns == 0):
+            session.held_captions.append(payload)
+            return
+        self._publish("wake.transcript", payload)
 
     # ------------------------------------------------------------------ reply + playback
 
@@ -1905,12 +2100,15 @@ class VoiceHost:
                      history: list[dict] | None = None, speculation=None,
                      turn_end_ms: int = 0, asr_final_ms: int | None = None,
                      audio_q=None, note: str | None = None,
-                     control_state=None, memory=None) -> ReplyResult:
+                     control_state=None, memory=None,
+                     scripted: ReplyStream | None = None) -> ReplyResult:
         """Stages reply, playback and barge-in for one turn.
 
         Sentences are split into clauses (T11) so synthesis of clause N+1 starts while N plays.
         With `audio_q` (and an echo-cancelled capture) barge-in is watched during playback.
         `note` appended to the system prompt (barge-in); `control_state`/`memory` build prefix (T15/T19).
+        `scripted` is a reply the host wrote (the farewell, PL61): it stands in for the delegate's
+        and passes the gate and the records like any reply.
 
         Gate records (5a): the turn's evaluations are journalled in memory while it is spoken
         and handed to the store's ledger once the verdict is known, before the reply row and
@@ -1959,6 +2157,10 @@ class VoiceHost:
                     speculation.cancel()
                 stream = ReplyStream(sentences=_only(turn_gate.fail_closed_phrase),
                                      source="gate_fault")
+            elif scripted is not None:
+                if speculation is not None:
+                    speculation.cancel()
+                stream = scripted
             else:
                 stream = await p.delegate.reply(text, session_id, turn_id=turn.turn_id,
                                                 history=history, speculation=speculation,

@@ -191,6 +191,9 @@ class Config:
     # In natural, a reply whose speech has not started this long after the turn closed is
     # preceded by one short thinking line (VOXSCRIBE_VOICE_THINKING_AFTER_S, PL67).
     voice_thinking_after_s: float = 1.5
+    # A voice session ends after this long listening with no usable speech, however loud the
+    # room (VOXSCRIBE_VOICE_NO_SPEECH_LIMIT_S, PL61). Only recognised speech extends a wait.
+    voice_no_speech_limit_s: float = 120.0
 
     # Wake word — any phrase, no model training required (VOXSCRIBE_WAKE_PHRASE)
     wake_phrase: str = "hey vox"
@@ -465,6 +468,18 @@ class Config:
                 _fail("VOXSCRIBE_VOICE_THINKING_AFTER_S",
                       f"must be between 0.5 and 10, got {thinking_raw!r}")
             config_dict["voice_thinking_after_s"] = thinking_after
+
+        limit_raw = env_vars.get("VOXSCRIBE_VOICE_NO_SPEECH_LIMIT_S", "").strip()
+        if limit_raw:
+            try:
+                limit_value = float(limit_raw)
+            except ValueError:
+                _fail("VOXSCRIBE_VOICE_NO_SPEECH_LIMIT_S",
+                      f"must be a number of seconds, got {limit_raw!r}")
+            if not 30.0 <= limit_value <= 3600.0:
+                _fail("VOXSCRIBE_VOICE_NO_SPEECH_LIMIT_S",
+                      f"must be between 30 and 3600, got {limit_raw!r}")
+            config_dict["voice_no_speech_limit_s"] = limit_value
 
         voice_reply_model = env_vars.get("VOXSCRIBE_VOICE_REPLY_MODEL", "").strip()
         if voice_reply_model:

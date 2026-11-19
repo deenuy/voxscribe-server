@@ -4,8 +4,9 @@ In the owner's sessions of 2026-11-19 every first turn ended at the first-turn w
 after the wake, while later turns closed on a pause. These tests drive the host's real turn stage
 (`_listen`) with the real turn detector over synthetic audio shaped like a first turn: the end of
 the wake phrase in the pre-roll, the acknowledgement cue muted from capture, a short question,
-then the room. Time on the host's wall clock advances 32 ms per chunk of live capture, as it does
-with a microphone, so the first-turn wait is measured as it is in a session.
+then the room. Live capture advances 32 ms a chunk, as it does from a microphone, and the
+host's waits are measured in that listening time (PL61), so the first-turn wait is measured as it
+is in a session.
 
 Two causes, both shown here:
 - the turn detector settled on digital silence before every turn, so it measured the room against

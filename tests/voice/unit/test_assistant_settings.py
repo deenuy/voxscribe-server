@@ -36,6 +36,7 @@ from app.local.voice.adapters.scope import (
 )
 from app.local.voice.delegate_lane import TALKER_DELEGATE_INSTRUCTION
 from app.local.voice.host import (
+    STOP_HINT,
     SessionBinding,
     VoiceConfig,
     VoiceHost,
@@ -172,7 +173,8 @@ async def test_a_name_saved_by_alice_reaches_her_next_reply_prompt_and_not_bobs(
     view = await _save(app, "t_alice", name="Aria", persona_label="companion")
     assert view.changed == ("name", "persona_label")
 
-    host = _host(app, turns=(QUESTION, "", QUESTION, ""))
+    # Each session ends on a closing: an empty turn no longer ends one (PL61).
+    host = _host(app, turns=(QUESTION, STOP_HINT, QUESTION, STOP_HINT))
     await _session(host)                     # Alice's: the device's binding
     await _session(host, binding=BOB)
     alice, bob = prompts
@@ -295,7 +297,7 @@ async def test_a_change_saved_during_a_session_applies_to_the_next_one(monkeypat
         yield ANSWER
 
     monkeypatch.setattr(llm_adapter, "stream_reply", stream_reply)
-    host = _host(app, turns=(QUESTION, "And two plus two?", "", QUESTION, ""))
+    host = _host(app, turns=(QUESTION, "And two plus two?", STOP_HINT, QUESTION, STOP_HINT))
     await _session(host)
     await _session(host)
     first, second, next_session = seen
