@@ -1657,6 +1657,38 @@
         "title": "WakeArmResponse",
         "type": "object"
       },
+      "WakeMuteRequest": {
+        "properties": {
+          "muted": {
+            "title": "Muted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "muted"
+        ],
+        "title": "WakeMuteRequest",
+        "type": "object"
+      },
+      "WakeMuteResponse": {
+        "description": "POST /v1/wake/mute. `muted` is whether the running session is muted now: false when none is running.",
+        "properties": {
+          "muted": {
+            "title": "Muted",
+            "type": "boolean"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "muted",
+          "state"
+        ],
+        "title": "WakeMuteResponse",
+        "type": "object"
+      },
       "WakePowerResponse": {
         "properties": {
           "event": {
@@ -1773,6 +1805,11 @@
             ],
             "title": "Model"
           },
+          "muted": {
+            "default": false,
+            "title": "Muted",
+            "type": "boolean"
+          },
           "phrase": {
             "anyOf": [
               {
@@ -1810,6 +1847,25 @@
           "state"
         ],
         "title": "WakeStateResponse",
+        "type": "object"
+      },
+      "WakeStopResponse": {
+        "description": "POST /v1/wake/stop. `stopped` is false when no session was running; `state` is the wake listener's after.",
+        "properties": {
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "stopped": {
+            "title": "Stopped",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "stopped",
+          "state"
+        ],
+        "title": "WakeStopResponse",
         "type": "object"
       },
       "WakeTriggerResponse": {
@@ -5971,6 +6027,48 @@
         ]
       }
     },
+    "/v1/wake/mute": {
+      "post": {
+        "description": "Mute or unmute the running voice session: the Mute button. Muted, the session stays open,\ncaptured audio is not recognised and nothing is sent to the model; the idle timeout does not\nend it for up to MUTE_HOLD_S. Mute ends with the session; with none running, muted is false.",
+        "operationId": "mute_session_v1_wake_mute_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WakeMuteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WakeMuteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mute Session",
+        "tags": [
+          "wake"
+        ]
+      }
+    },
     "/v1/wake/power": {
       "post": {
         "description": "Power and session events forwarded by the app (Electron powerMonitor).\n\nsleep pauses the capture watchdog; wake (or an unlock that follows a missed wake) reopens the\nmicrophone stream after a short delay so the voice host is armed on a live stream. Lock alone\nchanges nothing. Returns handled=False when the engine runs without an audio engine.",
@@ -6073,6 +6171,28 @@
           }
         },
         "summary": "Wake State",
+        "tags": [
+          "wake"
+        ]
+      }
+    },
+    "/v1/wake/stop": {
+      "post": {
+        "description": "End the running voice session now: the End button. Playback stops at once and the session\ncloses through the spoken stop phrase's path; the wake listener is left as it was before the\nsession. Answers once the session has closed (bounded by END_WAIT_S).",
+        "operationId": "stop_session_v1_wake_stop_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WakeStopResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Stop Session",
         "tags": [
           "wake"
         ]

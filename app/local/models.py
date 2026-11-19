@@ -691,6 +691,7 @@ class WakeStateResponse(BaseModel):
     trigger: str | None = None
     meeting_id: str | None = None
     bound_to_caller: bool = False
+    muted: bool = False         # the running session is muted (POST /v1/wake/mute); false for anyone else
 
 
 class WakeArmResponse(BaseModel):
@@ -714,6 +715,24 @@ class WakeStartResponse(BaseModel):
     started: bool
     state: str
     meeting_id: str | None = None
+
+
+class WakeStopResponse(BaseModel):
+    """POST /v1/wake/stop. `stopped` is false when no session was running; `state` is the wake listener's after."""
+
+    stopped: bool
+    state: str
+
+
+class WakeMuteRequest(BaseModel):
+    muted: bool
+
+
+class WakeMuteResponse(BaseModel):
+    """POST /v1/wake/mute. `muted` is whether the running session is muted now: false when none is running."""
+
+    muted: bool
+    state: str
 
 
 class WakePowerResponse(BaseModel):

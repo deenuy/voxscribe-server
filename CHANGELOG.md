@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+- Added the `meeting.pipeline` event and `GET /v1/meetings/{id}/pipeline`: the transcript, summary and tasks steps after Stop, each working, ready, failed or skipped with a reason code. Added the `meeting_steps` table (migration 023).
+- Added `POST /v1/wake/stop` (End) and `POST /v1/wake/mute` (Mute) for a running voice session; `GET /v1/wake/state` reports `muted`.
+
+### Bug Fixes
+- Fixed "Ask about this scribe" answering from a search over every source instead of the scribe's transcript, and chat searching through a connection of its own outside the tenant pool.
+- Fixed the chat reply stream breaking on backslashes and control characters, and holding the event loop while the model generated.
+- Fixed regenerating a summary, which never ran the model and left the summary pending; a regenerate while a summary is being written now attaches to that run.
+- Fixed a task drafting timeout being logged with no reason; it is now `model_timeout` on the pipeline and can be retried with Generate.
+
 ## What's New in VoxScribe Server 0.9.0
 
 ### New Features
