@@ -249,6 +249,15 @@ async def reset_profile_for_request(app, tenant: str | None):
     return _ProfileView(copy.deepcopy(store.startup))
 
 
+def drop_cached_profile(app, tenant: str | None) -> None:
+    """Forget the assistant profile cached for a tenant, for the erase path: the row is gone
+    with the tenant's data, and the cache must not hand the old values to the next session.
+    The next read loads the row again, or the product defaults. Touches no database."""
+    store = getattr(getattr(app, "state", None), "profile_store", None)
+    if store is not None:
+        store.reset(tenant=tenant)
+
+
 # ---- tenant session scope ----------------------------------------------------
 
 

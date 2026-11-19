@@ -468,3 +468,22 @@ def test_a_patch_in_a_restricted_mode_does_not_keep_a_system_prompt():
     personal = AssistantProfileStore(Profile(mode="personal"))
     view = personal.patch({"assistant": {"system_prompt": "Be brief."}})
     assert view.assistant.system_prompt == "Be brief."
+
+
+def test_dropping_a_tenants_cached_profile_leaves_the_defaults_and_other_tenants_alone():
+    from types import SimpleNamespace
+
+    from voxscribe.profile.schema import Profile
+
+    from app.local.voice.adapters.scope import drop_cached_profile
+    from app.local.voice.profile_store import AssistantProfileStore
+
+    store = AssistantProfileStore(Profile(mode="personal"))
+    app = SimpleNamespace(state=SimpleNamespace(profile_store=store))
+    store.patch({"assistant": {"speed": 1.5}}, tenant="t_erased")
+    store.patch({"assistant": {"speed": 0.75}}, tenant="t_other")
+
+    drop_cached_profile(app, "t_erased")
+    assert (store.get("t_erased").assistant.speed, store.revision("t_erased")) == (1.0, 0)
+    assert (store.get("t_other").assistant.speed, store.revision("t_other")) == (0.75, 1)
+    drop_cached_profile(SimpleNamespace(state=SimpleNamespace()), "t_erased")    # no store: no-op
