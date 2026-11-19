@@ -111,6 +111,17 @@ class _Provisioner:
             cur = await conn.execute("SELECT schema_name FROM information_schema.schemata WHERE schema_name ~ '^t_[0-9a-f]{24}$' ORDER BY 1")
             return [r[0] for r in await cur.fetchall()]
 
+    def evict(self, key: str) -> None:
+        """Remove a tenant from the ready set so the next connection re-provisions them.
+
+        Call this after erasing a tenant's schema so the provisioner does not keep
+        writing to a schema that no longer exists. The armed wake loop checks _ready
+        on each frame; evicting here means the next armed cycle will find the entry
+        gone and refuse to open a session for a dropped schema.
+        """
+        self._ready.discard(key)
+        self._locks.pop(key, None)
+
 
 class _Borrow:
     """`async with pool.connection() as conn`, with the tenant's schema set for the length of the block."""

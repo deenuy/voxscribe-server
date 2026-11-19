@@ -183,6 +183,12 @@ class Config:
     vox_location: str = ""
     vox_user_name: str = ""
 
+    # Retention: how many days to keep wake candidate rows and tool-call records before the
+    # periodic sweep deletes them. 0 (the default) means keep forever; set to a positive integer
+    # to enable deletion.
+    wake_candidate_retention_days: int = 0
+    tool_call_retention_days: int = 0
+
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "Config":
         """Load configuration from environment.
@@ -415,6 +421,14 @@ class Config:
             val = env_vars.get(env_key, "") or os.environ.get(env_key, "")
             if val.strip():
                 config_dict[field] = val.strip()
+
+        # Retention
+        config_dict["wake_candidate_retention_days"] = _parse_int(
+            env_vars, "VOXSCRIBE_WAKE_CANDIDATE_RETENTION_DAYS", 0
+        )
+        config_dict["tool_call_retention_days"] = _parse_int(
+            env_vars, "VOXSCRIBE_TOOL_CALL_RETENTION_DAYS", 0
+        )
 
         return cls(**config_dict)
 
