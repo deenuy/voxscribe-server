@@ -1748,7 +1748,9 @@ class VoiceHost:
             speak = asyncio.create_task(speak_reply(
                 clause_stream, gate=heard.gate(turn_gate), talker=heard.talker(clause_talker),
                 audio_out=heard.audio_out(p.audio_out), clock=p.clock, user_text=text,
-                session_tools=turn_gate.tools(lambda: p.store.session_tools(session_id))),
+                # G7 reads this turn's receipts, not the session's tool rows (PL43).
+                session_tools=turn_gate.tools(
+                    lambda: p.store.turn_receipts(session_id, turn.turn_id))),
                 name="voice-reply")
 
             pre_roll = None

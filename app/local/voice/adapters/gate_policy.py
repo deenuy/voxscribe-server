@@ -7,7 +7,8 @@ Core's engine is the authority. A denial or a fallback from it is final and is s
 pack's scripted line. The host floor runs behind it and can only tighten: it holds the rules
 this server enforced before PL09 that core 0.5.0's packs cannot express yet (dosing and
 forbidden-topic patterns matched on the person's words as well as the reply, a scripted line
-per rule, and action claims that need a tool row). Its own scripted lines pass the engine too.
+per rule, and action claims that need a receipt in the turn). Its own scripted lines pass the
+engine too.
 
 The pack is read from the installed wheel, once per process. Anything short of a clean load
 (unknown mode, missing or malformed pack, a senior care or classroom pack that is not in
@@ -82,8 +83,8 @@ RULE_HEARD_UNWRITTEN = "gate_ledger:heard_unwritten"
 # check is synchronous, so this cannot interrupt a gate that never returns; it bounds what the
 # host will act on. An evaluation costs microseconds (see the PL09 report for the measurement).
 CHECK_DEADLINE_MS = 250
-# The tool-row lookup an action claim needs is the gate's only I/O. Past this the reply fails
-# closed instead of waiting on the database.
+# The receipt lookup an action claim needs (this turn's receipts, PL43) is the gate's only I/O.
+# Past this the reply fails closed instead of waiting on the database.
 TOOLS_TIMEOUT_S = 1.0
 
 

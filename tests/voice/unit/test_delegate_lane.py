@@ -6,7 +6,9 @@ A3  a stale result is offered, not read out
 A5  every tool row carries the task id of the delegate task that made the call
 
 No microphone, reply model, search engine or database: the reply model and the search tool are
-scripted, the pool records what is written, and time is a fake clock the fakes advance.
+scripted, the pool records what is written, and time is a fake clock the fakes advance. The
+stored privacy mode is "connectors" and the profile personal, so the network decision (PL41,
+tests/voice/unit/test_network_decision.py) lets the search run.
 """
 from __future__ import annotations
 
@@ -44,7 +46,8 @@ SEARCH_TOPIC = "the best standing desks"
 SEARCH_RESULT = "The Uplift V2 is the top pick. It costs about six hundred dollars."
 TALKER_ANSWER = "Four."
 
-TOOL_ENTRY_POINTS = ("web_search", "search_answer", "record_tool_call", "app.local.tools")
+TOOL_ENTRY_POINTS = ("web_search", "search_answer", "tool_runtime", "runtime.call",
+                     "app.local.tools")
 
 UNRELATED_QUESTIONS = (
     "What time is it?", "What day is it?", "What's the date?", "What is 2+2?", "How are you?",
@@ -64,11 +67,24 @@ class FakeClock:
         self.ms += int(seconds * MS_PER_S)
 
 
-class RecordingPool:
-    """Stands in for the connection pool; keeps every statement and its parameters."""
+class _Rows:
+    def __init__(self, rows) -> None:
+        self._rows = rows
 
-    def __init__(self) -> None:
+    async def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    async def fetchall(self):
+        return self._rows
+
+
+class RecordingPool:
+    """Stands in for the connection pool; keeps every statement and its parameters, and answers
+    the stored privacy mode."""
+
+    def __init__(self, privacy: str = "connectors") -> None:
         self.statements: list[tuple[str, tuple]] = []
+        self.privacy = privacy
 
     @asynccontextmanager
     async def connection(self):
@@ -79,9 +95,21 @@ class RecordingPool:
 
     async def execute(self, sql: str, params=()):
         self.statements.append((sql, tuple(params)))
+        if "FROM settings" in sql:
+            return _Rows([(self.privacy,)])
+        return _Rows([])
 
     def rows(self, table: str) -> list[tuple]:
         return [p for sql, p in self.statements if sql.startswith(f"INSERT INTO {table}")]
+
+    def named_rows(self, table: str) -> list[dict]:
+        """Each insert into `table` as {column: value}, from the statement's column list."""
+        out = []
+        for sql, params in self.statements:
+            if sql.startswith(f"INSERT INTO {table}"):
+                cols = [c.strip() for c in sql.split("(", 1)[1].split(")", 1)[0].split(",")]
+                out.append(dict(zip(cols, params, strict=True)))
+        return out
 
 
 class TimedTalker(FakeTalker):
@@ -528,9 +556,12 @@ async def test_every_tool_row_carries_the_task_id(monkeypatch, talker_calls):
 
     assert task.status is TaskStatus.DONE and task.result == TALKER_ANSWER
     assert queries == [SEARCH_TOPIC]
-    (tool_row,) = pool.rows("tool_calls")
-    assert tool_row[-1] == task.task_id               # tool_calls.task_id
-    assert tool_row[1:4] == ("turn-1", "s1", "web_search")
+    (tool_row,) = pool.named_rows("tool_calls")
+    assert tool_row["task_id"] == task.task_id
+    assert (tool_row["turn_id"], tool_row["meeting_id"]) == ("turn-1", "s1")
+    assert tool_row["tool"] == "web.search" and tool_row["status"] == "executed"
+    assert tool_row["tool_version"] and tool_row["duration_ms"] >= 0
+    assert SEARCH_TOPIC not in str(tool_row)           # the query is kept as a digest only
 
     task_rows = pool.rows("delegate_tasks")
     assert {r[0] for r in task_rows} == {task.task_id}
@@ -559,18 +590,20 @@ async def test_search_that_is_cancelled_still_writes_its_tool_row(monkeypatch, t
     assert await _say(delegate, "cancel that", "turn-2") == [dl.CANCELLED_PHRASE]
     await delegate.lane.wait(task.task_id)
     await delegate.drain()
-    (tool_row,) = pool.rows("tool_calls")
-    assert tool_row[-1] == task.task_id and tool_row[8] == "cancelled"
+    (tool_row,) = pool.named_rows("tool_calls")
+    assert tool_row["task_id"] == task.task_id and tool_row["status"] == "cancelled"
     assert pool.rows("delegate_tasks")[-1][3] == "cancelled"
 
 
 def test_the_talker_path_cannot_reach_a_tool():
-    """Inspection: tools are imported in one function, and only the thinker calls it."""
+    """Inspection: the reply chain reaches tools in one function, and only the thinker calls it.
+    The delegate reaches tools only through the tool runtime (its deterministic reminder routes
+    and the registry check before the lane), never the search module itself."""
     chain = inspect.getsource(reply_chain)
     assert chain.count("app.local.tools") == 1
     assert "app.local.tools" in inspect.getsource(reply_chain.search_answer)
     adapter = inspect.getsource(delegate_ollama)
-    assert "app.local.tools" not in adapter
+    assert "web_search" not in adapter and "tools.web_search" not in adapter
     assert adapter.count("search_answer") == 1
     assert "search_answer" in inspect.getsource(OllamaDelegate._think)
     for talker_fn in (reply_chain.talker_sentences, reply_chain._sentence_stream,

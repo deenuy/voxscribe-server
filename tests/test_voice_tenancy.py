@@ -236,6 +236,13 @@ async def test_every_connection_a_session_and_its_tasks_borrow_is_inside_the_ten
 
     monkeypatch.setattr(web_search, "search", search)
     monkeypatch.setattr("app.local.llm_adapter.stream_reply", stream_reply)
+    # Alice allows connectors, so the network decision (PL41) lets the thinker search; the
+    # decision reads her stored setting, inside her scope like every other borrow.
+    with tenancy.tenant_scope(alice):
+        async with app.state.store.pool.connection() as conn:
+            await conn.execute("INSERT INTO settings (key, value) VALUES (%s, %s)",
+                               ("privacyMode", '"connectors"'))
+            await conn.commit()
 
     delegate = OllamaDelegate(app)
     turns = ("Search for the latest tide tables.", "Remind me to call Alex in 10 minutes.",
@@ -255,7 +262,11 @@ async def test_every_connection_a_session_and_its_tasks_borrow_is_inside_the_ten
     await _settle()
 
     counts = await _counts(alice, DELEGATE_TABLES)
-    assert counts["reminders"] == 1 and counts["tool_calls"] == 1 and counts["delegate_tasks"] == 1
+    # One audit row per tool call: web.search, reminder.create and reminder.list.
+    assert counts["reminders"] == 1 and counts["tool_calls"] == 3 and counts["delegate_tasks"] == 1
+    assert sorted(await _rows(alice, "SELECT tool, status, tenant FROM {s}.tool_calls")) == [
+        ("reminder.create", "executed", alice), ("reminder.list", "executed", alice),
+        ("web.search", "executed", alice)]
     assert await _counts(alice, ("turns",)) == {"turns": len(turns)}
     assert await _counts(base, (*SESSION_TABLES, *DELEGATE_TABLES)) == dict.fromkeys(
         (*SESSION_TABLES, *DELEGATE_TABLES), 0)

@@ -335,6 +335,9 @@ class FakeStore:
     async def session_tools(self, session_id) -> list[str]:
         return []
 
+    async def turn_receipts(self, session_id, turn_id) -> list[str]:
+        return []
+
     async def add_turn(self, turn, outcome, *, turn_end_ms, asr_final_ms=None,
                        interruption=None) -> None:
         self.turns.append((turn.turn_n, outcome))

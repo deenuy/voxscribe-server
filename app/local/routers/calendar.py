@@ -8,6 +8,7 @@ from fastapi import APIRouter, Query, Request
 from app.local import connector_tokens, ics, store_misc
 from app.local.errors import ConflictError, InvalidRequestError, NetworkDisabledError
 from app.local.models import CalendarImportRequest, CalendarImportResponse, CalendarStatusResponse
+from app.local.tools.network import network_decision
 
 router = APIRouter(prefix="/v1/calendar", tags=["calendar"])
 
@@ -96,12 +97,12 @@ async def import_calendar(request: Request, body: CalendarImportRequest) -> dict
         ).model_dump()
 
     elif body.kind == "google":
-        # Check if Google connector is connected
-        settings = request.app.state.settings
-
-        # Check privacy mode
-        if settings.privacy_mode != "connectors":
-            raise NetworkDisabledError("Google Calendar import requires privacyMode: connectors")
+        # PL41: the network decision (product mode, the profile's network field, the stored
+        # privacy mode) before anything leaves the device.
+        decision = await network_decision(request.app, pool=store.pool)
+        if not decision.allowed:
+            raise NetworkDisabledError(
+                f"Google Calendar import needs the network ({decision.reason})")
 
         # Check if token is available
         token_tuple = await connector_tokens.get_google_access_token()

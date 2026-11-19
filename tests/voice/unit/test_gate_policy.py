@@ -230,8 +230,8 @@ def test_unbacked_action_claim_is_replaced_and_a_backed_one_passes():
     verdict = gate.check(claim, [], user_text="wake me at seven")
     assert (verdict.decision, verdict.category, verdict.replacement) == \
         (GATE_REPLACE, floor.ACTION_CLAIM_REASON, floor.ACTION_CLAIM_PHRASE)
-    assert verdict.rule == f"{floor.FLOOR_VERSION}:no_tool_row"
-    assert gate.check(claim, ["alarm_set"], user_text="wake me at seven").decision == GATE_PASS
+    assert verdict.rule == f"{floor.FLOOR_VERSION}:no_receipt"
+    assert gate.check(claim, ["alarm.set"], user_text="wake me at seven").decision == GATE_PASS
 
 
 def test_floor_never_allows_what_the_engine_denied(monkeypatch):
@@ -274,7 +274,7 @@ class _SlowGate(CorePolicyGate):
 
 
 class _HungToolsStore:
-    """A store whose tool-row lookup never returns."""
+    """A store whose receipt lookup never returns."""
 
     def __init__(self, inner) -> None:
         self._inner = inner
@@ -282,7 +282,7 @@ class _HungToolsStore:
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
-    async def session_tools(self, session_id):
+    async def turn_receipts(self, session_id, turn_id):
         await asyncio.sleep(3600)
 
 

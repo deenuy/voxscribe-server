@@ -1,4 +1,5 @@
-"""Web search tool via SearXNG.
+"""Web search tool via SearXNG: the executor behind the `web.search` record
+(app/local/tools/builtin.py), run through the tool runtime on the delegate lane.
 
 Fetches title/url/snippet from a local SearXNG instance.
 Result is flagged untrusted: the LLM sees it wrapped in a safety boundary so
@@ -18,6 +19,9 @@ _SEARXNG_URL = os.environ.get("VOX_SEARXNG_URL", "http://127.0.0.1:8080")
 _TOP_N       = 5
 _TIMEOUT_S   = 6.0
 
+# The HTTP transport: None is httpx's own. Tests put a fake here to count what would be sent.
+TRANSPORT = None
+
 
 async def _call(arguments: dict) -> str:
     import httpx
@@ -30,13 +34,14 @@ async def _call(arguments: dict) -> str:
     params = {"q": query, "format": "json", "language": "en"}
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_S, transport=TRANSPORT) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
             data = r.json()
     except Exception as exc:
-        log.warning("web_search: SearXNG request failed: %s", exc)
-        return f"[web_search: unavailable — {exc}]"
+        # The exception's text can carry the request URL, and so the query: log its type only.
+        log.warning("web_search: SearXNG request failed: %s", type(exc).__name__)
+        return f"[web_search: unavailable: {type(exc).__name__}]"
 
     results = data.get("results", [])[:_TOP_N]
     if not results:
@@ -54,34 +59,28 @@ async def _call(arguments: dict) -> str:
     return "\n".join(lines)
 
 
-def web_search_tool():
-    from app.local.tools.registry import ToolDef
-    return ToolDef(
-        name="web_search",
-        description=(
-            "Search the web for current facts, weather, news, prices, or recent events. "
-            "Use only for queries that cannot be answered from the conversation context or the "
-            "assistant's own knowledge. Returns titles and snippets from top results."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query, phrased as a short natural-language question or keywords.",
-                },
-            },
-            "required": ["query"],
-        },
-        timeout_s=_TIMEOUT_S + 1.0,
-        untrusted=True,
-        call=_call,
-    )
-
-
 async def search(query: str) -> str:
     """Convenience wrapper for calling web search directly."""
     return await _call({"query": query})
+
+
+_RESULT_MAX_CHARS = 20_000       # the web.search record's result bound
+
+
+def _count_results(search_result: str) -> int:
+    return len([ln for ln in search_result.splitlines()
+                if ln.startswith("1.") or ln[:2] in ("2.", "3.", "4.", "5.")])
+
+
+async def execute(args: dict):
+    """The web.search executor, run by the tool runtime. SearXNG unreachable is a failure."""
+    from app.local.tools.runtime import ToolFailed, ToolResult  # lazy: no import cycle
+
+    text = await search(args["query"])        # the module's name, so a test can replace it
+    if text.startswith("[web_search: unavailable"):
+        raise ToolFailed("unavailable")
+    return ToolResult(fields={"text": text[:_RESULT_MAX_CHARS],
+                              "result_count": _count_results(text)})
 
 
 async def is_reachable() -> bool:

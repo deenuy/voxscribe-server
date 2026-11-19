@@ -37,9 +37,8 @@ REMINDER_SIGNALS = frozenset({
 
 REMINDER_LOOKAHEAD_H = 24   # schedule at most this many hours ahead
 
-# Confirmation template spoken after a reminder is set.
-REMINDER_SET_PHRASE = "Got it -- I'll remind you {description} at {time_str}."
-REMINDER_TIMER_PHRASE = "Got it -- timer set for {description}."
+# The confirmations are the reminder.create and timer.start records' templates
+# (app/local/tools/builtin.py), spoken only with a receipt.
 REMINDER_FIRED_PHRASE = "Reminder: {text}."
 REMINDER_LIST_INTRO = "You have {n} reminder{s} coming up."
 REMINDER_LIST_ITEM = "{time_str}: {text}."
@@ -117,7 +116,7 @@ def _resolve_at_time(hour: int, minute: int) -> datetime:
     return candidate.astimezone(UTC).replace(tzinfo=UTC)
 
 
-def _format_local_time(dt: datetime) -> str:
+def format_local_time(dt: datetime) -> str:
     """Human-readable local time: '3:00 PM'."""
     local = dt.astimezone()
     return local.strftime("%-I:%M %p").lstrip("0") or local.strftime("%I:%M %p")
@@ -309,12 +308,9 @@ class ReminderStore:
             return [_row_to_reminder(r) for r in await rows.fetchall()]
 
 
-def reminder_confirmation(original_text: str, description: str, fire_at: datetime) -> str:
-    """The spoken confirmation sentence after a reminder or timer is set."""
-    if _TIMER_RE.search(original_text):
-        return REMINDER_TIMER_PHRASE.format(description=description)
-    time_str = _format_local_time(fire_at)
-    return REMINDER_SET_PHRASE.format(description=description, time_str=time_str)
+def is_timer_request(text: str) -> bool:
+    """True when parse_reminder() read the text as a timer ("set a timer for N minutes")."""
+    return bool(_TIMER_RE.search(text))
 
 
 def build_reminder_list_sentences(pending: list[Reminder]) -> list[str]:
@@ -325,7 +321,7 @@ def build_reminder_list_sentences(pending: list[Reminder]) -> list[str]:
     s = "s" if n != 1 else ""
     sentences = [REMINDER_LIST_INTRO.format(n=n, s=s)]
     for r in pending:
-        time_str = _format_local_time(r.fire_at)
+        time_str = format_local_time(r.fire_at)
         sentences.append(REMINDER_LIST_ITEM.format(time_str=time_str, text=r.text))
     return sentences
 

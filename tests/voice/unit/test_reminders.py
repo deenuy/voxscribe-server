@@ -34,7 +34,6 @@ from app.local.voice.reminder_store import (
     is_reminder_list_request,
     is_reminder_signal,
     parse_reminder,
-    reminder_confirmation,
 )
 
 
@@ -298,23 +297,24 @@ class TestBuildReminderListSentences:
 
 
 # ---------------------------------------------------------------------------
-# reminder_confirmation
+# confirmations: the reminder.create and timer.start records' success lines
 # ---------------------------------------------------------------------------
 
 class TestReminderConfirmation:
+    def _render(self, name: str, values: dict) -> str:
+        from app.local.tools.registry import default_registry
+
+        return default_registry().get(name).render("success", values)
+
     def test_timer_phrase_for_timer_input(self):
-        fire_at = _now_utc() + timedelta(minutes=5)
-        msg = reminder_confirmation("set a timer for 5 minutes", "5 minutes", fire_at)
+        msg = self._render("timer.start", {"label": "5 minutes", "fire_at": "", "timer_id": "r"})
         assert "timer" in msg.lower()
         assert "5 minute" in msg
 
     def test_reminder_phrase_names_time(self):
-        # Use a fixed datetime to verify the time string
-        fire_at = datetime(2026, 11, 18, 15, 0, 0, tzinfo=UTC)  # 3:00 PM UTC
-        msg = reminder_confirmation("remind me to call Alex at 3pm", "call Alex", fire_at)
-        assert "call Alex" in msg
-        # Time string should appear somewhere in the message
-        assert any(c.isdigit() for c in msg)
+        msg = self._render("reminder.create", {"text": "call Alex", "fire_at": "",
+                                               "reminder_id": "r", "when": "3:00 PM"})
+        assert msg == "Got it, I'll remind you at 3:00 PM: call Alex."
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +326,10 @@ def _make_app(reminder_store=None) -> SimpleNamespace:
     settings = SimpleNamespace(
         voice_model=None, reply_model=None, voice_mode="default",
     )
-    state = SimpleNamespace(settings=settings, store=None)
+    from tests.voice.unit.tool_fakes import ToolPool
+
+    # The tool runtime writes its audit rows (and so its receipts) through this pool.
+    state = SimpleNamespace(settings=settings, store=SimpleNamespace(pool=ToolPool()))
     return SimpleNamespace(state=state)
 
 
