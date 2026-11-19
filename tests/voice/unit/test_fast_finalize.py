@@ -272,7 +272,9 @@ async def test_cue_pre_arms_the_echo_guard(monkeypatch):
     engine = SimpleNamespace(echo_guard=SimpleNamespace(notify_chime=armed.append))
     monkeypatch.setattr(audio_portaudio.subprocess, "run", lambda *a, **kw: None)
     await audio_portaudio.PortAudioOut(engine).play_file(CHIME_END)
-    assert armed == [audio_portaudio.CHIME_DURATION_MS + audio_portaudio.CHIME_DECAY_MS]
+    # The cue's own length where the file can be read (macOS), the stand-in elsewhere.
+    assert armed == [audio_portaudio.cue_duration_ms(CHIME_END) + audio_portaudio.CHIME_DECAY_MS]
+    assert armed[0] >= 1500
 
 
 async def test_pre_roll_is_never_muted_by_the_chime():

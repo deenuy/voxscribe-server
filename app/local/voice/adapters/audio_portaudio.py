@@ -13,8 +13,11 @@ playback, which is what lets it read capture energy during a reply as the user's
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import struct
 import subprocess
+import wave
 
 import numpy as np
 
@@ -29,8 +32,48 @@ CHUNK_FRAMES = 512            # 32 ms at the capture rate, the AudioEngine block
 DIRECT_QUEUE_CHUNKS = 512
 CUE_TIMEOUT_S = 3
 CUE_PLAYER = "afplay"
-CHIME_DURATION_MS = 800       # the longest system cue the host plays (Glass), via afplay
+# A cue is muted from capture for its own length, read from the file (cue_duration_ms), and
+# CHIME_DECAY_MS of room reverb after it. CHIME_DURATION_MS stands in when the file cannot be read.
+# The fixed 800 ms this used to be was shorter than the cues themselves (the acknowledgement and
+# end cues run about 1.6 s), so their last half second reached the recognizer and the turn
+# detector as sound to judge (PL59).
+CHIME_DURATION_MS = 1700
 CHIME_DECAY_MS = 300          # room reverb after the cue ends, still muted from capture
+
+
+@functools.lru_cache(maxsize=16)
+def cue_duration_ms(path: str) -> int:
+    """How long the cue at `path` plays, from its header (AIFF or WAV); CHIME_DURATION_MS when
+    it cannot be read."""
+    try:
+        if path.lower().endswith((".wav", ".wave")):
+            with wave.open(path, "rb") as w:
+                return round(w.getnframes() * 1000 / w.getframerate())
+        with open(path, "rb") as f:
+            head = f.read(12)
+            if head[:4] != b"FORM" or head[8:12] not in (b"AIFF", b"AIFC"):
+                return CHIME_DURATION_MS
+            while True:
+                chunk = f.read(8)
+                if len(chunk) < 8:
+                    return CHIME_DURATION_MS
+                kind, size = chunk[:4], struct.unpack(">I", chunk[4:])[0]
+                if kind == b"COMM":
+                    comm = f.read(18)
+                    frames = struct.unpack(">I", comm[2:6])[0]
+                    rate = _extended(comm[8:18])
+                    return round(frames * 1000 / rate) if rate > 0 else CHIME_DURATION_MS
+                f.seek(size + (size & 1), 1)
+    except (OSError, EOFError, struct.error, wave.Error, ValueError, ZeroDivisionError):
+        return CHIME_DURATION_MS
+
+
+def _extended(b: bytes) -> float:
+    """An AIFF sample rate: an 80-bit IEEE 754 extended float, big-endian."""
+    exponent = ((b[0] & 0x7F) << 8 | b[1]) - 16383
+    mantissa = int.from_bytes(b[2:10], "big")
+    value = mantissa * 2.0 ** (exponent - 63)
+    return -value if b[0] & 0x80 else value
 
 
 class PortAudioIn:
@@ -109,7 +152,7 @@ class PortAudioOut:
         # is pre-armed for it here, before the device hears it: capture is muted for the cue and
         # its room decay, and the cue never reaches the recognizer or the wake gate.
         if self._engine is not None:
-            self._engine.echo_guard.notify_chime(CHIME_DURATION_MS + CHIME_DECAY_MS)
+            self._engine.echo_guard.notify_chime(cue_duration_ms(path) + CHIME_DECAY_MS)
         try:
             await asyncio.to_thread(subprocess.run, [CUE_PLAYER, path], check=False,
                                     timeout=CUE_TIMEOUT_S)

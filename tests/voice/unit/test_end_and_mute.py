@@ -135,8 +135,13 @@ async def test_end_with_no_session_changes_nothing():
     assert ports.audio_out.stops == 0 and store.closed == [] and host.state == WakeState.OFF
 
 
+# The waits are measured in listening (capture read, PL61), and Feeder delivers about ten times
+# faster than a microphone: 3 s of listening here passes in about 0.3 s.
+FEEDER_IDLE_S = 3.0
+
+
 async def test_mute_keeps_the_session_open_and_sends_nothing_until_unmuted():
-    host, ports, store = _host(config=VoiceConfig(conv_idle_s=0.3))
+    host, ports, store = _host(config=VoiceConfig(conv_idle_s=FEEDER_IDLE_S))
     feeder = Feeder(ports.audio_in)
     try:
         await asyncio.wait_for(host.start_now(), WAIT_S)
@@ -160,7 +165,7 @@ async def test_mute_keeps_the_session_open_and_sends_nothing_until_unmuted():
 
 async def test_a_muted_session_ends_when_the_mute_hold_runs_out(monkeypatch):
     monkeypatch.setattr(host_mod, "MUTE_HOLD_S", 0.3)
-    host, ports, store = _host(config=VoiceConfig(conv_idle_s=0.1))
+    host, ports, store = _host(config=VoiceConfig(conv_idle_s=FEEDER_IDLE_S))
     feeder = Feeder(ports.audio_in)
     try:
         sid = await asyncio.wait_for(host.start_now(), WAIT_S)

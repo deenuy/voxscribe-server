@@ -240,6 +240,50 @@ async def prerender_phrase(text: str, *, voice: str = _SAY_VOICE) -> Path | None
         return None
 
 
+def _line_cache_path(text: str, voice: str, speed: float) -> Path:
+    key = hashlib.sha1(f"kokoro:{voice}:{speed:.2f}:{text}".encode()).hexdigest()[:16]
+    return _PHRASES_DIR / f"line-{key}.wav"
+
+
+async def prerender_line(text: str, *, voice: str = "", speed: float = 1.0) -> Path | None:
+    """Pre-render a fixed line in the reply voice (Kokoro, `voice` at `speed`; macOS say when
+    Kokoro is unavailable), into the phrase cache beside the say-rendered phrases. Idempotent:
+    the cached file is returned when it exists. Used for the lines the assistant says on its own
+    (thinking lines, farewells: app/local/voice/expression.py), so they sound like its replies."""
+    path = _line_cache_path(text, voice or _KOKORO_VOICE, speed)
+    if path.exists():
+        return path
+    samples = await synthesize(text, voice=voice or _KOKORO_VOICE, speed=speed)
+    if samples is None:
+        return None
+    try:
+        import numpy as np
+
+        _PHRASES_DIR.mkdir(parents=True, exist_ok=True)
+        pcm = (np.clip(np.asarray(samples, dtype="float32"), -1.0, 1.0) * 32767).astype("<i2")
+        tmp = path.with_suffix(".tmp")
+        with wave.open(str(tmp), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(_PLAYBACK_RATE_HZ)
+            wf.writeframes(pcm.tobytes())
+        tmp.replace(path)
+        log.info("tts_engine: pre-rendered line len=%d -> %s", len(text), path.name)
+        return path
+    except Exception:
+        log.exception("tts_engine: line prerender failed len=%d", len(text))
+        return None
+
+
+async def load_line(text: str, *, voice: str = "", speed: float = 1.0):
+    """A fixed line in the reply voice, from the phrase cache (rendered on first use). None when
+    it cannot be rendered or read."""
+    path = await prerender_line(text, voice=voice, speed=speed)
+    if path is None:
+        return None
+    return await _read_prerendered(path)
+
+
 async def load_phrase(text: str, *, voice: str = _SAY_VOICE):
     """A fixed phrase as float32 mono at _PLAYBACK_RATE_HZ, from the pre-render cache.
 

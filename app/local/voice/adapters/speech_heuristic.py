@@ -18,6 +18,13 @@ class HeuristicSpeech:
         self._td = None
         self._voice = None
         self._pause_s = pause_s
+        self._room = None
+
+    def set_room(self, pcm_float32_mono: np.ndarray | None) -> None:
+        """The room as it sounds when nobody speaks, for the detector to settle on at the next
+        reset() (end_of_turn.TurnDetector._settle). None: settle on silence."""
+        self._room = None if pcm_float32_mono is None else np.asarray(pcm_float32_mono,
+                                                                      dtype=np.float32)
 
     def set_pause(self, pause_s: float | None) -> None:
         """The end-of-turn pause for the next turn (the product profile's pace). Takes effect at
@@ -32,7 +39,7 @@ class HeuristicSpeech:
             from app.local.end_of_turn import TurnDetector
 
             self._td = TurnDetector(self._pause_s)
-        self._td.reset()
+        self._td.reset(self._room)
 
     def process(self, pcm_float32_mono: np.ndarray) -> list[TurnDecision]:
         x = np.asarray(pcm_float32_mono)

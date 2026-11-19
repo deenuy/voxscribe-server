@@ -1,5 +1,33 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.11.0
+
+Release of 2026-11-19. Uses voxscribe-core 0.6.0. No database migration.
+
+### New Features
+- Added a natural spoken style for personal and IdeaScribe modes, making the assistant answer the way a person talks instead of reading out stock assistant phrases.
+- Added brief reactions such as "Oh", "Ah" or "Hmm" at the start of a reply when they fit, never the same one twice in a row.
+- Added a short thinking line such as "Let me see" when a reply is slow to start, so a pause never sounds like the assistant stopped listening.
+- Added spoken endings, making it possible to finish a conversation by saying "that's all", "I'm done", "bye" or "stop" and hear a short farewell.
+- Added an audition command that plays every reaction, thinking line and farewell, making it easy to hear each one and remove any that sound wrong.
+- Added a setting to choose the plain or natural spoken style per device, with senior care and classroom staying plain by default.
+
+### UX Improvements
+- Improved pronunciation of "mm-hmm", "mhm", "mm" and "aww" so the voice no longer spells them out letter by letter.
+- Improved interruptions so that saying "stop" or "wait" while the assistant is talking silences it and keeps the conversation open.
+- Improved the first reply in a conversation so captions appear only for speech the assistant actually used.
+
+### Bug Fixes
+- Fixed the first reply of a conversation waiting up to eight seconds after the person had finished speaking.
+- Fixed long first questions being cut off before the person finished.
+- Fixed the end of the listening chime being heard as the person's speech.
+- Fixed a single word or a burst of noise ending the whole conversation.
+- Prevented a loud room from keeping a conversation open indefinitely when nobody is speaking.
+
+### Changed
+- Background noise no longer extends how long the assistant waits for the next turn; only recognised speech does.
+- In natural style, the short "hm" sound before every reply is replaced by a thinking line that plays only when a reply is late.
+
 ## What's New in VoxScribe Server 0.10.0
 
 Baseline release of 2026-11-19. Uses voxscribe-core 0.6.0. Starting this version applies migrations
