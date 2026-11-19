@@ -187,7 +187,8 @@ async def start_session(request: Request):
     host = _host(request)
     _require_device_control(request, host)
     if host is None or getattr(request.app.state, "audio_engine", None) is None:
-        raise EngineError("voice_unavailable", "the voice assistant is not running on this engine", 503)
+        # Not a server failure: this engine was started without the voice assistant.
+        raise EngineError("voice_unavailable", "the voice assistant is not running on this engine", 409)
     try:
         _bind_caller(request, host)
         mid = await host.start_now()
