@@ -263,6 +263,29 @@ class Summary(BaseModel):
     promptVersion: str | None = None
 
 
+class SummaryJobResponse(BaseModel):
+    """POST /summary/regenerate: the run writing the summary (a new one, or the one already in progress)."""
+
+    jobId: str
+
+
+class PipelineStep(BaseModel):
+    """One step after Stop. `reason` is a short code (app/local/pipeline.py REASONS), never model or transcript text:
+    queued, recording, not_started, too_short, no_speech, model_unavailable, model_timeout, model_error,
+    unusable_output, edited_by_hand, summary_failed, not_generated, interrupted. Null when there is nothing to add."""
+
+    step: Literal["transcript", "summary", "tasks"]
+    state: Literal["working", "ready", "failed", "skipped"]
+    reason: str | None = None
+
+
+class PipelineResponse(BaseModel):
+    """GET /v1/meetings/{id}/pipeline: every step, in order (transcript, summary, tasks)."""
+
+    meetingId: str
+    steps: list[PipelineStep]
+
+
 # ============================================================================
 # Sources (Knowledge)
 # ============================================================================

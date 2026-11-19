@@ -10,7 +10,7 @@ import asyncio
 import logging
 from contextlib import nullcontext
 
-from . import meeting_bus, tenancy
+from . import meeting_bus, pipeline, tenancy
 from .store_meetings import MeetingStore
 
 log = logging.getLogger(__name__)
@@ -20,10 +20,21 @@ _tenant_of: dict[asyncio.Task, str | None] = {}     # whose meeting each running
 
 
 async def finalize_meeting(app, meeting_id: str) -> None:
-    store = MeetingStore(app.state.store.pool)
+    """Every segment is stored when this runs (the live socket and the voice store call it after the last flush),
+    so the transcript step is ready here, and the summary and tasks steps are queued behind it (pipeline.py)."""
+    pool = app.state.store.pool
+    store = MeetingStore(pool)
+    own = None
+    if pipeline.running(meeting_id, "summary") is None:     # a direct call: schedule_finalize registers its own
+        own = pipeline.start_run(meeting_id, "summary")
     try:
+        spoken = any(s.text and s.text.strip() for s in await store.get_transcript(meeting_id))
+        await pipeline.report(pool, meeting_id, "transcript", *((pipeline.READY, None) if spoken
+                                                               else (pipeline.SKIPPED, pipeline.NO_SPEECH)))
         # Immediately mark summary as pending so the client sees a defined status.
         await store.set_summary_pending(meeting_id)
+        await pipeline.report(pool, meeting_id, "summary", pipeline.WORKING, pipeline.QUEUED)
+        await pipeline.report(pool, meeting_id, "tasks", pipeline.WORKING, pipeline.QUEUED)
         providers = getattr(app.state, "providers", {})
         llm = providers.get("llm")
         if llm:
@@ -35,8 +46,13 @@ async def finalize_meeting(app, meeting_id: str) -> None:
             await SummaryService(store, llm).generate_summary(meeting_id)
         else:
             await store.set_summary_status(meeting_id, "unavailable")
+            await pipeline.report(pool, meeting_id, "summary", pipeline.FAILED, pipeline.MODEL_UNAVAILABLE)
+            await pipeline.report(pool, meeting_id, "tasks", pipeline.SKIPPED, pipeline.MODEL_UNAVAILABLE)
     except Exception:
         log.error("Finalization failed for meeting %s", meeting_id, exc_info=True)
+    finally:
+        if own is not None:
+            pipeline.end_run(meeting_id, "summary", own)
     try:
         await store.mark_done(meeting_id)
         await meeting_bus.publish(meeting_id, "status", {"state": "done"})
@@ -46,6 +62,7 @@ async def finalize_meeting(app, meeting_id: str) -> None:
 
 def schedule_finalize(app, meeting_id: str) -> asyncio.Task:
     task = asyncio.create_task(finalize_meeting(app, meeting_id))
+    pipeline.start_run(meeting_id, "summary", task)          # a regenerate request from now on attaches to it
     _running.add(task)
     _tenant_of[task] = tenancy.current_tenant()
     task.add_done_callback(_running.discard)

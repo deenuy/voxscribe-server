@@ -109,6 +109,9 @@ _ERRORS: list[dict] = [
     {"code": "voice_session_in_progress", "status": 409, "detail": "a voice session is already running"},
     {"code": "voice_unavailable", "status": 409, "detail": "this engine was started without the voice assistant"},
     {"code": "session_in_progress",  "status": 409, "detail": "a session is already in progress"},
+    # summary and tasks (the steps after Stop)
+    {"code": "summary_edited",       "status": 409, "detail": "the summary was edited by hand; regenerating needs overwriteEdits: true"},
+    {"code": "model_timeout",        "status": 504, "detail": "the on-device AI did not answer in time; try again"},
     # assistant profile
     {"code": "assistant_field_fixed", "status": 400, "detail": "the assistant setting is fixed for this engine or product mode and cannot be changed"},
     # uploads

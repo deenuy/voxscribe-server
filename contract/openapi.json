@@ -1161,6 +1161,69 @@
         "title": "NotesRequest",
         "type": "object"
       },
+      "PipelineResponse": {
+        "description": "GET /v1/meetings/{id}/pipeline: every step, in order (transcript, summary, tasks).",
+        "properties": {
+          "meetingId": {
+            "title": "Meetingid",
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/PipelineStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "meetingId",
+          "steps"
+        ],
+        "title": "PipelineResponse",
+        "type": "object"
+      },
+      "PipelineStep": {
+        "description": "One step after Stop. `reason` is a short code (app/local/pipeline.py REASONS), never model or transcript text:\nqueued, recording, not_started, too_short, no_speech, model_unavailable, model_timeout, model_error,\nunusable_output, edited_by_hand, summary_failed, not_generated, interrupted. Null when there is nothing to add.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "working",
+              "ready",
+              "failed",
+              "skipped"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "step": {
+            "enum": [
+              "transcript",
+              "summary",
+              "tasks"
+            ],
+            "title": "Step",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "state"
+        ],
+        "title": "PipelineStep",
+        "type": "object"
+      },
       "PowerEvent": {
         "properties": {
           "event": {
@@ -1238,6 +1301,20 @@
           "liveUrl"
         ],
         "title": "StartMeetingResponse",
+        "type": "object"
+      },
+      "SummaryJobResponse": {
+        "description": "POST /summary/regenerate: the run writing the summary (a new one, or the one already in progress).",
+        "properties": {
+          "jobId": {
+            "title": "Jobid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "jobId"
+        ],
+        "title": "SummaryJobResponse",
         "type": "object"
       },
       "TicketRequest": {
@@ -4192,6 +4269,49 @@
         ]
       }
     },
+    "/v1/meetings/{meeting_id}/pipeline": {
+      "get": {
+        "description": "The steps after Stop as they stand: transcript, summary and tasks, each `working`, `ready`, `failed` or\n`skipped` with a reason code (or null). The same states the `meeting.pipeline` event carries, read from what is\nstored, so a screen opened later shows the truth without waiting for an event.",
+        "operationId": "get_pipeline_v1_meetings__meeting_id__pipeline_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "meeting_id",
+            "required": true,
+            "schema": {
+              "title": "Meeting Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Pipeline",
+        "tags": [
+          "meetings"
+        ]
+      }
+    },
     "/v1/meetings/{meeting_id}/start": {
       "post": {
         "description": "Start recording a meeting.",
@@ -4331,7 +4451,7 @@
     },
     "/v1/meetings/{meeting_id}/summary/regenerate": {
       "post": {
-        "description": "Regenerate the summary for a meeting.\n\nReturns 202 Accepted if the provider is available.\nReturns 503 Provider Unavailable if the LLM provider is down.\nReturns 409 `summary_edited` when a person wrote or changed the summary: regenerating replaces their words, so it\nneeds a body of `{\"overwriteEdits\": true}`.",
+        "description": "Write the summary again (and then draft tasks again), in the background.\n\n202 `{jobId}`. While a summary is being written (after Stop, or by an earlier request) this attaches to that\nrun instead of starting another: the same 202 with that run's jobId, and the pipeline's summary step is\npublished again as it stands (working). 409 `summary_edited` when a person wrote or changed the summary:\nregenerating replaces their words, so it needs a body of `{\"overwriteEdits\": true}`. 503 when the on-device AI\nis not available. Progress is the `meeting.pipeline` event and GET /pipeline.",
         "operationId": "regenerate_summary_v1_meetings__meeting_id__summary_regenerate_post",
         "parameters": [
           {
@@ -4345,10 +4465,12 @@
           }
         ],
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SummaryJobResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -4455,7 +4577,7 @@
     },
     "/v1/meetings/{meeting_id}/tasks/generate": {
       "post": {
-        "description": "Draft tasks from the transcript (and the scribe's project, when it has one).\n\nAdds only titles the scribe does not have yet, so it is safe to run again: tasks that are done, edited or written\nby hand are never touched or repeated. Answers `{created, skipped}`. 409 until the scribe has finished and has a\ntranscript; 503 when the AI is not running; 502 when its answer cannot be used (try again).",
+        "description": "Draft tasks from the transcript (and the scribe's project, when it has one).\n\nAdds only titles the scribe does not have yet, so it is safe to run again: tasks that are done, edited or written\nby hand are never touched or repeated. Answers `{created, skipped}`. 409 until the scribe has finished and has a\ntranscript; 503 when the AI is not running; 502 when its answer cannot be used; 504 `model_timeout` when it does\nnot answer in time (try again). The tasks step of the pipeline shows working, then ready or failed with its\nreason, so this is also how a failed step is retried.",
         "operationId": "generate_tasks_v1_meetings__meeting_id__tasks_generate_post",
         "parameters": [
           {
