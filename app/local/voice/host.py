@@ -630,6 +630,12 @@ class SessionContext:
     played_text: str = ""          # what the user heard of it
     pre_roll: np.ndarray | None = None   # the interjection's start, captured during the reply
     held_empty: bool = False       # one wordless turn after a barge-in did not end the session
+    seq: int = 0                   # sequence number of the last event the session published
+
+    def next_seq(self) -> int:
+        """The sequence number for the session's next event: 1, 2, 3, ... with no gap."""
+        self.seq += 1
+        return self.seq
 
     @property
     def tenant(self) -> str | None:
@@ -726,7 +732,7 @@ class VoiceHost:
 
     @classmethod
     def from_app(cls, app) -> VoiceHost:
-        from app.local.voice.adapters.events_app import publish_broadcast
+        from app.local.voice.adapters.events_app import publish as publish_event
         from app.local.voice.adapters.scope import TenantSessionScope
 
         profile = getattr(getattr(app, "state", None), "profile", None)
@@ -738,7 +744,7 @@ class VoiceHost:
         # The device starts with no tenant. With isolation on it stays off until a verified
         # person binds it (routers/wake.py); with isolation off there is no tenant to wait for.
         scope = TenantSessionScope(app)
-        return cls(config, build=lambda: build_ports(app), publish=publish_broadcast,
+        return cls(config, build=lambda: build_ports(app), publish=publish_event,
                    scope=scope, binding=scope.device_binding())
 
     # ------------------------------------------------------------------ state
@@ -809,14 +815,14 @@ class VoiceHost:
             raise SessionTenantRequiredError(
                 "tenant isolation is on and no tenant is bound to the voice host")
         self.set_state(WakeState.ARMED)
-        self._publish("wake_state", self.snapshot())
+        self._publish_device("wake_state", self.snapshot())
         return True
 
     def disarm(self) -> bool:
         if self.state == WakeState.OFF:
             return False
         self.set_state(WakeState.OFF)
-        self._publish("wake_state", self.snapshot())
+        self._publish_device("wake_state", self.snapshot())
         return True
 
     @property
@@ -824,7 +830,24 @@ class VoiceHost:
         return self.ports is not None
 
     def _publish_state(self, state: WakeState) -> None:
-        self._publish("wake_state", self.snapshot() | {"state": state.value})
+        self._publish_device("wake_state", self.snapshot() | {"state": state.value})
+
+    def _publish_device(self, kind: str, data: dict) -> None:
+        """Publish an event about the device rather than a session (wake_state, capture_health).
+
+        The device works for one tenant at a time, so its events go to that tenant: they are
+        published in the binding's scope, whichever scope the caller is in (a request to arm or
+        disarm, the capture watchdog, the host's own loop). With a tenant required and nobody
+        bound there is nobody to tell, and nothing is published. A device event is no session's,
+        even when published from inside one, so it never takes a session's sequence number."""
+        if not self.bound:
+            return
+        token = _session.set(None)
+        try:
+            with self._scope.bound(self._binding):
+                self._publish(kind, data)
+        finally:
+            _session.reset(token)
 
     def _play_cue(self, path: str) -> asyncio.Task:
         """Play a cue as a background task. The AudioOut adapter mutes capture for the cue and
@@ -869,7 +892,7 @@ class VoiceHost:
                 except SessionTenantRequiredError as exc:
                     log.warning("voice host: not arming: %s", exc)
                     self.set_state(WakeState.OFF)
-                    self._publish("wake_state", self.snapshot())
+                    self._publish_device("wake_state", self.snapshot())
                 except Exception:
                     log.exception("voice host: crashed -- resetting in %.0f s", CRASH_RESET_S)
                     self.set_state(WakeState.ERROR)
@@ -1639,5 +1662,5 @@ class VoiceHost:
         elif event.action == "reopen_failed":
             log.warning("voice host: capture reopen failed issue=%s; watchdog will retry",
                         event.issue)
-        self._publish("capture_health", {"issue": event.issue, "action": event.action,
+        self._publish_device("capture_health", {"issue": event.issue, "action": event.action,
                                          "value": event.value})
