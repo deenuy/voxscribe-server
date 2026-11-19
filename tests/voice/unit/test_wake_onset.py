@@ -113,6 +113,9 @@ def test_an_unsure_name_is_accepted_only_when_an_unprimed_pass_hears_it_too():
 
 def test_the_unprimed_pass_must_hear_the_name_itself():
     assert hears_name(words("hey vox"), "hey vox") and hears_name(words("k voks"), "hey vox")
+    # A speaker whose v and w are one sound: the unprimed pass writes the nearest common word.
+    for same_sound in ("hey walks", "hey wox how are you", "hey wax", "Hey, Walks."):
+        assert hears_name(words(same_sound), "hey vox")
     for other in ("hey folks", "hey box", "hey fox", "hey max", "hey von", "hey bots"):
         assert not hears_name(words(other), "hey vox")
 
@@ -190,3 +193,11 @@ def test_the_default_detector_is_the_hybrid_and_works_without_the_spotter_model(
     det = wake_setup.make_detector(transcribe=Recognizer("Hey Vox"))
     assert det.model_name == "hybrid:hey_vox" and det.patience_frames == 1
     assert callable(det.confirm)
+
+
+def test_a_speaker_whose_v_is_heard_as_w_still_wakes_it():
+    """Measured on the owner's voice: the primed pass writes the phrase with almost no confidence
+    in the name, and the unprimed pass writes "hey walks"."""
+    rec = Recognizer("Hey Vox how are you", unprimed="hey walks how are you", confidence=0.002)
+    _, scores = detector(rec, QUIET + TALK + QUIET)
+    assert scores.count(DETECTED_SCORE) == 1

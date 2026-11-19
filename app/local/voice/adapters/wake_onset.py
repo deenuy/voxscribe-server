@@ -111,16 +111,33 @@ def starts_with_phrase(words: Sequence[WordTiming], phrase: str = ASR_CONFIRM_PH
     return phrase_start_confidence(words, phrase) is not None
 
 
+# Letters one speaker's v is another recognizer's w: many speakers do not separate the two sounds,
+# and an unprimed recognizer then writes an unfamiliar name as the nearest common word that begins
+# with the other letter ("walks" for "vox": measured on the owner's voice, 2026-11-19, where the
+# primed pass wrote the phrase every time and the unprimed pass wrote "walks" ten times in twelve).
+# Voicing pairs (f for v) are not here: "fox" and "folks" are what the second pass exists to refuse.
+_SAME_ONSET = (frozenset("vw"),)
+
+
+def _same_onset(a: str, b: str) -> bool:
+    return a == b or any(a in group and b in group for group in _SAME_ONSET)
+
+
+def _sounds_like(heard: str, want: str) -> bool:
+    """The same sounds, with an onset the speaker may not distinguish from the name's."""
+    return bool(heard) and _same_onset(heard[0], want[0]) and phonetic_key(heard) == phonetic_key(want)
+
+
 def hears_name(words: Sequence[WordTiming], phrase: str = ASR_CONFIRM_PHRASE) -> bool:
-    """True when any word is the phrase's name (its last word) by sound and first letter, or the
-    whole phrase written as one word. For the unprimed second pass, which has no reason to write
-    the name unless it was said."""
+    """True when any word is the phrase's name (its last word) by sound, or the whole phrase
+    written as one word. For the unprimed second pass, which has no reason to write the name, or
+    its nearest common word, unless it was said."""
     want = _phrase_words(phrase)
     if not want:
         return False
     joined = "".join(want)
-    return any(_same_word(t, want[-1]) or (len(want) > 1 and len(t) > len(want[-1])
-                                           and _same_word(t, joined))
+    return any(_sounds_like(t, want[-1]) or (len(want) > 1 and len(t) > len(want[-1])
+                                             and _sounds_like(t, joined))
                for t in _tokens(words))
 
 
@@ -268,13 +285,20 @@ class OnsetPhraseDetector:
         try:
             words = list(self._decode(window))
             confidence = phrase_start_confidence(words, self.phrase)
-            if confidence is None:
-                return False
-            if confidence < NAME_CONFIDENCE and not hears_name(self._decode(window, primed=False),
-                                                               self.phrase):
-                return False
+            second = None
+            if confidence is not None and confidence < NAME_CONFIDENCE:
+                second = hears_name(self._decode(window, primed=False), self.phrase)
         except Exception as exc:  # noqa: BLE001 - a recognizer failure is no candidate, never a wake
             log.warning("wake onset check failed: %s", type(exc).__name__)
+            return False
+        hit = confidence is not None and (confidence >= NAME_CONFIDENCE or bool(second))
+        # What the check decided, never what was said: counts, a confidence and two verdicts.
+        log.info("wake onset check: pass=%d speech_s=%.2f words=%d begins_with_phrase=%s "
+                 "name_confidence=%s unprimed_hears_name=%s candidate=%s",
+                 self._checks, self._speech_s, len(words), confidence is not None,
+                 "n/a" if confidence is None else f"{confidence:.3f}",
+                 "n/a" if second is None else second, hit)
+        if not hit:
             return False
         self._last = (self._seen, int(window.shape[0]), words)
         return True

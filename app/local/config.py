@@ -181,6 +181,9 @@ class Config:
     voice_max_reply_seconds: int = 20
     voice_mode: str = "default"          # default | classroom | seniorcare
     voice_reply_model: str = "llama3.2"  # 3B-4B class for spoken replies
+    # How long a person may pause before the assistant takes its turn, in seconds
+    # (VOXSCRIBE_END_OF_TURN_PAUSE_S). Unset: the product profile's value.
+    end_of_turn_pause_s: float | None = None
 
     # Wake word — any phrase, no model training required (VOXSCRIBE_WAKE_PHRASE)
     wake_phrase: str = "hey vox"
@@ -418,6 +421,16 @@ class Config:
             if voice_mode not in ("default", "classroom", "seniorcare"):
                 _fail("VOXSCRIBE_VOICE_MODE", f"must be default|classroom|seniorcare, got {voice_mode!r}")
             config_dict["voice_mode"] = voice_mode
+
+        pause_raw = env_vars.get("VOXSCRIBE_END_OF_TURN_PAUSE_S", "").strip()
+        if pause_raw:
+            try:
+                pause_value = float(pause_raw)
+            except ValueError:
+                _fail("VOXSCRIBE_END_OF_TURN_PAUSE_S", f"must be a number of seconds, got {pause_raw!r}")
+            if not 0.3 <= pause_value <= 60.0:
+                _fail("VOXSCRIBE_END_OF_TURN_PAUSE_S", f"must be between 0.3 and 60, got {pause_raw!r}")
+            config_dict["end_of_turn_pause_s"] = pause_value
 
         voice_reply_model = env_vars.get("VOXSCRIBE_VOICE_REPLY_MODEL", "").strip()
         if voice_reply_model:

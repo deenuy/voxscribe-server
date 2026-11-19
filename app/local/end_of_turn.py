@@ -36,11 +36,39 @@ log = logging.getLogger("app.local.end_of_turn")
 
 _SAMPLE_RATE  = 16_000
 _CHUNK_FRAMES = 512
+_SETTLE_FRAMES = 25             # 0.8 s of silence through a reset detector before a turn's audio
 _BYTES_PER_FRAME = 2  # PCM16LE
 # A correct caller is within one frame of the audio it fed; a minute apart means another clock.
 _CLOCK_SKEW_LIMIT_MS = 60_000
 
 __all__ = ["ClockDomainError", "TurnDetector"]
+
+
+# How long a person may pause before their turn is taken to be over.
+#
+# The kernel's own bands are for dictation and for speakers who think aloud: a finished sentence
+# closes the turn only after six seconds of silence, and an unfinished one holds for thirty. That is
+# right for a companion that must never cut an elder off. It is wrong for a conversation with an
+# assistant: nobody waits six seconds for an answer, they ask again, the silence never comes, and
+# the turn never closes (the owner's first test, 2026-11-19). So the pace is the product's choice:
+# a pause at or above PATIENT_PAUSE_S keeps the kernel's bands; a shorter one scales them, and a
+# sentence that still looks unfinished gets UNFINISHED_EXTRA_MS more before it is taken anyway.
+PATIENT_PAUSE_S = 6.0
+UNFINISHED_EXTRA_MS = 1600.0
+_MIN_PAUSE_MS = 300.0
+
+
+def turn_pacing(pause_s: float | None):
+    """(PauseBandConfig, TurnTakingConfig) for an end-of-turn pause of `pause_s` seconds."""
+    from voxscribe.silence_policy import PauseBandConfig
+    from voxscribe.turn_taking import TurnTakingConfig
+
+    if pause_s is None or pause_s >= PATIENT_PAUSE_S:
+        return PauseBandConfig(), TurnTakingConfig()
+    extended = max(_MIN_PAUSE_MS, float(pause_s) * 1000.0)
+    bands = PauseBandConfig(short_ms=min(400.0, extended * 0.3), long_ms=extended * 0.6,
+                            extended_ms=extended)
+    return bands, TurnTakingConfig(hold_cap_ms=extended + UNFINISHED_EXTRA_MS)
 
 
 class TurnDetector:
@@ -50,7 +78,7 @@ class TurnDetector:
     push PCM16 frames with push_pcm16(); check the returned TurnDecision.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, pause_s: float | None = None) -> None:
         try:
             import numpy as np
             from voxscribe.speech.heuristic import HeuristicDetector
@@ -64,10 +92,16 @@ class TurnDetector:
         self._np = np
         self._detector = HeuristicDetector()
         self._tracker = SpeechActivityTracker(TURN)
-        self._adapter = SpeechTurnAdapter(silence_offset_ms=TURN.hangover_ms)
+        bands, turns = turn_pacing(pause_s)
+        self._adapter = SpeechTurnAdapter(pause_config=bands, turn_config=turns,
+                                          silence_offset_ms=TURN.hangover_ms)
+        self.pause_s = pause_s
         self._now_ms: int = 0
         self._samples_fed: int = 0
-        log.info("end_of_turn: TurnDetector initialized (heuristic detector, TURN policy)")
+        self._settle_ms: int = 0
+        log.info("end_of_turn: TurnDetector initialized (heuristic detector, TURN policy, "
+                 "closes a finished turn after %d ms of silence, an unfinished one after %d ms)",
+                 int(bands.extended_ms), int(turns.hold_cap_ms))
 
     @property
     def stream_ms(self) -> int:
@@ -81,7 +115,23 @@ class TurnDetector:
         self._adapter.reset()
         self._now_ms = 0
         self._samples_fed = 0
+        self._settle()
         log.debug("end_of_turn: reset")
+
+    def _settle(self) -> None:
+        """Let the detector find its footing before the turn's audio arrives.
+
+        A freshly reset detector does not report speech that begins in its first half second or
+        so. A turn opened by a wake phrase begins with speech at once: the words said right after
+        the phrase ("hey vox, how are you") are the first audio the turn is given. Without this,
+        that turn was never seen to open, so it never closed and the person was never answered
+        (measured 2026-11-19: no start reported for speech in the first 0.3 s after a reset).
+        The settling audio is silence and belongs to no turn; the time it takes is kept so the
+        host's stream clock and the detector's own timeline still agree in tick()."""
+        quiet = self._np.zeros(_CHUNK_FRAMES, dtype="float32")
+        for _ in range(_SETTLE_FRAMES):
+            self._detector.process(quiet)
+        self._settle_ms = _SETTLE_FRAMES * _CHUNK_FRAMES * 1000 // _SAMPLE_RATE
 
     def push_pcm16(self, frame_bytes: bytes, now_ms: int) -> object | None:
         """Feed one PCM16LE frame (1024 bytes / 512 samples) and advance time.
@@ -126,7 +176,7 @@ class TurnDetector:
                 f"tick(now_ms={int(now_ms)}) is {skew_ms} ms from the {self.stream_ms} ms of audio "
                 "fed since reset(); pass stream time, not engine uptime"
             )
-        d = self._adapter.tick(now_ms)
+        d = self._adapter.tick(int(now_ms) + self._settle_ms)
         if d is not None:
             log.debug("end_of_turn: tick %s closes=%s silence_ms=%d",
                       d.action, d.closes_turn, d.silence_ms)

@@ -524,3 +524,51 @@ async def test_starting_by_hand_with_nobody_bound_is_refused_before_anything_is_
     with pytest.raises(SessionTenantRequiredError):
         await host.start_now()
     assert host.state == WakeState.OFF
+
+
+async def test_a_first_turn_whose_wait_runs_out_with_words_heard_is_answered(monkeypatch):
+    """The turn detector never closes the turn (the person kept talking, or the pause that
+    closes a turn never came), but words were heard. The wait running out is then the end of the
+    turn, not a silent close that throws the conversation away."""
+    from voxscribe.session.ports import TranscriptSegment
+
+    from .fakes import FakeDelegate, FakeSpeech
+
+    class NeverCloses(FakeSpeech):
+        def process(self, pcm_float32_mono):
+            return []
+
+    class HearsWords(FakeRecognizer):
+        def open_stream(self, session_id):
+            stream = super().open_stream(session_id)
+            text = stream.text
+            stream.pop_partials = lambda: [TranscriptSegment(id="p", text=text, start_ms=0, end_ms=320)] if text else []
+            return stream
+
+    monkeypatch.setattr(host_mod, "FIRST_TURN_WAIT_S", 0.3)
+    monkeypatch.setattr(host_mod, "FIRST_TURN_GRACE_S", 0.0)
+    monkeypatch.setattr(host_mod, "CONV_IDLE_S", 0.3)
+    delegate = FakeDelegate()
+    host = VoiceHost(VoiceConfig(end_of_turn_pause_s=0.2, conv_idle_s=0.3),
+                     ports=fake_ports(recognizer=HearsWords(["How are you?"]), speech=NeverCloses(),
+                                      delegate=delegate))
+    assert host.arm()
+    await asyncio.wait_for(host.run_session(EndlessQueue(), score=0.9), SESSION_TIMEOUT_S)
+    assert delegate.calls == ["How are you?"]
+
+
+async def test_a_first_turn_with_nothing_heard_still_closes_in_silence(monkeypatch):
+    from .fakes import FakeDelegate, FakeSpeech
+
+    class NeverCloses(FakeSpeech):
+        def process(self, pcm_float32_mono):
+            return []
+
+    monkeypatch.setattr(host_mod, "FIRST_TURN_WAIT_S", 0.3)
+    monkeypatch.setattr(host_mod, "FIRST_TURN_GRACE_S", 0.0)
+    delegate = FakeDelegate()
+    host = VoiceHost(VoiceConfig(end_of_turn_pause_s=0.2),
+                     ports=fake_ports(recognizer=FakeRecognizer([]), speech=NeverCloses(), delegate=delegate))
+    assert host.arm()
+    await asyncio.wait_for(host.run_session(EndlessQueue(), score=0.9), SESSION_TIMEOUT_S)
+    assert delegate.calls == []
