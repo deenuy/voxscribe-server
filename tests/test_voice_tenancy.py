@@ -262,7 +262,11 @@ async def test_every_connection_a_session_and_its_tasks_borrow_is_inside_the_ten
     await _settle()
 
     counts = await _counts(alice, DELEGATE_TABLES)
-    assert counts["reminders"] == 1 and counts["tool_calls"] == 1 and counts["delegate_tasks"] == 1
+    # One audit row per tool call: web.search, reminder.create and reminder.list.
+    assert counts["reminders"] == 1 and counts["tool_calls"] == 3 and counts["delegate_tasks"] == 1
+    assert sorted(await _rows(alice, "SELECT tool, status, tenant FROM {s}.tool_calls")) == [
+        ("reminder.create", "executed", alice), ("reminder.list", "executed", alice),
+        ("web.search", "executed", alice)]
     assert await _counts(alice, ("turns",)) == {"turns": len(turns)}
     assert await _counts(base, (*SESSION_TABLES, *DELEGATE_TABLES)) == dict.fromkeys(
         (*SESSION_TABLES, *DELEGATE_TABLES), 0)

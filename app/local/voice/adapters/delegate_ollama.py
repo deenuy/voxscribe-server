@@ -8,8 +8,9 @@ host passes `system_note` (voice/barge_in.py), which reaches the reply model's s
 Routing, in order, all before the reply model is called (T14/T16):
 
   fired    any reminder whose fire_at is <= now() is spoken first, then marked fired (T16)
-  reminder "remind me to X at HH:MM" / "set a timer for N minutes": store + confirm (T16)
-  list     "what reminders do I have?": read pending reminders aloud (T16)
+  reminder "remind me to X at HH:MM" / "set a timer for N minutes": reminder.create or
+           timer.start through the tool runtime; the record's line is spoken (T16, PL43)
+  list     "what reminders do I have?": reminder.list, pending reminders read aloud (T16)
   rerun    a yes to last turn's stale-result offer submits the same request again
   cancel   "cancel that", "never mind": the newest open task is cancelled, "Okay, cancelled."
   change   "actually, X", "search for X instead": the newest open task is cancelled and X
@@ -33,19 +34,20 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from datetime import UTC, datetime
 
 from voxscribe.session.ports import ReplyStream
 
 from app.local import reply_chain
 from app.local.tools import builtin
 from app.local.tools import runtime as tool_runtime
-from app.local.tools.runtime import CallContext
+from app.local.tools.runtime import CallContext, ToolResult
 from app.local.voice import delegate_lane as dl
+from app.local.voice import reminder_store as rs
 from app.local.voice.adapters.events_app import publish as publish_event
 from app.local.voice.adapters.store_postgres import PostgresDelegateTaskStore
 from app.local.voice.delegate_lane import DelegateLane, DelegateTask, IntentKind
 from app.local.voice.host import current_session
-from app.local.voice import reminder_store as rs
 
 log = logging.getLogger("app.local.voice.delegate")
 
@@ -112,20 +114,20 @@ class OllamaDelegate:
         # T16: check for fired reminders at the start of every turn.
         fired_sentences = await self._collect_fired_reminders()
 
-        # T16: reminder and timer requests are handled without the LLM.
+        # T16: reminder and timer requests are handled without the LLM, as registry tools
+        # (PL43). The line spoken is the record's: the success line only when the store
+        # committed and the receipt is written (the gate checks it, D-1, D-3); the failure or
+        # timeout line otherwise, never a confirmation (D-2).
+        ctx = CallContext(session_id=session_id, turn_id=turn_id)
         if rs.is_reminder_signal(text):
             parsed = rs.parse_reminder(text)
             if parsed is not None:
                 desc, fire_at = parsed
-                try:
-                    await self._reminder_store.add(desc, fire_at)
-                except Exception:
-                    log.exception("reminders: failed to store reminder session_id=%s",
-                                  session_id)
-                confirmation = rs.reminder_confirmation(text, desc, fire_at)
-                log.info("voice delegate: route=reminder session_id=%s", session_id)
+                outcome = await self._set_reminder(text, desc, fire_at, ctx)
+                log.info("voice delegate: route=reminder tool=%s status=%s session_id=%s",
+                         outcome.tool, outcome.status, session_id)
                 return ReplyStream(
-                    sentences=_prepend_then(fired_sentences, _each([confirmation])),
+                    sentences=_prepend_then(fired_sentences, _each([outcome.line])),
                     source="reminder",
                     cue=reply_chain.THINKING_PHRASE if text else None,
                     fallback=reply_chain.FALLBACK_PHRASE,
@@ -133,13 +135,18 @@ class OllamaDelegate:
 
         # T16: "what reminders do I have?" reads the pending list without the LLM.
         if rs.is_reminder_list_request(text):
-            try:
-                pending = await self._reminder_store.list_pending()
-            except Exception:
-                log.exception("reminders: failed to list reminders session_id=%s", session_id)
-                pending = []
-            sentences = rs.build_reminder_list_sentences(pending)
-            log.info("voice delegate: route=reminder_list session_id=%s", session_id)
+            store = self._reminder_store
+
+            async def list_pending(_args: dict) -> ToolResult:
+                pending = await store.list_pending()
+                return ToolResult(fields={"count": len(pending)}, items=tuple(pending))
+
+            outcome = await tool_runtime.call(self._app, builtin.REMINDER_LIST, {}, ctx,
+                                              list_pending)
+            sentences = (rs.build_reminder_list_sentences(list(outcome.items))
+                         if outcome.executed else [outcome.line])
+            log.info("voice delegate: route=reminder_list status=%s session_id=%s",
+                     outcome.status, session_id)
             return ReplyStream(
                 sentences=_prepend_then(fired_sentences, _each(sentences)),
                 source="reminder",
@@ -291,6 +298,28 @@ class OllamaDelegate:
             self._writes.difference_update(pending)
 
     # ------------------------------------------------------------------ T16 reminder helpers
+
+    async def _set_reminder(self, text: str, desc: str, fire_at: datetime,
+                            ctx: CallContext) -> tool_runtime.ToolOutcome:
+        """timer.start or reminder.create through the tool runtime. Both are reminder rows today;
+        the parse is unchanged. Each executor sees only the validated arguments."""
+        store = self._reminder_store
+        when = fire_at.astimezone(UTC).isoformat()
+        if rs.is_timer_request(text):
+            async def start_timer(args: dict) -> ToolResult:
+                row = await store.add(args["label"], datetime.fromisoformat(args["fire_at"]))
+                return ToolResult(fields={"timer_id": row.id}, ref=row.id)
+
+            return await tool_runtime.call(self._app, builtin.TIMER_START,
+                                           {"label": desc, "fire_at": when}, ctx, start_timer)
+
+        async def create_reminder(args: dict) -> ToolResult:
+            row = await store.add(args["text"], datetime.fromisoformat(args["fire_at"]))
+            return ToolResult(fields={"reminder_id": row.id,
+                                      "when": rs.format_local_time(row.fire_at)}, ref=row.id)
+
+        return await tool_runtime.call(self._app, builtin.REMINDER_CREATE,
+                                       {"text": desc, "fire_at": when}, ctx, create_reminder)
 
     async def _collect_fired_reminders(self) -> list[str]:
         """Return spoken sentences for any reminders that are due, and mark them fired."""
