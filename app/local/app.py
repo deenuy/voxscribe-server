@@ -1,5 +1,6 @@
 """FastAPI application setup."""
 
+import asyncio
 import hmac
 import logging
 import time
@@ -113,10 +114,22 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.warning("recovery: unfinished meetings could not be recovered: %s", exc)
 
+    # Retention sweep: start the loop after everything else is initialised so the pool is ready.
+    _retention_task = None
+    try:
+        from app.local.retention import start_retention_loop
+        _retention_task = start_retention_loop(app)
+        log.info("retention-sweep: loop started")
+    except Exception as exc:
+        log.warning("retention-sweep: could not start loop: %s", exc)
+
     log.info("engine startup: ready")
     yield
 
     # Shutdown
+    if _retention_task is not None:
+        _retention_task.cancel()
+        await asyncio.gather(_retention_task, return_exceptions=True)
     log.info("engine shutdown: stopping components")
     if getattr(app.state, "voice_host", None) is not None:
         log.info("voice-host: stopping")
@@ -167,8 +180,24 @@ async def create_app(
 
     log.info("profile: mode=%s delegate=%s", profile.mode, profile.reply.delegate)
 
-    # Create data directory
-    data_dir = Path(settings.data_dir) if settings.data_dir else Path("/tmp/voxscribe")
+    # Create data directory.
+    # The durable per-user default follows XDG_DATA_HOME on Linux/macOS:
+    # ~/.local/share/voxscribe.  We never default to a temporary directory because
+    # recordings and downloaded models placed there would vanish on reboot.
+    if settings.data_dir:
+        data_dir = Path(settings.data_dir)
+    else:
+        data_dir = Path.home() / ".local" / "share" / "voxscribe"
+        # Warn once if data exists under the old /tmp default so the owner knows
+        # where to look and can move the files manually.
+        old_tmp = Path("/tmp/voxscribe")
+        if old_tmp.exists() and any(old_tmp.iterdir()):
+            log.warning(
+                "data directory: found data at the old temporary path %s but the new default "
+                "is %s -- to keep your data, move the directory manually with: "
+                "mv %s %s",
+                old_tmp, data_dir, old_tmp, data_dir,
+            )
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # Connect to database
