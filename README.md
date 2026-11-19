@@ -202,6 +202,11 @@ migration unless the file carries a marker naming the earlier migration that sta
 -- contract: completes 021 (gate_decisions has had no writer since 021's release)
 ```
 
+The same file checks that numbers are unique and have no gap. The runner (`app/local/migrations.py`) applies every
+file whose number is not recorded in that schema's `schema_migrations`, in ascending order, and logs a warning naming
+any number it applies after a higher one, so a migration that arrives late from another branch still runs. Two
+engines or two requests migrating one schema exclude each other with the advisory lock earlier releases also take.
+
 Open contract steps:
 
 - `gate_decisions` (expanded in 021). Since 021 the engine writes the gate's ledger to `gate_records` and never writes

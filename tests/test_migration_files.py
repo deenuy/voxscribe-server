@@ -80,3 +80,12 @@ def test_the_check_ignores_words_in_comments_strings_and_function_bodies():
         "ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;\n"
     )
     assert contract_violations("030_x.sql", sql, {21}) == []
+
+
+def test_migration_numbers_are_unique_and_have_no_gap():
+    numbers = sorted(_version(p) for p in MIGRATIONS.glob("*.sql"))
+    duplicates = sorted({n for n in numbers if numbers.count(n) > 1})
+    assert not duplicates, f"two migration files share a number: {duplicates}"
+    missing = sorted(set(range(1, numbers[-1] + 1)) - set(numbers))
+    assert not missing, f"migration numbering has a gap: {missing}"
+    assert all(re.fullmatch(r"\d{3}_[a-z0-9_]+\.sql", p.name) for p in MIGRATIONS.glob("*.sql"))
