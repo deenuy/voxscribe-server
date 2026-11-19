@@ -1,0 +1,126 @@
+{
+  "auth": "ticket query parameter (from POST /v1/tickets with path=/v1/meetings/{id}/live)",
+  "clientFrames": {
+    "assist": {
+      "description": "Request a live assistance suggestion at the current offset.",
+      "schema": {
+        "type": "object"
+      }
+    },
+    "enhance": {
+      "description": "Request enhanced enrichment for the current segment.",
+      "schema": {
+        "type": "object"
+      }
+    },
+    "note": {
+      "description": "The client sends a note to attach to the meeting.",
+      "schema": {
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "pong": {
+      "description": "Response to a server ping.",
+      "schema": {
+        "properties": {
+          "t": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  "description": "The live meeting socket. Connect once a meeting is recording. The server sends typed frames; the client may send control frames.",
+  "frameEnvelope": {
+    "description": "Every frame (server and client) is a JSON object with 'type' and 'data'.",
+    "schema": {
+      "properties": {
+        "data": {
+          "type": "object"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "data"
+      ],
+      "type": "object"
+    }
+  },
+  "route": "/v1/meetings/{meeting_id}/live",
+  "serverFrames": {
+    "assist.suggestion": {
+      "description": "A live assistance suggestion.",
+      "schema": {
+        "$ref": "#/$defs/AssistSuggestion"
+      }
+    },
+    "audio.warning": {
+      "description": "Audio was dropped during recording.",
+      "schema": {
+        "$ref": "#/$defs/AudioWarning"
+      }
+    },
+    "enhanced.update": {
+      "description": "An enhanced block that was updated.",
+      "schema": {
+        "$ref": "#/$defs/EnhancedBlock"
+      }
+    },
+    "note.updated": {
+      "description": "A note block was updated.",
+      "schema": {
+        "$ref": "#/$defs/NoteUpdated"
+      }
+    },
+    "ping": {
+      "description": "Keepalive ping. The client responds with a pong frame.",
+      "schema": {
+        "properties": {
+          "t": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "reply": {
+      "description": "A spoken reply from the assistant.",
+      "schema": {
+        "$ref": "#/$defs/ReplyPayload"
+      }
+    },
+    "status": {
+      "description": "The meeting state changed.",
+      "schema": {
+        "$ref": "#/$defs/MeetingStatus"
+      }
+    },
+    "summary.ready": {
+      "description": "The meeting summary is ready.",
+      "schema": {
+        "$ref": "#/$defs/SummaryReady"
+      }
+    },
+    "transcript.partial": {
+      "description": "A transcript segment that may still change.",
+      "schema": {
+        "$ref": "#/$defs/Segment"
+      }
+    },
+    "transcript.stable": {
+      "description": "A transcript segment that will not change.",
+      "schema": {
+        "$ref": "#/$defs/Segment"
+      }
+    }
+  }
+}

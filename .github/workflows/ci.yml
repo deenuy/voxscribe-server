@@ -31,3 +31,10 @@ jobs:
 
       - name: Unit tests (no I/O)
         run: uv run pytest tests/ tests/voice/unit/ -x -q -m "not integration and not room"
+
+      - name: Contract drift check
+        run: |
+          uv run python -m contract.export --output-dir /tmp/contract-fresh
+          for f in openapi.json events.json websocket.json errors.json; do
+            diff "contract/$f" "/tmp/contract-fresh/$f" || (echo "contract/$f is out of sync. Run: uv run python -m contract.export" && exit 1)
+          done

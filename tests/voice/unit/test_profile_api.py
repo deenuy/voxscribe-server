@@ -22,11 +22,22 @@ from fastapi.testclient import TestClient
 
 def _make_app():
     """Return a minimal FastAPI app with the assistant router and profile_store."""
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
     from voxscribe.profile.schema import Profile
+    from app.local.errors import EngineError
     from app.local.voice.profile_store import AssistantProfileStore
     from app.local.routers.assistant import router
 
     app = FastAPI()
+
+    @app.exception_handler(EngineError)
+    async def engine_error_handler(request: Request, exc: EngineError):
+        return JSONResponse(
+            status_code=exc.status,
+            content={"error": exc.code, "detail": exc.detail, **exc.extra},
+        )
+
     app.include_router(router)
     app.state.profile_store = AssistantProfileStore(Profile())
     return app
@@ -64,35 +75,38 @@ def test_patch_wake_phrase(client):
 
 
 def test_patch_wake_phrase_too_short(client):
-    """Single-word wake phrase must return 422."""
+    """Single-word wake phrase must return 400 invalid_request (D18)."""
     resp = client.patch(
         "/v1/assistant/profile",
         json={"assistant": {"wake_phrase": "aria"}},
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 400
     body = resp.json()
+    assert body.get("error") == "invalid_request"
     assert "wake_phrase" in body.get("detail", "")
 
 
 def test_patch_speed_out_of_range(client):
-    """Speed 3.0 (above maximum) must return 422."""
+    """Speed 3.0 (above maximum) must return 400 invalid_request (D18)."""
     resp = client.patch(
         "/v1/assistant/profile",
         json={"assistant": {"speed": 3.0}},
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 400
     body = resp.json()
+    assert body.get("error") == "invalid_request"
     assert "speed" in body.get("detail", "")
 
 
 def test_patch_name_empty(client):
-    """Empty name (after stripping) must return 422."""
+    """Empty name (after stripping) must return 400 invalid_request (D18)."""
     resp = client.patch(
         "/v1/assistant/profile",
         json={"assistant": {"name": "   "}},
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 400
     body = resp.json()
+    assert body.get("error") == "invalid_request"
     assert "name" in body.get("detail", "")
 
 
@@ -176,12 +190,13 @@ def test_patch_speed_at_maximum_boundary(client):
 
 
 def test_patch_speed_below_minimum(client):
-    """Speed below 0.5 must return 422."""
+    """Speed below 0.5 must return 400 invalid_request (D18)."""
     resp = client.patch(
         "/v1/assistant/profile",
         json={"assistant": {"speed": 0.1}},
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 400
+    assert resp.json().get("error") == "invalid_request"
 
 
 def test_patch_preserves_unmentioned_fields(client):

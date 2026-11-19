@@ -353,6 +353,32 @@ async def create_app(
     allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
     app.add_middleware(OriginGuard, allowed=allowed_origins, enabled=lambda: app.state.identity is not None)
 
+    # Request body size limit for upload and import routes.
+    # Refused before the body is read into memory when Content-Length exceeds the limit.
+    max_upload = settings.max_upload_bytes
+    if max_upload > 0:
+        _UPLOAD_PATHS = frozenset({"/v1/meetings/import", "/v1/sources"})
+
+        @app.middleware("http")
+        async def size_limit_middleware(request: Request, call_next):
+            path = request.url.path
+            if path in _UPLOAD_PATHS or path.endswith("/notes"):
+                cl = request.headers.get("content-length")
+                if cl is not None:
+                    try:
+                        size = int(cl)
+                    except ValueError:
+                        size = 0
+                    if size > max_upload:
+                        return JSONResponse(
+                            status_code=413,
+                            content={
+                                "error": "payload_too_large",
+                                "detail": f"request body exceeds the {max_upload}-byte limit",
+                            },
+                        )
+            return await call_next(request)
+
     # CORS is added after the auth middleware so it is the OUTERMOST layer: preflight requests
     # (which cannot carry a token) and 401 responses must still get CORS headers, or a browser
     # reports every auth failure as an opaque network error. With tenant isolation on, only the

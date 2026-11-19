@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+from app.local.errors import EngineError, InvalidRequestError
+from app.local.models import AssistantProfileResponse, AssistantVoicesResponse
 
 log = logging.getLogger("app.local.routers.assistant")
 
@@ -73,7 +76,7 @@ def _profile_to_dict(profile) -> dict:
 def _get_store(request: Request):
     store = getattr(request.app.state, "profile_store", None)
     if store is None:
-        raise HTTPException(status_code=503, detail="profile store not initialised")
+        raise EngineError("service_unavailable", "profile store not initialised", 503)
     return store
 
 
@@ -89,7 +92,7 @@ def _current_tenant(request: Request):
     return tenancy.current_tenant()
 
 
-@router.get("/profile")
+@router.get("/profile", response_model=AssistantProfileResponse)
 async def get_profile(request: Request):
     """Return the current assistant profile."""
     _get_store(request)   # validate store is present
@@ -104,13 +107,13 @@ async def get_profile(request: Request):
     return JSONResponse(_profile_to_dict(view))
 
 
-@router.patch("/profile")
+@router.patch("/profile", response_model=AssistantProfileResponse)
 async def patch_profile(request: Request):
     """Merge a partial update into the current profile.
 
     Accepts a JSON body with the same shape as the profile (any subset of fields).
     Returns the full updated profile.
-    Returns 422 when any field fails validation.
+    Returns 400 when any field fails validation.
 
     Example::
         PATCH /v1/assistant/profile
@@ -123,10 +126,10 @@ async def patch_profile(request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="request body must be valid JSON")
+        raise InvalidRequestError("request body must be valid JSON")
 
     if not isinstance(body, dict):
-        raise HTTPException(status_code=422, detail="body must be a JSON object")
+        raise InvalidRequestError("body: must be a JSON object")
 
     try:
         if _has_pool(request):
@@ -137,18 +140,15 @@ async def patch_profile(request: Request):
             store = _get_store(request)
             updated = store.patch(body)
     except ProfileValidationError as exc:
-        return JSONResponse(
-            status_code=422,
-            content={"error": "invalid_request", "detail": str(exc)},
-        )
+        raise InvalidRequestError(str(exc))
     except Exception:
         log.exception("patch_profile: unexpected error")
-        raise HTTPException(status_code=500, detail="failed to update profile")
+        raise InvalidRequestError("failed to update profile")
 
     return JSONResponse(_profile_to_dict(updated))
 
 
-@router.post("/profile/reset")
+@router.post("/profile/reset", response_model=AssistantProfileResponse)
 async def reset_profile(request: Request):
     """Revert the assistant profile to the startup defaults.
 
@@ -166,7 +166,7 @@ async def reset_profile(request: Request):
     return JSONResponse(_profile_to_dict(reverted))
 
 
-@router.get("/voices")
+@router.get("/voices", response_model=AssistantVoicesResponse)
 async def list_voices():
     """Return the list of available Kokoro voice IDs.
 

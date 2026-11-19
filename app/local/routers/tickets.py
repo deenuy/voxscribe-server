@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.local import tickets
 from app.local.errors import InvalidRequestError
+from app.local.models import TicketResponse
 
 router = APIRouter(prefix="/v1", tags=["tickets"])
 
@@ -18,7 +19,7 @@ class TicketRequest(BaseModel):
     path: str = Field(min_length=1, max_length=200)
 
 
-@router.post("/tickets", status_code=201)
+@router.post("/tickets", status_code=201, response_model=TicketResponse)
 async def issue_ticket(body: TicketRequest, request: Request, response: Response):
     if not tickets.ticketable(body.path):
         raise InvalidRequestError("path: tickets are issued only for /v1/events and /v1/meetings/{id}/live")

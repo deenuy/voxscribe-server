@@ -403,9 +403,7 @@ class ModelsListResponse(BaseModel):
     models: list[Model]
 
 
-class ModelProgressEvent(BaseModel):
-    event: str = "model.progress"
-    model: Model
+# (ModelProgressEvent removed; use event_schema.STREAM_EVENTS["model.progress"])
 
 
 # ============================================================================
@@ -481,32 +479,33 @@ class Settings(BaseModel):
 
 
 # ============================================================================
-# Live WebSocket events
+# Live WebSocket events (server-to-client frames)
+# These match the frames sent by routers/live.py _to_frame and direct sends.
 # ============================================================================
 
 
-class LiveEventStatus(BaseModel):
-    type: str = "status"
+class LiveFrameStatus(BaseModel):
+    type: Literal["status"]
     state: Literal["recording", "processing", "done"]
 
 
-class LiveEventTranscriptPartial(BaseModel):
-    type: str = "transcript.partial"
+class LiveFrameTranscriptPartial(BaseModel):
+    type: Literal["transcript.partial"]
     segment: Segment
 
 
-class LiveEventTranscriptStable(BaseModel):
-    type: str = "transcript.stable"
+class LiveFrameTranscriptStable(BaseModel):
+    type: Literal["transcript.stable"]
     segment: Segment
 
 
-class LiveEventEnhancedUpdate(BaseModel):
-    type: str = "enhanced.update"
+class LiveFrameEnhancedUpdate(BaseModel):
+    type: Literal["enhanced.update"]
     block: EnhancedBlock
 
 
-class LiveEventAssistSuggestion(BaseModel):
-    type: str = "assist.suggestion"
+class LiveFrameAssistSuggestion(BaseModel):
+    type: Literal["assist.suggestion"]
     id: str
     offsetMs: int
     question: str
@@ -514,28 +513,41 @@ class LiveEventAssistSuggestion(BaseModel):
     citations: list[Citation]
 
 
-class LiveEventSummaryReady(BaseModel):
-    type: str = "summary.ready"
+class LiveFrameSummaryReady(BaseModel):
+    type: Literal["summary.ready"]
 
 
-class LiveEventError(BaseModel):
-    type: str = "error"
+class LiveFrameError(BaseModel):
+    type: Literal["error"]
     code: str
     detail: str
 
 
-class LiveEventPong(BaseModel):
-    type: str = "pong"
+class LiveFramePong(BaseModel):
+    type: Literal["pong"]
 
 
-# ============================================================================
-# Events stream (SSE)
-# ============================================================================
+# Client-to-server text frames
+class LiveClientNote(BaseModel):
+    type: Literal["note"]
+    blockId: str
+    text: str
+    offsetMs: int
 
 
-class SourceUpdateEvent(BaseModel):
-    event: str = "source.update"
-    source: Source
+class LiveClientAssist(BaseModel):
+    type: Literal["assist"]
+    enabled: bool
+
+
+class LiveClientEnhance(BaseModel):
+    type: Literal["enhance"]
+    live: bool
+    style: Literal["standard", "concise"]
+
+
+class LiveClientPing(BaseModel):
+    type: Literal["ping"]
 
 
 # ============================================================================
@@ -565,9 +577,7 @@ class GoogleConnectorPutRequest(BaseModel):
     scopes: list[str]
 
 
-class ConnectorTokenNeededEvent(BaseModel):
-    event: str = "connector.token_needed"
-    connector: str
+# (ConnectorTokenNeededEvent removed; use event_schema.STREAM_EVENTS["connector.token_needed"])
 
 
 # ============================================================================
@@ -644,3 +654,83 @@ class ResscoreIdeaRequest(BaseModel):
 
 class HandoffIdeaRequest(BaseModel):
     target: str
+
+
+# ============================================================================
+# Wake route responses
+# ============================================================================
+
+
+class WakeStateResponse(BaseModel):
+    state: Literal["armed", "listening", "off", "error"]
+    model: str | None = None
+    phrase: str | None = None
+    trigger: str | None = None
+    meeting_id: str | None = None
+    bound_to_caller: bool = False
+
+
+class WakeArmResponse(BaseModel):
+    state: Literal["armed", "listening", "off", "error"]
+    changed: bool
+
+
+class WakeProfileResponse(BaseModel):
+    mode: str
+    delegate: str
+    quiet_hours_enabled: bool
+
+
+class WakeTriggerResponse(BaseModel):
+    triggered: bool
+    state: str
+    meeting_id: str | None = None
+
+
+class WakePowerResponse(BaseModel):
+    event: Literal["sleep", "wake", "lock", "unlock"]
+    handled: bool
+    sleeping: bool | None = None
+
+
+# ============================================================================
+# Assistant route responses
+# ============================================================================
+
+
+class AssistantConfigView(BaseModel):
+    name: str
+    wake_phrase: str
+    end_phrases: list[str]
+    voice_id: str
+    speed: float
+    system_prompt: str
+    persona_label: str
+
+
+class AssistantProfileResponse(BaseModel):
+    assistant: AssistantConfigView
+
+
+class AssistantVoicesResponse(BaseModel):
+    voices: list[str]
+
+
+# ============================================================================
+# Ticket route response
+# ============================================================================
+
+
+class TicketResponse(BaseModel):
+    ticket: str
+    path: str
+    expiresInSeconds: int
+
+
+# ============================================================================
+# Data route responses
+# ============================================================================
+
+
+class NotesAcceptedResponse(BaseModel):
+    accepted: int
