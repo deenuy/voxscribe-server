@@ -1,4 +1,5 @@
-"""Web search tool via SearXNG.
+"""Web search tool via SearXNG: the executor behind the `web.search` record
+(app/local/tools/builtin.py), run through the tool runtime on the delegate lane.
 
 Fetches title/url/snippet from a local SearXNG instance.
 Result is flagged untrusted: the LLM sees it wrapped in a safety boundary so
@@ -56,31 +57,6 @@ async def _call(arguments: dict) -> str:
         lines.append(f"{i}. {title}: {snippet} ({src_url})")
     lines.append("[END SEARCH RESULTS]")
     return "\n".join(lines)
-
-
-def web_search_tool():
-    from app.local.tools.registry import ToolDef
-    return ToolDef(
-        name="web_search",
-        description=(
-            "Search the web for current facts, weather, news, prices, or recent events. "
-            "Use only for queries that cannot be answered from the conversation context or the "
-            "assistant's own knowledge. Returns titles and snippets from top results."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query, phrased as a short natural-language question or keywords.",
-                },
-            },
-            "required": ["query"],
-        },
-        timeout_s=_TIMEOUT_S + 1.0,
-        untrusted=True,
-        call=_call,
-    )
 
 
 async def search(query: str) -> str:

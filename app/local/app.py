@@ -247,6 +247,10 @@ async def create_app(
     app.state.wake_enabled = wake
     app.state.debug_trigger = debug_trigger
     app.state.profile = profile
+    # PL43: the tool registry, validated here: a tool record with a missing or bad field stops
+    # the engine before it serves anything, naming the field.
+    from app.local.tools.registry import default_registry
+    app.state.tool_registry = default_registry()
 
     # Build the runtime-mutable assistant profile store.
     # Defaults come from the loaded product profile (not from a bare Profile()).
