@@ -268,13 +268,20 @@ class OnsetPhraseDetector:
         try:
             words = list(self._decode(window))
             confidence = phrase_start_confidence(words, self.phrase)
-            if confidence is None:
-                return False
-            if confidence < NAME_CONFIDENCE and not hears_name(self._decode(window, primed=False),
-                                                               self.phrase):
-                return False
+            second = None
+            if confidence is not None and confidence < NAME_CONFIDENCE:
+                second = hears_name(self._decode(window, primed=False), self.phrase)
         except Exception as exc:  # noqa: BLE001 - a recognizer failure is no candidate, never a wake
             log.warning("wake onset check failed: %s", type(exc).__name__)
+            return False
+        hit = confidence is not None and (confidence >= NAME_CONFIDENCE or bool(second))
+        # What the check decided, never what was said: counts, a confidence and two verdicts.
+        log.info("wake onset check: pass=%d speech_s=%.2f words=%d begins_with_phrase=%s "
+                 "name_confidence=%s unprimed_hears_name=%s candidate=%s",
+                 self._checks, self._speech_s, len(words), confidence is not None,
+                 "n/a" if confidence is None else f"{confidence:.3f}",
+                 "n/a" if second is None else second, hit)
+        if not hit:
             return False
         self._last = (self._seen, int(window.shape[0]), words)
         return True
