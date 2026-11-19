@@ -1,0 +1,130 @@
+{
+  "description": "Named error codes the engine returns in {error, detail} JSON bodies.",
+  "errors": [
+    {
+      "code": "not_found",
+      "detail": "the addressed resource does not exist",
+      "status": 404
+    },
+    {
+      "code": "invalid_request",
+      "detail": "the request body or a parameter failed validation",
+      "status": 400
+    },
+    {
+      "code": "conflict",
+      "detail": "the operation conflicts with the current state",
+      "status": 409
+    },
+    {
+      "code": "provider_unavailable",
+      "detail": "the requested AI provider is not reachable",
+      "status": 503
+    },
+    {
+      "code": "consent_required",
+      "detail": "the caller has not given the required consent",
+      "status": 400
+    },
+    {
+      "code": "network_disabled",
+      "detail": "the engine is in offline mode; network calls are blocked",
+      "status": 403
+    },
+    {
+      "code": "database_unavailable",
+      "detail": "the database is not reachable",
+      "status": 503
+    },
+    {
+      "code": "connector_not_connected",
+      "detail": "the connector has no active token",
+      "status": 409
+    },
+    {
+      "code": "connector_token_expired",
+      "detail": "the connector token has expired",
+      "status": 409
+    },
+    {
+      "code": "service_unavailable",
+      "detail": "a required internal service is not ready",
+      "status": 503
+    },
+    {
+      "code": "internal_error",
+      "detail": "an unexpected error occurred",
+      "status": 500
+    },
+    {
+      "code": "unauthorized",
+      "detail": "no or invalid engine token",
+      "status": 401
+    },
+    {
+      "code": "identity_required",
+      "detail": "no identity token was provided",
+      "status": 401
+    },
+    {
+      "code": "identity_invalid",
+      "detail": "the identity token failed verification",
+      "status": 401
+    },
+    {
+      "code": "origin_not_allowed",
+      "detail": "the request Origin is not in the allowed list",
+      "status": 403
+    },
+    {
+      "code": "ticket_invalid",
+      "detail": "the ticket is not valid, was already used, or has expired",
+      "status": 401
+    },
+    {
+      "code": "too_many_tickets",
+      "detail": "the caller already has the maximum number of live tickets",
+      "status": 429
+    },
+    {
+      "code": "role_not_permitted",
+      "detail": "the caller's role may not perform this device operation",
+      "status": 403
+    },
+    {
+      "code": "device_mismatch",
+      "detail": "the caller's token is bound to a different device",
+      "status": 403
+    },
+    {
+      "code": "product_mismatch",
+      "detail": "the meeting was started by a different product",
+      "status": 409
+    },
+    {
+      "code": "voice_tenant_unbound",
+      "detail": "no tenant has armed the device yet",
+      "status": 409
+    },
+    {
+      "code": "voice_session_in_progress",
+      "detail": "a voice session is already running",
+      "status": 409
+    },
+    {
+      "code": "session_in_progress",
+      "detail": "a session is already in progress",
+      "status": 409
+    },
+    {
+      "code": "payload_too_large",
+      "detail": "the request body exceeds the configured size limit",
+      "status": 413
+    },
+    {
+      "code": "method_not_allowed",
+      "detail": "this method is not allowed here",
+      "status": 405
+    }
+  ]
+}

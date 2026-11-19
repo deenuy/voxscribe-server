@@ -16,10 +16,17 @@ from app.local.models import (
     EditEnhancedRequest,
     EditSegmentRequest,
     EnhancedResponse,
+    EnhanceJobResponse,
     EnhanceRequest,
+    ImportMeetingRequest,
+    ImportMeetingResponse,
+    Meeting,
+    MeetingListResponse,
+    NotesAcceptedResponse,
     NotesRequest,
     NotesResponse,
     StartMeetingRequest,
+    StartMeetingResponse,
     Summary,
     TranscriptResponse,
     UpdateMeetingRequest,
@@ -31,7 +38,7 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/meetings", tags=["meetings"])
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, response_model=Meeting)
 async def create_meeting(request: Request, body: CreateMeetingRequest):
     """Create a new meeting."""
     from fastapi.responses import JSONResponse
@@ -58,7 +65,7 @@ async def create_meeting(request: Request, body: CreateMeetingRequest):
     return meeting.model_dump(exclude_none=True)
 
 
-@router.get("")
+@router.get("", response_model=MeetingListResponse)
 async def list_meetings(
     request: Request,
     query: str = None,
@@ -78,7 +85,7 @@ async def list_meetings(
     }
 
 
-@router.get("/{meeting_id}")
+@router.get("/{meeting_id}", response_model=Meeting)
 async def get_meeting(request: Request, meeting_id: str):
     """Get a meeting by ID."""
     store = MeetingStore(request.app.state.store.pool)
@@ -86,7 +93,7 @@ async def get_meeting(request: Request, meeting_id: str):
     return meeting.model_dump(exclude_none=True)
 
 
-@router.patch("/{meeting_id}")
+@router.patch("/{meeting_id}", response_model=Meeting)
 async def update_meeting(request: Request, meeting_id: str, body: UpdateMeetingRequest):
     """Update a meeting."""
     store = MeetingStore(request.app.state.store.pool)
@@ -132,7 +139,7 @@ async def delete_meeting(request: Request, meeting_id: str):
     return Response(status_code=204)
 
 
-@router.post("/{meeting_id}/start")
+@router.post("/{meeting_id}/start", response_model=StartMeetingResponse)
 async def start_meeting(request: Request, meeting_id: str, body: StartMeetingRequest):
     """Start recording a meeting."""
     if not body.consentAcknowledged:
@@ -148,7 +155,7 @@ async def start_meeting(request: Request, meeting_id: str, body: StartMeetingReq
     }
 
 
-@router.post("/{meeting_id}/stop")
+@router.post("/{meeting_id}/stop", response_model=Meeting)
 async def stop_meeting(request: Request, meeting_id: str):
     """Stop recording and begin processing.
 
@@ -172,7 +179,7 @@ async def stop_meeting(request: Request, meeting_id: str):
 # ============================================================================
 
 
-@router.put("/{meeting_id}/notes")
+@router.put("/{meeting_id}/notes", response_model=NotesAcceptedResponse)
 async def put_notes(request: Request, meeting_id: str, body: NotesRequest):
     """Replace all notes for a meeting."""
     store = MeetingStore(request.app.state.store.pool)
@@ -419,7 +426,7 @@ async def detach_source(request: Request, meeting_id: str, source_id: str):
     return ""
 
 
-@router.post("/import", status_code=202)
+@router.post("/import", status_code=202, response_model=ImportMeetingResponse)
 async def import_meeting(request: Request):
     """Make a scribe from a transcript someone already has: pasted text, a transcript file (.txt, .md, .srt, .vtt) or a
     YouTube link (its captions).

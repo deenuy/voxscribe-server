@@ -1,0 +1,1281 @@
+{
+  "$defs": {
+    "AssistSuggestion": {
+      "additionalProperties": true,
+      "properties": {
+        "answer": {
+          "title": "Answer",
+          "type": "string"
+        },
+        "citations": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Citations",
+          "type": "array"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "offsetMs": {
+          "title": "Offsetms",
+          "type": "integer"
+        },
+        "question": {
+          "title": "Question",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "offsetMs",
+        "question",
+        "answer",
+        "citations"
+      ],
+      "title": "AssistSuggestion",
+      "type": "object"
+    },
+    "AudioWarning": {
+      "additionalProperties": true,
+      "properties": {
+        "droppedMs": {
+          "title": "Droppedms",
+          "type": "number"
+        }
+      },
+      "required": [
+        "droppedMs"
+      ],
+      "title": "AudioWarning",
+      "type": "object"
+    },
+    "CaptureHealthPayload": {
+      "additionalProperties": true,
+      "description": "The device's capture health (a stall, a reopen). Device level, like wake_state.",
+      "properties": {
+        "action": {
+          "title": "Action",
+          "type": "string"
+        },
+        "issue": {
+          "title": "Issue",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "required": [
+        "issue",
+        "action"
+      ],
+      "title": "CaptureHealthPayload",
+      "type": "object"
+    },
+    "Citation": {
+      "properties": {
+        "chunkId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chunkid"
+        },
+        "endMs": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Endms"
+        },
+        "kind": {
+          "enum": [
+            "transcript",
+            "source"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "locator": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Locator"
+        },
+        "segmentId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Segmentid"
+        },
+        "sourceId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sourceid"
+        },
+        "startMs": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Startms"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Citation",
+      "type": "object"
+    },
+    "ConnectorTokenNeeded": {
+      "additionalProperties": true,
+      "properties": {
+        "connector": {
+          "title": "Connector",
+          "type": "string"
+        }
+      },
+      "required": [
+        "connector"
+      ],
+      "title": "ConnectorTokenNeeded",
+      "type": "object"
+    },
+    "EnhancedBlock": {
+      "properties": {
+        "blockId": {
+          "title": "Blockid",
+          "type": "string"
+        },
+        "citations": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Citation"
+          },
+          "title": "Citations",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "stable",
+            "edited"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "updatedAt": {
+          "title": "Updatedat",
+          "type": "string"
+        }
+      },
+      "required": [
+        "blockId",
+        "text",
+        "status",
+        "updatedAt"
+      ],
+      "title": "EnhancedBlock",
+      "type": "object"
+    },
+    "Envelope": {
+      "additionalProperties": false,
+      "description": "One event on the event stream.\n\nid         opaque. Unique and ordered within the subscriber's stream (one stream per tenant,\n           or one shared stream with isolation off). A client sends the last one it received\n           back as Last-Event-ID when it reconnects; it must not parse it\nsessionId  the voice session that published the event, when one did\nseq        that session's sequence number: 1 for its first event, one more for each after,\n           with no gap. Absent on events no session published",
+      "properties": {
+        "data": {
+          "title": "Data"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "seq": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Seq"
+        },
+        "sessionId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sessionid"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "data"
+      ],
+      "title": "Envelope",
+      "type": "object"
+    },
+    "IdeaDelete": {
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "IdeaDelete",
+      "type": "object"
+    },
+    "IdeaUpdate": {
+      "additionalProperties": true,
+      "properties": {
+        "idea": {
+          "additionalProperties": true,
+          "title": "Idea",
+          "type": "object"
+        }
+      },
+      "required": [
+        "idea"
+      ],
+      "title": "IdeaUpdate",
+      "type": "object"
+    },
+    "JobUpdate": {
+      "additionalProperties": true,
+      "properties": {
+        "detail": {
+          "additionalProperties": true,
+          "default": {},
+          "title": "Detail",
+          "type": "object"
+        },
+        "jobId": {
+          "title": "Jobid",
+          "type": "string"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "queued",
+            "running",
+            "done",
+            "error"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "kind",
+        "state"
+      ],
+      "title": "JobUpdate",
+      "type": "object"
+    },
+    "Label": {
+      "properties": {
+        "color": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Color"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "title": "Label",
+      "type": "object"
+    },
+    "Meeting": {
+      "properties": {
+        "attachmentCount": {
+          "default": 0,
+          "title": "Attachmentcount",
+          "type": "integer"
+        },
+        "autoStopMinutes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Autostopminutes"
+        },
+        "calendarEventId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calendareventid"
+        },
+        "context": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Context"
+        },
+        "createdAt": {
+          "title": "Createdat",
+          "type": "string"
+        },
+        "durationMs": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Durationms"
+        },
+        "endedAt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Endedat"
+        },
+        "enhanceStyle": {
+          "default": "standard",
+          "enum": [
+            "standard",
+            "concise"
+          ],
+          "title": "Enhancestyle",
+          "type": "string"
+        },
+        "hasSummary": {
+          "default": false,
+          "title": "Hassummary",
+          "type": "boolean"
+        },
+        "hasTranscript": {
+          "default": false,
+          "title": "Hastranscript",
+          "type": "boolean"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "language": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Language"
+        },
+        "origin": {
+          "default": "recorded",
+          "enum": [
+            "recorded",
+            "text",
+            "file",
+            "youtube",
+            "wake"
+          ],
+          "title": "Origin",
+          "type": "string"
+        },
+        "projectId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Projectid"
+        },
+        "publishedAt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Publishedat"
+        },
+        "reminderEnabled": {
+          "default": false,
+          "title": "Reminderenabled",
+          "type": "boolean"
+        },
+        "revision": {
+          "default": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "scheduledEnd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scheduledend"
+        },
+        "scheduledStart": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scheduledstart"
+        },
+        "segmentCount": {
+          "default": 0,
+          "title": "Segmentcount",
+          "type": "integer"
+        },
+        "startedAt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Startedat"
+        },
+        "status": {
+          "enum": [
+            "scheduled",
+            "recording",
+            "processing",
+            "done",
+            "interrupted"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "summaryStale": {
+          "default": false,
+          "title": "Summarystale",
+          "type": "boolean"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "transcriptRevision": {
+          "default": 0,
+          "title": "Transcriptrevision",
+          "type": "integer"
+        },
+        "updatedAt": {
+          "title": "Updatedat",
+          "type": "string"
+        },
+        "wordCount": {
+          "default": 0,
+          "title": "Wordcount",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ],
+      "title": "Meeting",
+      "type": "object"
+    },
+    "MeetingStatus": {
+      "additionalProperties": true,
+      "properties": {
+        "state": {
+          "enum": [
+            "recording",
+            "processing",
+            "done"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "title": "MeetingStatus",
+      "type": "object"
+    },
+    "Model": {
+      "properties": {
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "downloadedBytes": {
+          "default": 0,
+          "title": "Downloadedbytes",
+          "type": "integer"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "expert",
+            "generative"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        },
+        "selected": {
+          "title": "Selected",
+          "type": "boolean"
+        },
+        "selectedRoles": {
+          "default": [],
+          "items": {
+            "enum": [
+              "main",
+              "live"
+            ],
+            "type": "string"
+          },
+          "title": "Selectedroles",
+          "type": "array"
+        },
+        "sizeBytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sizebytes"
+        },
+        "status": {
+          "enum": [
+            "available",
+            "downloading",
+            "ready",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "name",
+        "description",
+        "required",
+        "selected",
+        "status"
+      ],
+      "title": "Model",
+      "type": "object"
+    },
+    "NoteUpdated": {
+      "additionalProperties": true,
+      "properties": {
+        "blockId": {
+          "title": "Blockid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "blockId"
+      ],
+      "title": "NoteUpdated",
+      "type": "object"
+    },
+    "ProjectUpdate": {
+      "additionalProperties": true,
+      "description": "The project record, as GET /ideas/projects/{id} returns it.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "ProjectUpdate",
+      "type": "object"
+    },
+    "ReplyPayload": {
+      "additionalProperties": true,
+      "properties": {
+        "bargeIn": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bargein"
+        },
+        "category": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Category"
+        },
+        "gate": {
+          "default": null,
+          "title": "Gate"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "turn_n": {
+          "title": "Turn N",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "turn_n"
+      ],
+      "title": "ReplyPayload",
+      "type": "object"
+    },
+    "Segment": {
+      "properties": {
+        "edited": {
+          "default": false,
+          "title": "Edited",
+          "type": "boolean"
+        },
+        "endMs": {
+          "title": "Endms",
+          "type": "integer"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "revision": {
+          "default": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "source": {
+          "enum": [
+            "mic",
+            "system"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "speaker": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Speaker"
+        },
+        "startMs": {
+          "title": "Startms",
+          "type": "integer"
+        },
+        "state": {
+          "enum": [
+            "provisional",
+            "stable"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "startMs",
+        "endMs",
+        "source",
+        "text",
+        "state"
+      ],
+      "title": "Segment",
+      "type": "object"
+    },
+    "Source": {
+      "properties": {
+        "chunkCount": {
+          "default": 0,
+          "title": "Chunkcount",
+          "type": "integer"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "importedAt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Importedat"
+        },
+        "kind": {
+          "enum": [
+            "file",
+            "folder",
+            "url",
+            "drive"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "labels": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Label"
+          },
+          "title": "Labels",
+          "type": "array"
+        },
+        "mime": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mime"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "parentId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parentid"
+        },
+        "status": {
+          "enum": [
+            "queued",
+            "indexing",
+            "ready",
+            "error"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "uri": {
+          "title": "Uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "uri",
+        "name",
+        "status"
+      ],
+      "title": "Source",
+      "type": "object"
+    },
+    "StreamReset": {
+      "additionalProperties": true,
+      "description": "Sent instead of a replay when the events a reconnecting client missed are no longer held\n(or its last id is not from this stream: the engine restarted). The client reloads the state\nit shows; the stream carries on live from this event's id.",
+      "properties": {
+        "lastEventId": {
+          "title": "Lasteventid",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "gap",
+            "unknown_id"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "lastEventId"
+      ],
+      "title": "StreamReset",
+      "type": "object"
+    },
+    "SummaryReady": {
+      "additionalProperties": true,
+      "properties": {},
+      "title": "SummaryReady",
+      "type": "object"
+    },
+    "WakeDelegate": {
+      "additionalProperties": true,
+      "description": "A delegated task's status. Status only: a result reaches a person through the gate.",
+      "properties": {
+        "meetingId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Meetingid"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "taskId": {
+          "title": "Taskid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "taskId",
+        "status"
+      ],
+      "title": "WakeDelegate",
+      "type": "object"
+    },
+    "WakeReply": {
+      "additionalProperties": true,
+      "description": "A reply in a voice session: `thinking` when the turn has closed, `done` with what was spoken.",
+      "properties": {
+        "interrupted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Interrupted"
+        },
+        "meetingId": {
+          "title": "Meetingid",
+          "type": "string"
+        },
+        "phase": {
+          "enum": [
+            "thinking",
+            "done"
+          ],
+          "title": "Phase",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "turn": {
+          "title": "Turn",
+          "type": "integer"
+        },
+        "userText": {
+          "title": "Usertext",
+          "type": "string"
+        }
+      },
+      "required": [
+        "meetingId",
+        "turn",
+        "phase",
+        "userText",
+        "text"
+      ],
+      "title": "WakeReply",
+      "type": "object"
+    },
+    "WakeSegment": {
+      "additionalProperties": true,
+      "properties": {
+        "endMs": {
+          "title": "Endms",
+          "type": "integer"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "startMs": {
+          "title": "Startms",
+          "type": "integer"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "state",
+        "startMs",
+        "endMs"
+      ],
+      "title": "WakeSegment",
+      "type": "object"
+    },
+    "WakeStatePayload": {
+      "additionalProperties": true,
+      "description": "The device's wake state. A fact about a device, not a session: it goes to the tenant the\ndevice is bound to (see events.py, \"Who receives what\").",
+      "properties": {
+        "meeting_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Meeting Id"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "phrase": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Phrase"
+        },
+        "state": {
+          "enum": [
+            "off",
+            "armed",
+            "listening",
+            "error"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "trigger": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Trigger"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "title": "WakeStatePayload",
+      "type": "object"
+    },
+    "WakeTranscript": {
+      "additionalProperties": true,
+      "description": "What the recognizer heard in a voice session's turn.",
+      "properties": {
+        "meetingId": {
+          "title": "Meetingid",
+          "type": "string"
+        },
+        "segment": {
+          "$ref": "#/$defs/WakeSegment"
+        },
+        "turn": {
+          "title": "Turn",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "meetingId",
+        "turn",
+        "segment"
+      ],
+      "title": "WakeTranscript",
+      "type": "object"
+    }
+  },
+  "deviceEvents": [
+    "capture_health",
+    "wake_state"
+  ],
+  "envelope": "#/$defs/Envelope",
+  "machineEvents": [
+    "model.progress"
+  ],
+  "meetingEvents": {
+    "assist.suggestion": "#/$defs/AssistSuggestion",
+    "audio.warning": "#/$defs/AudioWarning",
+    "enhanced.update": "#/$defs/EnhancedBlock",
+    "note.updated": "#/$defs/NoteUpdated",
+    "reply": "#/$defs/ReplyPayload",
+    "status": "#/$defs/MeetingStatus",
+    "summary.ready": "#/$defs/SummaryReady",
+    "transcript.partial": "#/$defs/Segment",
+    "transcript.stable": "#/$defs/Segment"
+  },
+  "schemaVersion": 1,
+  "sessionEvents": [
+    "wake.delegate",
+    "wake.reply",
+    "wake.transcript"
+  ],
+  "streamEvents": {
+    "capture_health": "#/$defs/CaptureHealthPayload",
+    "connector.token_needed": "#/$defs/ConnectorTokenNeeded",
+    "idea.delete": "#/$defs/IdeaDelete",
+    "idea.update": "#/$defs/IdeaUpdate",
+    "job.update": "#/$defs/JobUpdate",
+    "meeting.update": "#/$defs/Meeting",
+    "model.progress": "#/$defs/Model",
+    "project.update": "#/$defs/ProjectUpdate",
+    "source.update": "#/$defs/Source",
+    "stream.reset": "#/$defs/StreamReset",
+    "wake.delegate": "#/$defs/WakeDelegate",
+    "wake.reply": "#/$defs/WakeReply",
+    "wake.transcript": "#/$defs/WakeTranscript",
+    "wake_state": "#/$defs/WakeStatePayload"
+  }
+}

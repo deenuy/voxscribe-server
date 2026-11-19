@@ -200,6 +200,11 @@ class Config:
     wake_candidate_retention_days: int = 0
     tool_call_retention_days: int = 0
 
+    # Maximum request body size for uploads and imports, in bytes (VOXSCRIBE_MAX_UPLOAD_BYTES).
+    # Requests that declare a larger Content-Length are refused before the body is read into memory.
+    # Default 50 MiB. 0 means no limit (not recommended in production).
+    max_upload_bytes: int = 50 * 1024 * 1024
+
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "Config":
         """Load configuration from environment.
@@ -454,6 +459,10 @@ class Config:
         )
         config_dict["tool_call_retention_days"] = _parse_int(
             env_vars, "VOXSCRIBE_TOOL_CALL_RETENTION_DAYS", 0
+        )
+
+        config_dict["max_upload_bytes"] = _parse_int(
+            env_vars, "VOXSCRIBE_MAX_UPLOAD_BYTES", cls.max_upload_bytes
         )
 
         return cls(**config_dict)

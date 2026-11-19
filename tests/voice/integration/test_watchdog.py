@@ -239,7 +239,11 @@ async def test_power_endpoint_without_audio_engine():
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api),
                                  base_url="http://test") as client:
         r = await client.post("/v1/wake/power", json={"event": "wake"})
-    assert r.status_code == 202 and r.json() == {"event": "wake", "handled": False}
+    assert r.status_code == 202
+    body = r.json()
+    assert body["event"] == "wake" and body["handled"] is False
+    # sleeping is null when no audio engine is running (no watchdog state to report)
+    assert body.get("sleeping") is None
 
 
 # ---------------------------------------------------------------- R10

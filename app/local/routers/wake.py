@@ -35,6 +35,13 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.local.errors import EngineError
+from app.local.models import (
+    WakeArmResponse,
+    WakePowerResponse,
+    WakeProfileResponse,
+    WakeStateResponse,
+    WakeTriggerResponse,
+)
 from app.local.identity import require_device_control
 from app.local.voice.host import (
     SessionInProgressError,
@@ -87,7 +94,7 @@ def _refused(exc: SessionTenantRequiredError | SessionInProgressError) -> Engine
     return EngineError(exc.code, str(exc), 409)
 
 
-@router.get("/profile")
+@router.get("/profile", response_model=WakeProfileResponse)
 async def wake_profile(request: Request):
     """Return a summary of the current product profile (mode and key settings)."""
     profile = getattr(request.app.state, "profile", None)
@@ -100,7 +107,7 @@ async def wake_profile(request: Request):
     }
 
 
-@router.get("/state")
+@router.get("/state", response_model=WakeStateResponse)
 async def wake_state(request: Request):
     host = _host(request)
     if host is None:
@@ -121,7 +128,7 @@ async def wake_state(request: Request):
     }
 
 
-@router.post("/arm", status_code=200)
+@router.post("/arm", status_code=200, response_model=WakeArmResponse)
 async def arm_wake(request: Request):
     host = _host(request)
     _require_device_control(request, host)
@@ -135,7 +142,7 @@ async def arm_wake(request: Request):
     return {"state": _value(host.state), "changed": changed}
 
 
-@router.post("/disarm", status_code=200)
+@router.post("/disarm", status_code=200, response_model=WakeArmResponse)
 async def disarm_wake(request: Request):
     host = _host(request)
     _require_device_control(request, host)
@@ -145,7 +152,7 @@ async def disarm_wake(request: Request):
     return {"state": WakeState.OFF.value, "changed": changed}
 
 
-@router.post("/trigger", status_code=202)
+@router.post("/trigger", status_code=202, response_model=WakeTriggerResponse)
 async def trigger_wake_session(request: Request):
     """DEBUG ONLY: bypass the wake gate and start a wake session immediately.
 
@@ -179,7 +186,7 @@ class PowerEvent(BaseModel):
     event: Literal["sleep", "wake", "lock", "unlock"]
 
 
-@router.post("/power", status_code=202)
+@router.post("/power", status_code=202, response_model=WakePowerResponse)
 async def power_event(body: PowerEvent, request: Request):
     """Power and session events forwarded by the app (Electron powerMonitor).
 
