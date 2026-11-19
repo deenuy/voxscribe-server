@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -235,6 +236,73 @@ async def test_the_device_cannot_be_bound_to_another_tenant_while_a_session_runs
     assert {tenant for _name, tenant, _session in store.seen} == {"t_alice"}
 
     assert host.bind(BOB) and host.binding == BOB         # between sessions it is allowed
+
+
+class SlowPrepareScope(RecordingScope):
+    """A scope whose prepare() is a round trip that a test holds open, as the server's is a
+    database read (adapters/scope.py)."""
+
+    def __init__(self, *, fails: bool = False) -> None:
+        super().__init__()
+        self.in_prepare = asyncio.Event()
+        self.release = asyncio.Event()
+        self.fails = fails
+
+    async def prepare(self, binding: SessionBinding):
+        self.in_prepare.set()
+        await self.release.wait()
+        if self.fails:
+            raise RuntimeError("profile read failed")
+        return ("", 1.0, 0)
+
+
+async def test_a_bind_that_lands_while_a_session_is_starting_is_refused():
+    """Between taking the binding and the session being open there is a round trip. A second
+    person's arm landing in it must be refused, not told the device is theirs while the
+    conversation that follows is written for the first."""
+    scope = SlowPrepareScope()
+    store = ScopeSeeingStore(scope)
+    host = VoiceHost(VoiceConfig(), scope=scope, binding=ALICE,
+                     ports=fake_ports(store=store, recognizer=FakeRecognizer(TURNS)))
+    session = asyncio.create_task(host.run_session(EndlessQueue(), score=0.9))
+    await asyncio.wait_for(scope.in_prepare.wait(), SESSION_TIMEOUT_S)
+
+    with pytest.raises(SessionInProgressError) as refused:
+        host.bind(BOB)
+    assert refused.value.code == "voice_session_in_progress" and host.binding == ALICE
+    assert host.bind(replace(ALICE, role="admin"))        # the same tenant is not a takeover
+
+    scope.release.set()
+    await asyncio.wait_for(session, SESSION_TIMEOUT_S)
+    assert {tenant for _name, tenant, _session in store.seen} == {"t_alice"}
+    assert host.bind(BOB) and host.binding == BOB         # once it has ended it is allowed
+
+
+async def test_a_session_that_fails_to_start_gives_the_device_back():
+    scope = SlowPrepareScope(fails=True)
+    host = VoiceHost(VoiceConfig(), scope=scope, binding=ALICE, ports=fake_ports())
+    scope.release.set()
+    with pytest.raises(RuntimeError):
+        await host.run_session(EndlessQueue(), score=0.9)
+    assert host.bind(BOB)
+
+
+async def test_a_bind_between_a_trigger_and_its_session_is_refused():
+    """The trigger takes the caller's binding and starts the session as a task. Nobody else
+    may take the device before that task has opened the session."""
+    host, _scope, store, _events = _bound_host()
+    triggered = asyncio.ensure_future(host.trigger())
+    await asyncio.sleep(0)            # the trigger has run to its first wait; the task has not
+    assert store.sessions == []
+    with pytest.raises(SessionInProgressError):
+        host.bind(BOB)
+
+    assert await asyncio.wait_for(triggered, SESSION_TIMEOUT_S) == "s1"
+    (task,) = [t for t in asyncio.all_tasks() if t.get_name() == "trigger-session"]
+    await asyncio.wait_for(task, SESSION_TIMEOUT_S)
+    tenants = {tenant for name, tenant, _session in store.seen if name == "create_session"}
+    assert tenants == {"t_alice"} and host.binding == ALICE
+    assert host.bind(BOB)
 
 
 async def test_binding_another_tenant_drops_what_the_delegate_held_inside_the_old_scope():

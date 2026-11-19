@@ -729,6 +729,7 @@ class VoiceHost:
         self._binding = binding or SessionBinding()    # who the device's sessions are for
         self._served: SessionBinding | None = None      # the binding the adapters last worked for
         self._open: SessionContext | None = None        # the device's session, while one runs
+        self._claimed = False                           # a session took its binding: starting or running
         self._rebound = False                           # bind() changed it: the armed loop re-enters
         self._task: asyncio.Task | None = None
         self._cues: set[asyncio.Task] = set()      # cues playing off the hot path
@@ -784,14 +785,15 @@ class VoiceHost:
 
         The armed loop leaves the old scope on its next frame and comes back in the new one. A
         session in progress keeps the binding it opened with, so binding the device to another
-        tenant while one runs is refused. A binding with no tenant unbinds: with isolation on
-        the host then goes off until it is bound again.
+        tenant while one runs is refused, from the moment the session takes its binding (it may
+        still be starting). A binding with no tenant unbinds: with isolation on the host then
+        goes off until it is bound again.
 
         When the tenant changes, the previous one is told the device is off for them, in their
         own scope and before the swap: from here on the room's speech is someone else's."""
         if binding == self._binding:
             return False
-        if binding.tenant != self._binding.tenant and self._open is not None:
+        if binding.tenant != self._binding.tenant and (self._claimed or self._open is not None):
             raise SessionInProgressError("a voice session is in progress for another tenant")
         if binding.tenant != self._binding.tenant and self.state != WakeState.OFF:
             self._publish_device("wake_state", self.snapshot() | {"state": WakeState.OFF.value,
@@ -1084,23 +1086,32 @@ class VoiceHost:
         is written."""
         if binding is None:
             binding = self._device_binding()
-        # Load the tenant's assistant profile once before the session scope is entered.
-        # prepare() may query the database; it is not on the audio path.
-        _prepare = getattr(self._scope, "prepare", None)
-        _voice_id, _speed = "", 1.0
-        if _prepare is not None:
-            _voice_id, _speed, _ = await _prepare(binding)
-        with self._scope.session(binding) as session:
-            session.voice_id = _voice_id
-            session.speed = _speed
-            log.info("voice host: session open tenant=%s product=%s device=%s profile=%s",
-                     session.tenant, session.product, session.device, session.profile_version)
-            self._open = session
-            try:
-                await self._conversation(audio_q, session, score=score, detector=detector,
-                                         speech_ratio=speech_ratio)
-            finally:
-                self._open = None
+        # The device is taken from this line, with no await since the binding was read: bind()
+        # refuses another tenant until the session has ended. prepare() below is a round trip,
+        # and an arm that landed in it used to be told the device was theirs while this
+        # conversation was written for the tenant before them.
+        self._claimed = True
+        try:
+            # Load the tenant's assistant profile once before the session scope is entered.
+            # prepare() may query the database; it is not on the audio path.
+            _prepare = getattr(self._scope, "prepare", None)
+            _voice_id, _speed = "", 1.0
+            if _prepare is not None:
+                _voice_id, _speed, _ = await _prepare(binding)
+            with self._scope.session(binding) as session:
+                session.voice_id = _voice_id
+                session.speed = _speed
+                log.info("voice host: session open tenant=%s product=%s device=%s profile=%s",
+                         session.tenant, session.product, session.device,
+                         session.profile_version)
+                self._open = session
+                try:
+                    await self._conversation(audio_q, session, score=score, detector=detector,
+                                             speech_ratio=speech_ratio)
+                finally:
+                    self._open = None
+        finally:
+            self._claimed = False
 
     async def _conversation(self, audio_q, session: SessionContext, *, score: float,
                             detector: str, speech_ratio: float | None) -> None:
@@ -1659,6 +1670,10 @@ class VoiceHost:
         p = self.ports
         binding = self._device_binding()    # refused here, before a task or a subscription
         audio_q = p.audio_in.subscribe()
+        # Taken now, not when the task below first runs: a bind landing in between would give
+        # the device to someone else while this session opens for `binding`. Released when the
+        # session ends.
+        self._claimed = True
 
         async def _session() -> None:
             try:
@@ -1667,6 +1682,7 @@ class VoiceHost:
                 log.exception("voice host: triggered session failed")
             finally:
                 # The trigger path never goes through the armed loop, so reset here.
+                self._claimed = False
                 self.set_state(WakeState.ARMED)
                 p.audio_in.unsubscribe(audio_q)
 
