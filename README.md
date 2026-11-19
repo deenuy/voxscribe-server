@@ -298,4 +298,4 @@ tools/archive/             Pre-sprint tool scripts
 
 ## Changelog
 
-See `CHANGELOG.md`. Current version: **0.10.0** (baseline of 2026-11-19: tenant isolation on the voice path, tools with receipts, reminders and timers).
+See `CHANGELOG.md`. Current version: **0.11.0** (natural spoken style, spoken endings and first-turn timing fixes).

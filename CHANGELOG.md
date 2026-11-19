@@ -1,19 +1,32 @@
 # Changelog
 
-## Unreleased
+## What's New in VoxScribe Server 0.11.0
+
+Release of 2026-11-19. Uses voxscribe-core 0.6.0. No database migration.
 
 ### New Features
-- Added a spoken register, `VOXSCRIBE_VOICE_EXPRESSIVENESS` = `plain` | `natural` (PL66). The default follows the product mode the gate runs under: `natural` for personal and IdeaScribe, `plain` (the replies as before) for senior care and classroom. In `natural` the reply model is asked to talk as people talk, and deterministic rules hold on what it wrote before the gate: at most one reaction, only at the start and only from the interjections the voice pronounces, never the previous reply's opener, no stock assistant sentences, nothing added to scripted lines. A pronunciation table rewrites what the voice misreads (Mm-hmm, Mhm, Mm, Aww) after the gate; captions and the stored transcript keep the original spelling. The lists live in `app/local/voice/expression.py`.
+- Added a natural spoken style for personal and IdeaScribe modes, making the assistant answer the way a person talks instead of reading out stock assistant phrases.
+- Added brief reactions such as "Oh", "Ah" or "Hmm" at the start of a reply when they fit, never the same one twice in a row.
+- Added a short thinking line such as "Let me see" when a reply is slow to start, so a pause never sounds like the assistant stopped listening.
+- Added spoken endings, making it possible to finish a conversation by saying "that's all", "I'm done", "bye" or "stop" and hear a short farewell.
+- Added an audition command that plays every reaction, thinking line and farewell, making it easy to hear each one and remove any that sound wrong.
+- Added a setting to choose the plain or natural spoken style per device, with senior care and classroom staying plain by default.
 
-- Added thinking lines for a late reply, in `natural` only (PL67): when a reply's speech has not started `VOXSCRIBE_VOICE_THINKING_AFTER_S` (1.5 s) after the turn closed, one short line is said first ("Let me see.", "One moment.", ...), never the same twice running, through the gate, muted from capture like any playback and stopped by a person speaking. None when the reply starts in time, after a yes, a no or a correction, or before a scripted route such as a lookup's announcement. The reply follows the line in the playback queue with no gap. The lines are rendered in the reply voice into the phrase cache. In `natural` the immediate "hm" before every reply is gone; `plain` keeps it.
-
-- Added ending rules with a spoken farewell (PL61). Plain closings end a session ("that's all", "that's it, thanks", "okay, I'm done", "goodbye", "bye", "stop", "never mind, bye") as the whole short turn or its ending clause, never inside a longer sentence, and the assistant says one farewell through the gate before closing: varied and never the device's last one in `natural`, "Goodbye." in `plain`. "Stop", "wait" or "hold on" said over the assistant stops the speech and the session listens on; "stop" said while it listens ends the session. End closes at once and an idle end says nothing.
-
-- Added `python -m app.local.voice.audition --out DIR [--play]` (PL68): every reaction, thinking line and farewell, synthesised with the configured voice, written as a WAV each, listed by name and played in turn. Each line is first put to the gate of the chosen mode. Strike a line by deleting its name in `app/local/voice/expression.py`.
+### UX Improvements
+- Improved pronunciation of "mm-hmm", "mhm", "mm" and "aww" so the voice no longer spells them out letter by letter.
+- Improved interruptions so that saying "stop" or "wait" while the assistant is talking silences it and keeps the conversation open.
+- Improved the first reply in a conversation so captions appear only for speech the assistant actually used.
 
 ### Bug Fixes
-- Fixed a turn the engine cannot use (no words, one word, noise) ending the whole session (PL61). It is now ignored and the wait goes on as it was. A session that never has a usable turn still closes as silent and keeps nothing, and its captions are no longer published before that is known, so the app is never shown words of a conversation that was deleted. Waits are measured in listening time, only recognised speech extends them (loudness no longer does), and `VOXSCRIBE_VOICE_NO_SPEECH_LIMIT_S` (120 s) ends a session with no recognised speech however loud the room.
-- Fixed the first turn of a voice session ending at the first-turn wait instead of on the person's pause (PL59). The turn detector settled on digital silence before every turn, so the room after the person stopped still read as speech and the closing pause started a second or more late; it now settles on the room's own sound. The first-turn wait now applies only while nothing has been recognised, and a cue is muted from capture for its whole length (the cues are about 1.6 s; the mute was 1.1 s).
+- Fixed the first reply of a conversation waiting up to eight seconds after the person had finished speaking.
+- Fixed long first questions being cut off before the person finished.
+- Fixed the end of the listening chime being heard as the person's speech.
+- Fixed a single word or a burst of noise ending the whole conversation.
+- Prevented a loud room from keeping a conversation open indefinitely when nobody is speaking.
+
+### Changed
+- Background noise no longer extends how long the assistant waits for the next turn; only recognised speech does.
+- In natural style, the short "hm" sound before every reply is replaced by a thinking line that plays only when a reply is late.
 
 ## What's New in VoxScribe Server 0.10.0
 
