@@ -188,6 +188,9 @@ class Config:
     # as before) or "natural" (a spoken register). Unset: the product mode's default, natural for
     # personal and IdeaScribe, plain for senior care and classroom (app/local/voice/expression.py).
     voice_expressiveness: str | None = None
+    # In natural, a reply whose speech has not started this long after the turn closed is
+    # preceded by one short thinking line (VOXSCRIBE_VOICE_THINKING_AFTER_S, PL67).
+    voice_thinking_after_s: float = 1.5
 
     # Wake word — any phrase, no model training required (VOXSCRIBE_WAKE_PHRASE)
     wake_phrase: str = "hey vox"
@@ -450,6 +453,18 @@ class Config:
                 _fail("VOXSCRIBE_VOICE_EXPRESSIVENESS",
                       f"must be plain|natural, got {expressiveness!r}")
             config_dict["voice_expressiveness"] = expressiveness
+
+        thinking_raw = env_vars.get("VOXSCRIBE_VOICE_THINKING_AFTER_S", "").strip()
+        if thinking_raw:
+            try:
+                thinking_after = float(thinking_raw)
+            except ValueError:
+                _fail("VOXSCRIBE_VOICE_THINKING_AFTER_S",
+                      f"must be a number of seconds, got {thinking_raw!r}")
+            if not 0.5 <= thinking_after <= 10.0:
+                _fail("VOXSCRIBE_VOICE_THINKING_AFTER_S",
+                      f"must be between 0.5 and 10, got {thinking_raw!r}")
+            config_dict["voice_thinking_after_s"] = thinking_after
 
         voice_reply_model = env_vars.get("VOXSCRIBE_VOICE_REPLY_MODEL", "").strip()
         if voice_reply_model:

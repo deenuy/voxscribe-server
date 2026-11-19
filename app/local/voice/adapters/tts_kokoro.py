@@ -35,6 +35,13 @@ class KokoroTalker:
             return _pcm(await tts_engine.synthesize(text, voice=voice, speed=speed))
         return _pcm(await tts_engine.synthesize(text, speed=speed))
 
+    async def line(self, text: str) -> np.ndarray:
+        """A fixed line the assistant says on its own (a thinking line, a farewell), in the
+        session's voice, from the phrase cache. The pronunciation table applies, as it does to
+        replies; the line itself is what the gate passed."""
+        voice, speed = self._get_voice_speed()
+        return _pcm(await tts_engine.load_line(self._pronounce(text), voice=voice, speed=speed))
+
     async def fixed(self, phrase: str) -> np.ndarray:
         # Pre-rendered with say; when the cache cannot render it, synthesise it live instead.
         samples = await tts_engine.load_phrase(phrase)

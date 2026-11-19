@@ -174,6 +174,13 @@ REPLY_INTERRUPTED = "interrupted"
 REPLY_CANCELLED = "cancelled"
 REPLY_FAILED = "failed"
 
+# Thinking lines (PL67, natural only): when a reply's speech has not started THINKING_AFTER_S
+# after the turn closed, one short line from expression.THINKING is said first. Only for a
+# reply the model writes; a scripted route (a lookup's announcement, a read-back, the clock)
+# needs no model and says its own first line. Config: VOXSCRIBE_VOICE_THINKING_AFTER_S.
+THINKING_AFTER_S = 1.5
+THINKING_SOURCES = frozenset({"llm", "pre_stream"})
+
 # Clause-streaming constants (T11) -- keep in sync with clause_splitter.CLAUSE_GAP_MAX_MS
 _CLAUSE_GAP_MAX_MS = 300        # gap above this is perceptible; log a warning
 
@@ -344,6 +351,7 @@ class VoiceConfig:
     # How the assistant talks: "plain" (today's replies) or "natural" (voice/expression.py). The
     # default here is plain; from_profile and from_settings resolve the product mode's default.
     expressiveness: str = "plain"
+    thinking_after_s: float = THINKING_AFTER_S
 
     @classmethod
     def from_settings(cls, settings) -> VoiceConfig:
@@ -357,6 +365,7 @@ class VoiceConfig:
             quiet_hours=getattr(settings, "quiet_hours", None),
             expressiveness=resolve_expressiveness(getattr(settings, "voice_expressiveness", None),
                                                   resolve_mode(None, settings)),
+            thinking_after_s=float(getattr(settings, "voice_thinking_after_s", THINKING_AFTER_S)),
         )
 
     @classmethod
@@ -430,6 +439,7 @@ class VoiceConfig:
             end_of_turn_pause_s=end_of_turn_pause_s,
             expressiveness=resolve_expressiveness(getattr(settings, "voice_expressiveness", None),
                                                   resolve_mode(profile, settings)),
+            thinking_after_s=float(getattr(settings, "voice_thinking_after_s", THINKING_AFTER_S)),
         )
 
 
@@ -507,6 +517,39 @@ class _ClauseTalker:
 
     async def warm(self) -> None:
         await self._inner.warm()
+
+
+class _FirstAudio:
+    """The reply's speaker, marking when the reply's first audio is queued. Its lock lets a late
+    thinking line be queued ahead of the reply's first clause, so one follows the other with no
+    gap and no overlap (PL67)."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.started = asyncio.Event()
+        self.lock = asyncio.Lock()
+
+    @property
+    def available(self) -> bool:
+        return getattr(self._inner, "available", True)
+
+    async def play(self, pcm_float32_mono, sample_rate: int) -> None:
+        async with self.lock:
+            self.started.set()
+            await self._inner.play(pcm_float32_mono, sample_rate)
+
+    async def play_file(self, path: str) -> None:
+        await self._inner.play_file(path)
+
+    def stop_playback(self) -> None:
+        self._inner.stop_playback()
+
+    @property
+    def is_playing(self) -> bool:
+        return self._inner.is_playing
+
+    def playback_ref(self) -> np.ndarray:
+        return self._inner.playback_ref()
 
 
 async def _only(sentence: str):
@@ -1185,6 +1228,7 @@ class VoiceHost:
             # Resident models before the first wake: the reply model and the talker.
             asyncio.create_task(p.delegate.warm(), name="delegate-warm")
             asyncio.create_task(p.talker.warm(), name="talker-warm")
+            asyncio.create_task(self._warm_lines(p), name="lines-warm")
 
             await p.audio_in.start()
             audio_q = p.audio_in.subscribe()
@@ -1934,14 +1978,18 @@ class VoiceHost:
             heard = HeardReply(p.clock, scripted=(clause_stream.cue, clause_stream.lead_in))
             sentences = heard.sentences(clause_stream.sentences)
             clause_stream.sentences = sentences
+            heard_out = heard.audio_out(p.audio_out)
+            speaker = _FirstAudio(heard_out) if heard_out is not None else None
             speak = asyncio.create_task(speak_reply(
                 clause_stream, gate=heard.gate(turn_gate), talker=heard.talker(clause_talker),
-                audio_out=heard.audio_out(p.audio_out), clock=p.clock, user_text=text,
+                audio_out=speaker, clock=p.clock, user_text=text,
                 # G7 reads this turn's receipts, not the session's tool rows (PL43).
                 session_tools=turn_gate.tools(
                     lambda: p.store.turn_receipts(session_id, turn.turn_id))),
                 name="voice-reply")
 
+            thinking = self._think_if_late(p, turn_gate, speaker, stream.source, text,
+                                           turn_end_ms, turn_n)
             pre_roll = None
             try:
                 if audio_q is not None and self._barge_in_enabled(p):
@@ -1952,6 +2000,8 @@ class VoiceHost:
             finally:
                 if not speak.done():
                     speak.cancel()
+                if thinking is not None and not thinking.done():
+                    thinking.cancel()
             ended = current_session()
             if pre_roll is not None and ended is not None and ended.stop_requested:
                 p.audio_out.stop_playback()         # a clause queued while the stage was cancelled
@@ -1997,6 +2047,71 @@ class VoiceHost:
         finally:
             if turn is not None:
                 await self._flush_gate_records(p, turn, verdict, ended)
+
+    def _think_if_late(self, p: VoicePorts, turn_gate, speaker: _FirstAudio | None,
+                       source: str, text: str, turn_end_ms: int,
+                       turn_n: int) -> asyncio.Task | None:
+        """In natural, a task that says one thinking line if the reply's speech has not started
+        THINKING_AFTER_S after the turn closed (PL67). None when no line can be due: plain, a
+        scripted route, a turn that was only a yes, a no or a correction, a faulted gate."""
+        from app.local.voice.expression import NATURAL, is_brief_answer  # lazy: boundary test
+
+        session = current_session()
+        if (speaker is None or session is None or session.expressiveness != NATURAL
+                or source not in THINKING_SOURCES or is_brief_answer(text)
+                or turn_gate.faulted):
+            return None
+        return asyncio.create_task(
+            self._thinking_line(p, session, turn_gate, speaker, turn_end_ms, turn_n),
+            name="voice-thinking")
+
+    async def _thinking_line(self, p: VoicePorts, session: SessionContext, turn_gate,
+                             speaker: _FirstAudio, turn_end_ms: int, turn_n: int) -> None:
+        from app.local.voice.expression import THINKING, pick  # lazy: boundary test
+
+        due_s = self.config.thinking_after_s - (p.clock.mono_ms() - turn_end_ms) / 1000
+        try:
+            await asyncio.wait_for(speaker.started.wait(), timeout=max(0.0, due_s))
+            return                                   # the reply started in time: nothing
+        except asyncio.TimeoutError:
+            pass
+        name = pick(THINKING, session.last_thinking)
+        if name is None:
+            return
+        pcm = await self._line_pcm(p, THINKING[name])
+        if pcm is None or not getattr(pcm, "size", len(pcm)):
+            return
+        async with speaker.lock:
+            if speaker.started.is_set():
+                return                               # the reply got there while it loaded
+            if turn_gate.scripted(THINKING[name]) is None:
+                log.info("voice host: thinking=%s refused by the gate turn=%d", name, turn_n)
+                return
+            await p.audio_out.play(pcm, p.talker.sample_rate)
+        session.last_thinking = name
+        log.info("voice host: thinking=%s turn=%d at +%d ms from turn end", name, turn_n,
+                 p.clock.mono_ms() - turn_end_ms)
+
+    @staticmethod
+    async def _line_pcm(p: VoicePorts, text: str):
+        """A fixed line the assistant says on its own, pre-rendered in the reply voice when the
+        talker can (KokoroTalker.line), else the talker's fixed-phrase cache. None on failure."""
+        try:
+            line = getattr(p.talker, "line", None)
+            return await (line(text) if line is not None else p.talker.fixed(text))
+        except Exception:
+            log.exception("voice host: a fixed line could not be rendered")
+            return None
+
+    async def _warm_lines(self, p: VoicePorts) -> None:
+        """Pre-render the thinking lines and farewells in the reply voice (natural), off the
+        hot path, so a late reply's line costs nothing to start."""
+        from app.local.voice.expression import NATURAL, THINKING, farewells  # lazy
+
+        if self.config.expressiveness != NATURAL or getattr(p.talker, "line", None) is None:
+            return
+        for text in (*THINKING.values(), *farewells(NATURAL).values()):
+            await self._line_pcm(p, text)
 
     @staticmethod
     async def _flush_gate_records(p: VoicePorts, turn, verdict: tuple[str, str] | None,
