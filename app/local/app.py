@@ -216,13 +216,12 @@ async def create_app(
     app.state.debug_trigger = debug_trigger
     app.state.profile = profile
 
-    # Build the runtime-mutable assistant profile store from startup defaults.
-    # The profile starts with defaults; patch it at runtime via PATCH /v1/assistant/profile.
+    # Build the runtime-mutable assistant profile store.
+    # Defaults come from the loaded product profile (not from a bare Profile()).
     try:
-        from voxscribe.profile.schema import Profile
         from app.local.voice.profile_store import AssistantProfileStore
-        app.state.profile_store = AssistantProfileStore(Profile())
-        log.info("profile-store: initialised with default profile")
+        app.state.profile_store = AssistantProfileStore(profile)
+        log.info("profile-store: initialised from loaded profile mode=%s", getattr(profile, "mode", "?"))
     except Exception as exc:
         log.warning("profile-store: could not initialise: %s", exc)
 

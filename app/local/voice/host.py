@@ -469,6 +469,10 @@ def build_ports(app) -> VoicePorts:
     profile_store = getattr(getattr(app, "state", None), "profile_store", None)
 
     def _get_voice_speed():
+        # Prefer the session's row (read once at session open); fall back to store defaults.
+        session = current_session()
+        if session is not None:
+            return (session.voice_id, session.speed)
         if profile_store is not None:
             asst = profile_store.get().assistant
             return (asst.voice_id, asst.speed)
@@ -623,6 +627,8 @@ class SessionContext:
     session_id: str = ""            # set once the store has created the session row
     binding: SessionBinding = field(default_factory=SessionBinding)
     profile_version: str = ""       # the profile in force when the session opened
+    voice_id: str = ""              # synthesizer voice: tenant's row, read once at session open
+    speed: float = 1.0             # synthesizer speed: tenant's row, read once at session open
     history: list[dict] = field(default_factory=list)
     late_finals: list[asyncio.Task] = field(default_factory=list)   # final decodes past the window
     silent: bool = False            # turn 1 heard no genuine speech: leave no meeting behind
@@ -1044,7 +1050,15 @@ class VoiceHost:
         is written."""
         if binding is None:
             binding = self._device_binding()
+        # Load the tenant's assistant profile once before the session scope is entered.
+        # prepare() may query the database; it is not on the audio path.
+        _prepare = getattr(self._scope, "prepare", None)
+        _voice_id, _speed = "", 1.0
+        if _prepare is not None:
+            _voice_id, _speed, _ = await _prepare(binding)
         with self._scope.session(binding) as session:
+            session.voice_id = _voice_id
+            session.speed = _speed
             log.info("voice host: session open tenant=%s product=%s device=%s profile=%s",
                      session.tenant, session.product, session.device, session.profile_version)
             self._open = session
