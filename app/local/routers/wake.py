@@ -3,21 +3,36 @@
 GET  /v1/wake/state     → {state, model, phrase, trigger, meeting_id}
                           states: armed | listening | off | error
 GET  /v1/wake/profile   → {mode, delegate, quiet_hours_enabled}  current product profile summary
-POST /v1/wake/arm       → arm (no-op if already armed/listening)
+POST /v1/wake/arm       → arm (no-op if already armed/listening). With tenant isolation on, the
+                          verified person who arms is who the device listens for from then on
 POST /v1/wake/disarm    → set state to off; the armed loop closes its subscription
 POST /v1/wake/trigger   → DEBUG ONLY (--debug-trigger). Bypass the wake gate, start a session
                           immediately. Returns {meeting_id}. Use for automated roomplay tests.
 POST /v1/wake/power     → sleep | wake | lock | unlock from the app, for the capture watchdog
 
 Without --wake there is no voice host: the state is off and arm changes nothing.
+
+Who the device host's sessions belong to (PL05): nobody makes a request when a person says the
+wake phrase, so the tenant is bound ahead of time by a request that does carry a verified
+person. Arming is that request (it is also where consent to listen is given). With isolation on
+the host is off until someone arms it, and another person cannot take the device while a
+session runs (409 voice_session_in_progress). A host that is asked to arm or to start a session
+with no tenant bound refuses with voice_tenant_unbound.
 """
 
+from dataclasses import replace
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app.local.voice.host import VoiceConfig, WakeState
+from app.local.errors import EngineError
+from app.local.voice.host import (
+    SessionInProgressError,
+    SessionTenantRequiredError,
+    VoiceConfig,
+    WakeState,
+)
 
 router = APIRouter(prefix="/v1/wake", tags=["wake"])
 
@@ -30,6 +45,18 @@ def _host(request: Request):
 
 def _value(v) -> str:
     return v.value if isinstance(v, WakeState) else str(v)
+
+
+def _bind_caller(request: Request, host) -> None:
+    """The verified person making this request is who the device listens for. Without tenant
+    isolation there is no person on the request and the binding is left as it is."""
+    tenant = getattr(request.state, "tenant", None)
+    if tenant:
+        host.bind(replace(host.binding, tenant=tenant))
+
+
+def _refused(exc: SessionTenantRequiredError | SessionInProgressError) -> EngineError:
+    return EngineError(exc.code, str(exc), 409)
 
 
 @router.get("/profile")
@@ -67,7 +94,11 @@ async def arm_wake(request: Request):
     host = _host(request)
     if host is None:
         return {"state": WakeState.OFF.value, "changed": False}
-    changed = host.arm()      # the host publishes wake_state on a change
+    try:
+        _bind_caller(request, host)
+        changed = host.arm()      # the host publishes wake_state on a change
+    except (SessionTenantRequiredError, SessionInProgressError) as exc:
+        raise _refused(exc) from None
     return {"state": _value(host.state), "changed": changed}
 
 
@@ -102,7 +133,11 @@ async def trigger_wake_session(request: Request):
     if host is None or not host.ready:
         raise HTTPException(status_code=503, detail="voice host not ready")
 
-    mid = await host.trigger()
+    try:
+        _bind_caller(request, host)
+        mid = await host.trigger()
+    except (SessionTenantRequiredError, SessionInProgressError) as exc:
+        raise _refused(exc) from None
     return {"triggered": True, "state": _value(host.state), "meeting_id": mid}
 
 
