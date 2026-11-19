@@ -15,6 +15,9 @@
 --   tenant           the tenant in scope when the call ran; NULL with isolation off
 -- meeting_id is the session id. A thinker's call has a task id and may have no turn.
 
+-- status is 024's; added here too (a no-op after 024) so this file stands alone when the two
+-- land out of order, as the receipt index below needs it.
+ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS status TEXT;
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS tool_version TEXT;
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS side_effect TEXT;
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS connector TEXT;
