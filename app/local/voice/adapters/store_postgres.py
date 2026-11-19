@@ -126,6 +126,14 @@ class PostgresSessionStore:
         await gate_records.flush_reply(self._pool, turn.handle, decision=decision,
                                        category=category, ended=ended)
 
+    async def record_initiated(self, item_id: str, events, *, decision: str | None,
+                               category: str | None) -> None:
+        """The gate records of a line the device said on its own (a reminder or timer that came
+        due, PL46): its own ledger session `due:<item id>`, in the tenant's schema. This extends
+        the SessionStore port in this server. A failed write is logged by the ledger."""
+        rec = gate_records.InitiatedRecord(item_id, self._gate_policy().stamp, list(events))
+        await gate_records.flush_initiated(self._pool, rec, decision=decision, category=category)
+
     def _gate_policy(self):
         from app.local.voice.adapters.gate_policy import session_policy
 

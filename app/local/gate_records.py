@@ -13,6 +13,12 @@ refuses UPDATE, DELETE and TRUNCATE on the table.
                   it never reached one (category reply_cancelled or reply_failed)
   legacy          a row carried over from the old gate_decisions table by migration 021
 
+An initiated utterance (a reminder or timer that came due, PL46) is spoken with no turn of the
+person's: it gets a ledger of its own under the session id `due:<item id>`, with its own
+policy_applied row, a decision row per line the gate was asked about (the reminder's words,
+then the neutral line if those were refused) and an outcome row. Nothing was heard, so there is
+no heard row (flush_initiated).
+
 When they are written. The heard row before anything is played (record_heard). The evaluations
 are journalled in memory while the reply is spoken, so a clause costs no database round trip,
 and flush_reply() writes them with the outcome in one short transaction of their own: not the
@@ -220,6 +226,53 @@ async def _insert_reply_events(conn, rec, events, *, decision: str | None,
         rule = deciding.rule if deciding is not None else category
     await conn.execute(INSERT_SQL, _row(
         EVENT_OUTCOME, rec, decision=decision, category=category, rule=rule))
+
+
+INITIATED_PREFIX = "due:"
+
+
+@dataclass
+class InitiatedRecord:
+    """The ledger handle for one initiated utterance, shaped like a turn's for _row()."""
+
+    item_id: str
+    policy: PolicyStamp
+    gate_events: list = None
+    turn_id: str | None = None
+    turn_n: int | None = None
+    reply_id: str | None = None
+
+    def __post_init__(self) -> None:
+        self.gate_events = list(self.gate_events or [])
+
+    @property
+    def meeting_id(self) -> str:
+        return f"{INITIATED_PREFIX}{self.item_id}"
+
+    @property
+    def mode(self) -> str:
+        return self.policy.mode
+
+
+async def flush_initiated(pool, rec: InitiatedRecord, *, decision: str | None,
+                          category: str | None) -> bool:
+    """Write an initiated utterance's policy stamp, its evaluations and its outcome, in one
+    transaction. Errors are logged (ids and counts), never raised. True when written."""
+    stamp = rec.policy
+    try:
+        async with asyncio.timeout(WRITE_TIMEOUT_S):
+            async with pool.connection() as conn:
+                await conn.execute(INSERT_ONCE_PER_SESSION_SQL, _row(
+                    EVENT_POLICY_APPLIED, rec, posture=stamp.posture,
+                    policy_digest=stamp.digest or None, engine=stamp.engine or None))
+                await _insert_reply_events(conn, rec, rec.gate_events, decision=decision,
+                                           category=category)
+                await conn.commit()
+    except Exception:
+        log.exception("gate records: failed to write an initiated utterance's %d evaluation(s)"
+                      " item=%s", len(rec.gate_events), rec.item_id)
+        return False
+    return True
 
 
 _RECONSTRUCT_SQL = (
