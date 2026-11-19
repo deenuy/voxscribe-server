@@ -785,11 +785,17 @@ class VoiceHost:
         The armed loop leaves the old scope on its next frame and comes back in the new one. A
         session in progress keeps the binding it opened with, so binding the device to another
         tenant while one runs is refused. A binding with no tenant unbinds: with isolation on
-        the host then goes off until it is bound again."""
+        the host then goes off until it is bound again.
+
+        When the tenant changes, the previous one is told the device is off for them, in their
+        own scope and before the swap: from here on the room's speech is someone else's."""
         if binding == self._binding:
             return False
         if binding.tenant != self._binding.tenant and self._open is not None:
             raise SessionInProgressError("a voice session is in progress for another tenant")
+        if binding.tenant != self._binding.tenant and self.state != WakeState.OFF:
+            self._publish_device("wake_state", self.snapshot() | {"state": WakeState.OFF.value,
+                                                                  "meeting_id": None})
         self._binding = binding
         self._rebound = True
         log.info("voice host: bound tenant=%s product=%s device=%s", binding.tenant,
