@@ -14,16 +14,24 @@ INT16_SCALE = 32767
 
 
 class HeuristicSpeech:
-    def __init__(self) -> None:
+    def __init__(self, pause_s: float | None = None) -> None:
         self._td = None
         self._voice = None
+        self._pause_s = pause_s
+
+    def set_pause(self, pause_s: float | None) -> None:
+        """The end-of-turn pause for the next turn (the product profile's pace). Takes effect at
+        the next reset()."""
+        if pause_s != self._pause_s:
+            self._pause_s = pause_s
+            self._td = None
 
     def reset(self) -> None:
         """Raises RuntimeError when the speech stack is not installed (the host falls back)."""
         if self._td is None:
             from app.local.end_of_turn import TurnDetector
 
-            self._td = TurnDetector()
+            self._td = TurnDetector(self._pause_s)
         self._td.reset()
 
     def process(self, pcm_float32_mono: np.ndarray) -> list[TurnDecision]:

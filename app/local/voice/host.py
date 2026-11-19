@@ -104,6 +104,7 @@ SILENCE_S = 6.0                 # end-of-turn silence when the turn detector is 
 CAP_S = 300.0                   # hard cap per turn
 CONV_IDLE_S = 20.0              # how long to wait for the next turn of a conversation
 FIRST_TURN_GRACE_S = 2.0        # first turn: SILENCE_S plus this before giving up
+FIRST_TURN_WAIT_S = 8.0         # first turn: never less than this for a person to begin and finish
 IDLE_SPEECH_RMS_FACTOR = 4      # audio this far above RMS_FLOOR keeps a conversation open
 QUEUE_POLL_S = 0.5              # a capture gap this long ends the turn as timed out
 TICK_EVERY_FRAMES = 5           # poll the turn detector for a pause every this many chunks
@@ -346,6 +347,11 @@ class VoiceConfig:
                 # Profile field is the authority: if it says no blocking, settings cannot override.
                 if not getattr(profile, "quiet_hours_block_wake", True):
                     quiet_hours_block_wake = False
+
+            # The pace of the conversation: an operator's value wins over the profile's.
+            cfg_pause = getattr(settings, "end_of_turn_pause_s", None)
+            if cfg_pause is not None:
+                end_of_turn_pause_s = float(cfg_pause)
 
         return cls(
             wake_phrase=wake_phrase,
@@ -1209,14 +1215,21 @@ class VoiceHost:
         session.pre_roll = None
 
         if await self._listen(p, listen_q, ring, turn_n, use_turns):
-            if turn_n > 1:
-                log.info("[Vox Stopped] idle timeout after %d turn(s)", turn_n - 1)
+            heard = bool(texts) or bool(partial.text)
+            if turn_n == 1 and heard:
+                # The wait ran out while the person was still talking, or before the pause that
+                # closes a turn. They said something: answer it. Closing in silence here deleted
+                # conversations in which the person had spoken.
+                log.info("wake: turn 1 closed at the first-turn wait with words heard")
             else:
-                log.info("[Vox Stopped] first-turn audio timeout")
-                session.silent = True
-            ring.close()
-            recognize.cancel()
-            return False
+                if turn_n > 1:
+                    log.info("[Vox Stopped] idle timeout after %d turn(s)", turn_n - 1)
+                else:
+                    log.info("[Vox Stopped] first-turn audio timeout")
+                    session.silent = True
+                ring.close()
+                recognize.cancel()
+                return False
 
         turn_end_ms = p.clock.mono_ms()
 
@@ -1410,9 +1423,12 @@ class VoiceHost:
         silence_needed = int(pause_s * SAMPLE_RATE / CHUNK_FRAMES)
         cap_chunks = int(CAP_S * SAMPLE_RATE / CHUNK_FRAMES)
         conv_idle_s = self.config.conv_idle_s
-        idle_deadline = time.monotonic() + ((pause_s + FIRST_TURN_GRACE_S) if turn_n == 1
-                                            else conv_idle_s)
+        idle_deadline = time.monotonic() + (
+            max(pause_s + FIRST_TURN_GRACE_S, FIRST_TURN_WAIT_S) if turn_n == 1 else conv_idle_s)
         if use_turns:
+            set_pause = getattr(p.speech, "set_pause", None)
+            if set_pause is not None:
+                set_pause(pause_s)      # the product's pace: patient for a companion, brisk for an assistant
             p.speech.reset()
         p.clock.reset()
         silence_run = 0
@@ -1495,6 +1511,13 @@ class VoiceHost:
                     self._publish_segment(session_id, turn_n, seg)
                     if seg.text:
                         partial.update(seg.text)
+                        if use_turns:
+                            # Whether the sentence is finished is judged on what has been heard
+                            # so far, not only on what the recognizer has settled.
+                            try:
+                                p.speech.update_text(" ".join([*texts, partial.text]).strip())
+                            except Exception:
+                                pass
                 for seg in stable:
                     await p.store.add_segment(session_id, seg)
                     if seg.text:
