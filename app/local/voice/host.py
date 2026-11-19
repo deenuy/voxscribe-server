@@ -270,12 +270,12 @@ class VoiceConfig:
     detector: str = "openvocab"                 # display name until the detector is loaded
     quiet_hours: object | None = None           # anything with active() -> bool
     # When True, a wake inside the quiet-hours window is rejected and nothing plays.
-    # Senior care always answers a wake (VX-H5; PRODUCT-MAP.md: "must still answer a wake at
-    # night; only proactive speech and volume are restricted"), so this is False for that mode.
-    # TODO: this belongs in the core profile schema; move it there with the next core wheel.
+    # Read from the core profile field quiet_hours_block_wake; the profile is the authority.
     quiet_hours_block_wake: bool = True
     max_turns: int = 0                          # 0 = no limit; from profile.reply.max_turns
     conv_idle_s: float = CONV_IDLE_S            # idle timeout per turn; from profile.reply.idle_timeout_s
+    # End-of-turn silence from the profile; falls back to SILENCE_S when the profile is absent.
+    end_of_turn_pause_s: float = SILENCE_S
 
     @classmethod
     def from_settings(cls, settings) -> VoiceConfig:
@@ -297,14 +297,13 @@ class VoiceConfig:
             dataclass default (i.e. VOXSCRIBE_WAKE_PHRASE was set by the operator).
           - quiet_hours: settings.quiet_hours wins when settings.quiet_hours.enabled
             is True (i.e. VOXSCRIBE_QUIET_HOURS_ENABLED=true was set by the operator).
-            Exception: settings can never turn on wake-blocking for senior_care mode.
+        Invariant: if the profile's quiet_hours_block_wake is False, no server setting
+        may re-enable blocking. The profile field is the authority (VX-H5).
         """
         from app.local.voice.wake_setup import DEFAULT_DETECTOR, DETECTOR_ENV
 
-        mode = getattr(profile, "mode", "personal")
-
-        # Senior care must always answer a wake (VX-H5); only proactive speech is suppressed.
-        quiet_hours_block_wake = (mode != "senior_care")
+        # Wake-blocking policy comes from the profile field, not a mode-name check.
+        quiet_hours_block_wake = getattr(profile, "quiet_hours_block_wake", True)
 
         quiet_hours: QuietHours | None = None
         if getattr(profile, "quiet_hours_enabled", False):
@@ -320,6 +319,8 @@ class VoiceConfig:
         max_turns = int(getattr(reply, "max_turns", 0)) if reply else 0
         conv_idle_s = float(getattr(reply, "idle_timeout_s", CONV_IDLE_S)) if reply else CONV_IDLE_S
 
+        end_of_turn_pause_s = float(getattr(profile, "end_of_turn_pause_s", SILENCE_S))
+
         # Apply explicit server-config overrides on top of profile defaults.
         if settings is not None:
             # Wake phrase: explicit env override wins when it differs from the config default.
@@ -327,16 +328,15 @@ class VoiceConfig:
             if settings_phrase and settings_phrase != _CONFIG_DEFAULT_WAKE_PHRASE:
                 wake_phrase = settings_phrase.lower().strip()
 
-            # Quiet hours: operator env override wins, but can never enable wake-blocking
-            # for senior care -- that would silence the person who needs it most.
+            # Quiet hours: operator env override wins.
             cfg_qh = getattr(settings, "quiet_hours", None)
             if cfg_qh is not None and getattr(cfg_qh, "enabled", False):
                 quiet_hours = QuietHours(
                     getattr(cfg_qh, "start", "22:00"),
                     getattr(cfg_qh, "end", "07:00"),
                 )
-                # Still cannot block wakes in senior care.
-                if mode == "senior_care":
+                # Profile field is the authority: if it says no blocking, settings cannot override.
+                if not getattr(profile, "quiet_hours_block_wake", True):
                     quiet_hours_block_wake = False
 
         return cls(
@@ -346,6 +346,7 @@ class VoiceConfig:
             quiet_hours_block_wake=quiet_hours_block_wake,
             max_turns=max_turns,
             conv_idle_s=conv_idle_s,
+            end_of_turn_pause_s=end_of_turn_pause_s,
         )
 
 
@@ -1373,10 +1374,11 @@ class VoiceHost:
         """Stage turn: feed capture to the recognizer and the turn policy until the turn ends.
 
         Returns True when the turn timed out (no audio, or idle past the deadline)."""
-        silence_needed = int(SILENCE_S * SAMPLE_RATE / CHUNK_FRAMES)
+        pause_s = self.config.end_of_turn_pause_s
+        silence_needed = int(pause_s * SAMPLE_RATE / CHUNK_FRAMES)
         cap_chunks = int(CAP_S * SAMPLE_RATE / CHUNK_FRAMES)
         conv_idle_s = self.config.conv_idle_s
-        idle_deadline = time.monotonic() + ((SILENCE_S + FIRST_TURN_GRACE_S) if turn_n == 1
+        idle_deadline = time.monotonic() + ((pause_s + FIRST_TURN_GRACE_S) if turn_n == 1
                                             else conv_idle_s)
         if use_turns:
             p.speech.reset()

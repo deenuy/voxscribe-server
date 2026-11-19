@@ -46,15 +46,19 @@ log = logging.getLogger("app.local.voice.gate")
 
 SURFACE_TTS = "tts"                  # every clause the host speaks is evaluated on this surface
 
-# Product mode (as the profile spells it) -> core policy pack. Core 0.5.0 ships no pack for
-# personal mode and its loader refuses the name, so personal runs on the ideascribe pack: the
-# same posture (denylist) and the same audience (an adult's own device).
+# Product mode (as the profile spells it) -> core policy pack (canonical pack filename).
+# Core 0.6.0 ships a personal pack and accepts both "senior_care" and "seniorcare" for
+# the senior care pack. PACK_ALIASES maps profile-layer spellings to canonical filenames
+# for the case where a profile explicitly sets gate.policy_pack with an underscore spelling.
 PACK_FOR_MODE = {
     "senior_care": "seniorcare",
     "classroom": "classroom",
     "ideascribe": "ideascribe",
-    "personal": "ideascribe",
+    "personal": "personal",
 }
+# Explicit aliases for pack names a profile may spell with underscores (profile-layer convention).
+# Replaces the previous generic .replace("_", "") normalisation; core handles both spellings too.
+PACK_ALIASES = {"senior_care": "seniorcare"}
 RESTRICTED_PACKS = ("seniorcare", "classroom")       # must load, and must load as allowlist
 MODE_FOR_RESTRICTED_PACK = {"seniorcare": "senior_care", "classroom": "classroom"}
 PROFILE_DEFAULT_PACK = "default"                     # GateConfig.policy_pack when a profile names none
@@ -109,7 +113,8 @@ def _resolve(profile, settings) -> tuple[str, str]:
     if named == PROFILE_DEFAULT_PACK:
         pack = PACK_FOR_MODE.get(mode, "")
     else:
-        pack = str(named).replace("_", "").strip().lower()      # profile says senior_care
+        raw = str(named).strip().lower()
+        pack = PACK_ALIASES.get(raw, raw)      # apply explicit aliases; core handles both spellings
     if mode in PACK_FOR_MODE and PACK_FOR_MODE[mode] in RESTRICTED_PACKS \
             and pack != PACK_FOR_MODE[mode]:
         raise core_policy.PolicyPackError(f"{mode} mode must run its own pack, profile names {pack!r}")

@@ -49,7 +49,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "pyyaml>=6.0",
     "psycopg[binary,pool]>=3.1",
-    "voxscribe-core[knowledge,wake]==0.5.0",
+    "voxscribe-core[knowledge,wake]==0.6.0",
     "httpx>=0.27",
     "faster-whisper>=1.0",
     "pyjwt>=2.15.1",
@@ -125,7 +125,7 @@ voxscribe-engine = "app.local.engine:run"
 # `make core-wheel` and follow what it prints.
 # Development against the sibling core: `make core-dev`. Back to the wheel: `make core-pinned`.
 [tool.uv.sources]
-voxscribe-core = { path = "wheels/voxscribe_core-0.5.0-py3-none-any.whl" }
+voxscribe-core = { path = "wheels/voxscribe_core-0.6.0-py3-none-any.whl" }
 
 # ---------------------------------------------------------------------------
 # Tool: pytest
