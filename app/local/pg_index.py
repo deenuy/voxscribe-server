@@ -229,6 +229,16 @@ class PostgresKnowledgeIndex:
             rows = await cur.fetchall()
         return [(row[0], row[1]) for row in rows]
 
+    async def source_names(self, source_ids) -> dict[str, str]:
+        """Map source id to its display name (the `name` column)."""
+        ids = list(source_ids)
+        if not ids:
+            return {}
+        async with self.pool.connection() as conn:
+            cur = await conn.execute("SELECT id, name FROM sources WHERE id = ANY(%s)", (ids,))
+            rows = await cur.fetchall()
+        return {row[0]: row[1] for row in rows}
+
     async def get_source_filename(self, source_id: str) -> str | None:
         """Get source filename for display."""
         async with self.pool.connection() as conn:

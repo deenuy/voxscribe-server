@@ -2136,7 +2136,7 @@
     },
     "/v1/chat/threads/{thread_id}/messages": {
       "post": {
-        "description": "Send a message and stream the response.",
+        "description": "Send a message and stream the answer as server-sent events.\n\n`event: token` {\"text\"} for each piece of the answer, then `event: citations` {\"citations\"} and `event: done`\n{\"messageId\"}; or `event: error` {\"error\", \"detail\"}. A scribe thread (scope.meetingId) is answered from that\nscribe's transcript, any other from the person's sources (chat_grounding.py). Every database read goes through\nthe tenant pool, and the model runs on a worker thread, never on the event loop.",
         "operationId": "send_message_v1_chat_threads__thread_id__messages_post",
         "parameters": [
           {
