@@ -1,6 +1,8 @@
 """Talker over Kokoro-ONNX, with the macOS say fallback and the fixed-phrase cache (tts_engine)."""
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 
 from app.local import tts_engine
@@ -17,8 +19,15 @@ def _pcm(samples) -> np.ndarray:
 class KokoroTalker:
     sample_rate = tts_engine.PLAYBACK_RATE_HZ
 
+    def __init__(self, get_voice_speed: Callable[[], tuple[str, float]] | None = None) -> None:
+        # get_voice_speed() returns (voice_id, speed); empty voice_id uses the engine default.
+        self._get_voice_speed = get_voice_speed or (lambda: ("", 1.0))
+
     async def synthesize(self, text: str) -> np.ndarray:
-        return _pcm(await tts_engine.synthesize(text))
+        voice, speed = self._get_voice_speed()
+        if voice:
+            return _pcm(await tts_engine.synthesize(text, voice=voice, speed=speed))
+        return _pcm(await tts_engine.synthesize(text, speed=speed))
 
     async def fixed(self, phrase: str) -> np.ndarray:
         # Pre-rendered with say; when the cache cannot render it, synthesise it live instead.
