@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+- Fixed the first turn of a voice session ending at the first-turn wait instead of on the person's pause (PL59). The turn detector settled on digital silence before every turn, so the room after the person stopped still read as speech and the closing pause started a second or more late; it now settles on the room's own sound. The first-turn wait now applies only while nothing has been recognised, and a cue is muted from capture for its whole length (the cues are about 1.6 s; the mute was 1.1 s).
+
 ## What's New in VoxScribe Server 0.10.0
 
 Baseline release of 2026-11-19. Uses voxscribe-core 0.6.0. Starting this version applies migrations

@@ -108,17 +108,19 @@ class TurnDetector:
         """Milliseconds of audio fed since reset(): the clock tick() expects."""
         return self._samples_fed * 1000 // _SAMPLE_RATE
 
-    def reset(self) -> None:
-        """Start a new session. Call once per wake trigger."""
+    def reset(self, room=None) -> None:
+        """Start a new turn. `room` is the room as it sounds when nobody speaks (float32 mono
+        at 16 kHz, any length): the detector settles on it. Without it the detector settles on
+        digital silence, which no microphone hears (see _settle)."""
         self._detector.reset()
         self._tracker.reset()
         self._adapter.reset()
         self._now_ms = 0
         self._samples_fed = 0
-        self._settle()
+        self._settle(room)
         log.debug("end_of_turn: reset")
 
-    def _settle(self) -> None:
+    def _settle(self, room=None) -> None:
         """Let the detector find its footing before the turn's audio arrives.
 
         A freshly reset detector does not report speech that begins in its first half second or
@@ -127,10 +129,24 @@ class TurnDetector:
         that turn was never seen to open, so it never closed and the person was never answered
         (measured 2026-11-19: no start reported for speech in the first 0.3 s after a reset).
         The settling audio is silence and belongs to no turn; the time it takes is kept so the
-        host's stream clock and the detector's own timeline still agree in tick()."""
-        quiet = self._np.zeros(_CHUNK_FRAMES, dtype="float32")
-        for _ in range(_SETTLE_FRAMES):
-            self._detector.process(quiet)
+        host's stream clock and the detector's own timeline still agree in tick().
+
+        What the detector settles on is the room it then measures speech against: its floor is
+        learned in the warm-up and afterwards rises at only 1.5 dB a second. Settled on digital
+        silence, the floor sits near -120 dB for the whole turn, every sound a microphone picks
+        up reads as far louder than the room, and only voicing and modulation are left to tell
+        speech from the room. Room noise that is not white then counts as speech for a second
+        and more after the person stops, so the pause that closes the turn starts late (the
+        first-turn defect of 2026-11-19, PL59). Settled on the room's own sound, the floor is
+        the room's and the pause starts when the person stops. With no room to hand the
+        settling audio is silence, as before."""
+        n = _SETTLE_FRAMES * _CHUNK_FRAMES
+        pcm = None if room is None else self._np.asarray(room, dtype="float32").reshape(-1)
+        if pcm is None or pcm.size < _CHUNK_FRAMES:
+            pcm = self._np.zeros(n, dtype="float32")
+        elif pcm.size < n:
+            pcm = self._np.resize(pcm, n)
+        self._detector.process(pcm[-n:])
         self._settle_ms = _SETTLE_FRAMES * _CHUNK_FRAMES * 1000 // _SAMPLE_RATE
 
     def push_pcm16(self, frame_bytes: bytes, now_ms: int) -> object | None:

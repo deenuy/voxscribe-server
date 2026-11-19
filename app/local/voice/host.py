@@ -112,11 +112,18 @@ SILENCE_S = 6.0                 # end-of-turn silence when the turn detector is 
 CAP_S = 300.0                   # hard cap per turn
 CONV_IDLE_S = 20.0              # how long to wait for the next turn of a conversation
 FIRST_TURN_GRACE_S = 2.0        # first turn: SILENCE_S plus this before giving up
-FIRST_TURN_WAIT_S = 8.0         # first turn: never less than this for a person to begin and finish
+# First turn: how long a person has to begin, never less than this. It applies only while nothing
+# has been recognised; once the person has said something the turn ends on their pause, and the
+# wait is the conversation's (conv_idle_s from the last words recognised), as in later turns.
+FIRST_TURN_WAIT_S = 8.0
 IDLE_SPEECH_RMS_FACTOR = 4      # audio this far above RMS_FLOOR keeps a conversation open
 QUEUE_POLL_S = 0.5              # a capture gap this long ends the turn as timed out
 TICK_EVERY_FRAMES = 5           # poll the turn detector for a pause every this many chunks
 TURN_RING_S = 60.0              # capture held for the recognizer, oldest dropped beyond this
+# The room as it sounds when nobody speaks, for the turn detector to settle on before each turn
+# (RoomTone): the quietest ROOM_TONE_CHUNKS of the last ROOM_HISTORY_CHUNKS heard.
+ROOM_TONE_CHUNKS = 25           # 0.8 s, the detector's settling length
+ROOM_HISTORY_CHUNKS = 125       # 4 s
 RECOGNIZE_DRAIN_TIMEOUT_S = 120.0
 BARGE_RATIO = 2.5               # mic_rms / playback_rms above this stops playback while armed
 MIN_PLAYBACK_RMS = 1e-6
@@ -608,6 +615,48 @@ class PreRollQueue:
         return not self._pre and self._live.empty()
 
 
+class RoomTone:
+    """The room as it sounds when nobody speaks: the quietest recent capture, in the order it
+    was heard. The turn detector settles on it before each turn, so it measures speech against
+    the room and not against digital silence (end_of_turn.TurnDetector._settle, PL59).
+
+    Fed with unmuted capture while armed and while listening; speech in it does not matter, the
+    quietest chunks are the pauses. Until it has ROOM_TONE_CHUNKS it has no sample (a session
+    started from the app with the listener off): the detector then settles on silence."""
+
+    def __init__(self, history: int = ROOM_HISTORY_CHUNKS, size: int = ROOM_TONE_CHUNKS) -> None:
+        self._recent: deque = deque(maxlen=max(history, size))
+        self._size = size
+
+    def offer(self, chunk) -> None:
+        if len(chunk) != CHUNK_FRAMES:
+            return
+        pcm = np.asarray(chunk, dtype=np.float32).copy()
+        self._recent.append((_rms(pcm), pcm))
+
+    def sample(self) -> np.ndarray | None:
+        if len(self._recent) < self._size:
+            return None
+        quiet = sorted(range(len(self._recent)), key=lambda i: self._recent[i][0])[:self._size]
+        return np.concatenate([self._recent[i][1] for i in sorted(quiet)])
+
+
+class TurnHearing:
+    """What the recognizer has heard in the turn so far: whether any words, and when the last
+    ones came (time.monotonic). Recognised words, not loudness, are what the turn's waits
+    measure."""
+
+    def __init__(self) -> None:
+        self.last_mono: float | None = None
+
+    @property
+    def words(self) -> bool:
+        return self.last_mono is not None
+
+    def heard(self) -> None:
+        self.last_mono = time.monotonic()
+
+
 class _TurnRing:
     """Capture held for the recognizer task: drop-oldest, closed with a None sentinel."""
 
@@ -888,6 +937,7 @@ class VoiceHost:
         self._initiated: list[tuple[Initiated, asyncio.Future]] = []   # waiting for a turn's end
         self._initiated_lock = asyncio.Lock()
         self._last_voice_mono: float | None = None   # armed: when capture last held a voice
+        self._room = RoomTone()                        # what the room sounds like (PL59)
         self._session_listeners: list[Callable[[str | None], None]] = []
         self.initiated_hold_s = INITIATED_HOLD_S
         self._state: dict = {
@@ -1154,8 +1204,10 @@ class VoiceHost:
             # No wake detection while the speaker plays: it would hear itself.
             if out.is_playing:
                 continue
-            if rms > RMS_FLOOR * IDLE_SPEECH_RMS_FACTOR and not p.audio_in.capture_muted():
-                self._last_voice_mono = p.clock.mono_ms() / 1000   # someone is talking
+            if not p.audio_in.capture_muted():
+                self._room.offer(chunk)
+                if rms > RMS_FLOOR * IDLE_SPEECH_RMS_FACTOR:
+                    self._last_voice_mono = p.clock.mono_ms() / 1000   # someone is talking
 
             frame_buf = np.concatenate([frame_buf, np.asarray(chunk, dtype=np.float32)])
             while frame_buf.shape[0] >= FRAME_SAMPLES:
@@ -1354,8 +1406,10 @@ class VoiceHost:
         ring = _TurnRing(int(TURN_RING_S * SAMPLE_RATE / CHUNK_FRAMES))
         texts: list[str] = []
         partial = StablePartial()
+        hearing = TurnHearing()
         recognize = asyncio.create_task(
-            self._recognize(p, ring, stream, session_id, turn_n, texts, partial, use_turns),
+            self._recognize(p, ring, stream, session_id, turn_n, texts, partial, use_turns,
+                            hearing),
             name="voice-recognize")
 
         # After a barge-in the interjection has already started: its first audio was captured
@@ -1366,7 +1420,7 @@ class VoiceHost:
         session.pre_roll = None
         session.speech_onset_mono = session.reply_ended_mono = None
 
-        if await self._listen(p, listen_q, ring, turn_n, use_turns, session):
+        if await self._listen(p, listen_q, ring, turn_n, use_turns, session, hearing):
             heard = bool(texts) or bool(partial.text)
             if session.stop_requested:
                 log.info("[Vox Stopped] ended from the app (turn=%d)", turn_n)
@@ -1375,9 +1429,9 @@ class VoiceHost:
                 recognize.cancel()
                 return False
             if turn_n == 1 and heard:
-                # The wait ran out while the person was still talking, or before the pause that
-                # closes a turn. They said something: answer it. Closing in silence here deleted
-                # conversations in which the person had spoken.
+                # The wait ran out after the person said something (it is the conversation's
+                # wait from their last words by then, PL59): answer what they said. Closing in
+                # silence here deleted conversations in which the person had spoken.
                 log.info("wake: turn 1 closed at the first-turn wait with words heard")
             else:
                 if turn_n > 1:
@@ -1591,12 +1645,17 @@ class VoiceHost:
                  len(done), len(pending), session.session_id)
 
     async def _listen(self, p: VoicePorts, audio_q, ring: _TurnRing, turn_n: int,
-                      use_turns: bool, session: SessionContext | None = None) -> bool:
+                      use_turns: bool, session: SessionContext | None = None,
+                      hearing: TurnHearing | None = None) -> bool:
         """Stage turn: feed capture to the recognizer and the turn policy until the turn ends.
 
         Returns True when the turn timed out (no audio, or idle past the deadline) or the session
         was ended from the app. While the session is muted capture is read and dropped: nothing
-        reaches the recognizer or the turn policy, and the deadline is the end of the mute hold."""
+        reaches the recognizer or the turn policy, and the deadline is the end of the mute hold.
+
+        The first turn's wait (FIRST_TURN_WAIT_S) is for a person to begin: once `hearing` has
+        words, the deadline is conv_idle_s after the last of them, so a person who is talking is
+        never cut off by it and the turn ends on their pause."""
         pause_s = self.config.end_of_turn_pause_s
         silence_needed = int(pause_s * SAMPLE_RATE / CHUNK_FRAMES)
         cap_chunks = int(CAP_S * SAMPLE_RATE / CHUNK_FRAMES)
@@ -1607,6 +1666,9 @@ class VoiceHost:
             set_pause = getattr(p.speech, "set_pause", None)
             if set_pause is not None:
                 set_pause(pause_s)      # the product's pace: patient for a companion, brisk for an assistant
+            set_room = getattr(p.speech, "set_room", None)
+            if set_room is not None:
+                set_room(self._room.sample())   # measure speech against this room, not silence
             p.speech.reset()
         p.clock.reset()
         silence_run = 0
@@ -1623,6 +1685,8 @@ class VoiceHost:
                 if was_muted and not muted:         # unmuted: a fresh wait for the person to speak
                     idle_deadline = time.monotonic() + conv_idle_s
                 was_muted = muted
+                if hearing is not None and hearing.last_mono is not None:
+                    idle_deadline = max(idle_deadline, hearing.last_mono + conv_idle_s)
                 deadline = session.muted_until if muted else idle_deadline
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1647,6 +1711,7 @@ class VoiceHost:
                 if not from_pre_roll and p.audio_in.capture_muted():
                     silence_run = 0
                     continue
+                self._room.offer(chunk)
 
                 if session is not None:
                     now_s = p.clock.mono_ms() / 1000
@@ -1689,7 +1754,7 @@ class VoiceHost:
 
     async def _recognize(self, p: VoicePorts, ring: _TurnRing, stream, session_id: str,
                          turn_n: int, texts: list[str], partial: StablePartial,
-                         use_turns: bool) -> None:
+                         use_turns: bool, hearing: TurnHearing | None = None) -> None:
         """Stage recognize during a turn: stable segments are stored and fed to the policy;
         partials are published and tracked for the fast-finalize fallback."""
         while True:
@@ -1708,6 +1773,8 @@ class VoiceHost:
                     self._publish_segment(session_id, turn_n, seg)
                     if seg.text:
                         partial.update(seg.text)
+                        if hearing is not None:
+                            hearing.heard()
                         if use_turns:
                             # Whether the sentence is finished is judged on what has been heard
                             # so far, not only on what the recognizer has settled.
@@ -1719,6 +1786,8 @@ class VoiceHost:
                     await p.store.add_segment(session_id, seg)
                     if seg.text:
                         texts.append(seg.text)
+                        if hearing is not None:
+                            hearing.heard()
                         if use_turns:
                             try:
                                 p.speech.update_text(" ".join(texts))
