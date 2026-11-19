@@ -259,15 +259,23 @@ async def test_erase_allows_clean_restart():
 
 @pytest.mark.asyncio
 async def test_erase_removes_tenant_files():
-    """DELETE /v1/data removes the tenant's files from the data directory."""
+    """DELETE /v1/data removes the tenant's files directory and nothing else in the data directory.
+
+    The data directory is chosen by whoever runs the engine and may hold files the engine does not own; erase used to
+    delete all of it with isolation off."""
     import httpx
 
     schema = await _fresh_schema()
     data_dir = Path(tempfile.mkdtemp(prefix="voxscribe_test_"))
     try:
-        # Isolation off: files live directly in data_dir.
-        tenant_file = data_dir / "recording.wav"
+        # Isolation off: the single shared scope's files live in data_dir/tenants/shared/.
+        from app.local.routers.data import tenant_files_dir
+
+        tenant_file = tenant_files_dir(data_dir, None) / "recording.wav"
+        tenant_file.parent.mkdir(parents=True)
         tenant_file.write_bytes(b"fake audio")
+        foreign = data_dir / "not-the-engines.txt"
+        foreign.write_text("kept")
 
         app = await _make_app(schema, data_dir)
         ctx = app.router.lifespan_context(app)
@@ -282,6 +290,7 @@ async def test_erase_removes_tenant_files():
             assert resp.status_code == 204
 
             assert not tenant_file.exists()
+            assert foreign.read_text() == "kept"
 
         await ctx.__aexit__(None, None, None)
     finally:
@@ -380,14 +389,18 @@ async def test_export_contains_seeded_records(client):
 
 @pytest.mark.asyncio
 async def test_export_includes_tenant_files():
-    """Files placed in the data directory appear in the export under files/."""
+    """The tenant's files appear in the export under files/; other files in the data directory do not."""
     import httpx
 
     schema = await _fresh_schema()
     data_dir = Path(tempfile.mkdtemp(prefix="voxscribe_test_"))
     try:
-        fake_file = data_dir / "notes.txt"
+        from app.local.routers.data import tenant_files_dir
+
+        fake_file = tenant_files_dir(data_dir, None) / "notes.txt"
+        fake_file.parent.mkdir(parents=True)
         fake_file.write_text("hello from test")
+        (data_dir / "not-the-engines.txt").write_text("not exported")
 
         app = await _make_app(schema, data_dir)
         ctx = app.router.lifespan_context(app)
@@ -402,7 +415,8 @@ async def test_export_includes_tenant_files():
         with tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
             names = tar.getnames()
 
-        assert any("notes.txt" in n for n in names)
+        assert "files/notes.txt" in names
+        assert not any("not-the-engines" in n for n in names)
 
         await ctx.__aexit__(None, None, None)
     finally:

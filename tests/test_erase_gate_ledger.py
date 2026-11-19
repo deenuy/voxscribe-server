@@ -12,8 +12,10 @@ import psycopg
 import pytest
 
 from app.local import tenancy
-from tests.test_tenancy import keys, tenant_engine  # noqa: F401 - fixtures
+from tests import test_tenancy
 from tests.testdb import TEST_DATABASE_URL
+
+keys, tenant_engine = test_tenancy.keys, test_tenancy.tenant_engine   # fixtures, shared with test_tenancy
 
 APP = Path(__file__).resolve().parent.parent / "app" / "local"
 ERASE = {"X-Confirm": "delete-all"}
