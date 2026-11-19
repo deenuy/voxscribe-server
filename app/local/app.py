@@ -211,6 +211,8 @@ async def create_app(
     app.state.auth_disabled = auth_disabled
     app.state.auth_token = os.environ.get("VOXSCRIBE_TOKEN", str(uuid.uuid4()))
     app.state.settings = settings
+    from app.local import events as _events
+    _events.configure(replay_buffer=settings.events_replay_buffer, max_streams=settings.events_max_streams)
     app.state.started_at = time.time()
     app.state.wake_enabled = wake
     app.state.debug_trigger = debug_trigger

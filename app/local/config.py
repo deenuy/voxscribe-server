@@ -139,6 +139,12 @@ class Config:
     # Retrieval
     retrieval_top_k: int = 6
 
+    # Event stream (/v1/events): how many recent events each tenant's stream keeps for a client that
+    # reconnects (VOXSCRIBE_EVENTS_REPLAY_BUFFER), and how many streams are kept at once
+    # (VOXSCRIBE_EVENTS_MAX_STREAMS). In memory only; a gap older than the buffer gets a stream.reset.
+    events_replay_buffer: int = 1024
+    events_max_streams: int = 256
+
     # Identity: when all three are set, every request must carry a verified person and each person's data is kept
     # apart. With none set, one person uses the engine at a time (the local single-user mode).
     identity_issuer: str = ""
@@ -344,6 +350,16 @@ class Config:
 
         # Retrieval
         config_dict["retrieval_top_k"] = _parse_int(env_vars, "VOXSCRIBE_RETRIEVAL_TOP_K", 6)
+
+        # Event stream bounds
+        for env_name, field in (
+            ("VOXSCRIBE_EVENTS_REPLAY_BUFFER", "events_replay_buffer"),
+            ("VOXSCRIBE_EVENTS_MAX_STREAMS", "events_max_streams"),
+        ):
+            value = _parse_int(env_vars, env_name, getattr(cls, field))
+            if value < 1:
+                _fail(env_name, f"must be at least 1, got {value}")
+            config_dict[field] = value
 
         # Voice (planned, accepted but unused)
         voice_enabled = env_vars.get("VOXSCRIBE_VOICE_ENABLED", "").strip().lower()

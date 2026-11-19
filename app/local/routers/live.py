@@ -173,22 +173,26 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
 
         # Event reader task
         async def event_reader():
-            """Read events from the meeting bus and send to client."""
+            """Read events from the meeting bus and send to client. This socket is one watcher
+            among any others of the meeting; each gets every event."""
             queue = await bus.subscribe()
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=30)
-                    frame = _to_frame(event)
-                    if frame is not None:
-                        try:
-                            await websocket.send_json(frame)
-                        except Exception as e:
-                            log.debug(f"Failed to send event: {e}")
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    log.debug(f"Event reader error: {e}")
-                    break
+            try:
+                while True:
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=30)
+                        frame = _to_frame(event)
+                        if frame is not None:
+                            try:
+                                await websocket.send_json(frame)
+                            except Exception as e:
+                                log.debug(f"Failed to send event: {e}")
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        log.debug(f"Event reader error: {e}")
+                        break
+            finally:
+                bus.unsubscribe(queue)
 
         # Start event reader in background
         event_task = asyncio.create_task(event_reader())

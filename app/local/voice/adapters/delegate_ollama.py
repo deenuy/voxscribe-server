@@ -36,7 +36,7 @@ from voxscribe.session.ports import ReplyStream
 
 from app.local import reply_chain
 from app.local.voice import delegate_lane as dl
-from app.local.voice.adapters.events_app import publish_broadcast
+from app.local.voice.adapters.events_app import publish as publish_event
 from app.local.voice.adapters.store_postgres import PostgresDelegateTaskStore
 from app.local.voice.delegate_lane import DelegateLane, DelegateTask, IntentKind
 from app.local.voice import reminder_store as rs
@@ -236,7 +236,7 @@ class OllamaDelegate:
         """Lane hook: keep the task's row current and tell the app its status."""
         if task.status not in dl.ACTIVE_STATUSES:
             self._contexts.pop(task.task_id, None)
-        publish_broadcast(TASK_EVENT, {"taskId": task.task_id, "meetingId": task.session_id,
+        publish_event(TASK_EVENT, {"taskId": task.task_id, "meetingId": task.session_id,
                                        "status": task.status.value})
         try:
             write = asyncio.get_running_loop().create_task(self._task_store.save(task),
