@@ -472,7 +472,7 @@ async def create_app(
         result = {
             "status": status,
             "version": engine_version(),
-            "profile": "ideascribe",
+            "profile": getattr(getattr(app.state, "profile", None), "mode", "unknown"),
             # The list is what clients test with `includes`; the detail of a capability sits beside it under its own
             # name (the app reads `capabilities` as a list, so it cannot become an object).
             "capabilities": [

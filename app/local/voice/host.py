@@ -39,6 +39,7 @@ No transcript text, audio or prompt is logged.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import os
 import re
@@ -228,12 +229,35 @@ class WakeState(str, Enum):
     ERROR = "error"
 
 
+class QuietHours:
+    """Active during the configured window. start and end are 'HH:MM' strings.
+
+    When start > end the window wraps midnight (e.g. 21:00-08:00).
+    """
+
+    def __init__(self, start: str, end: str) -> None:
+        sh, sm = (int(x) for x in start.split(":"))
+        eh, em = (int(x) for x in end.split(":"))
+        self._start = datetime.time(sh, sm)
+        self._end = datetime.time(eh, em)
+
+    def active(self) -> bool:
+        now = datetime.datetime.now().time().replace(second=0, microsecond=0)
+        s, e = self._start, self._end
+        if s <= e:
+            return s <= now < e
+        # wraps midnight
+        return now >= s or now < e
+
+
 @dataclass(frozen=True)
 class VoiceConfig:
     wake_phrase: str = "hey vox"
     trigger_phrase: str = ASR_CONFIRM_PHRASE    # what a person must say; shown in the UI
     detector: str = "openvocab"                 # display name until the detector is loaded
     quiet_hours: object | None = None           # anything with active() -> bool
+    max_turns: int = 0                          # 0 = no limit; from profile.reply.max_turns
+    conv_idle_s: float = CONV_IDLE_S            # idle timeout per turn; from profile.reply.idle_timeout_s
 
     @classmethod
     def from_settings(cls, settings) -> VoiceConfig:
@@ -243,6 +267,33 @@ class VoiceConfig:
             wake_phrase=getattr(settings, "wake_phrase", "hey vox").lower().strip(),
             detector=os.environ.get(DETECTOR_ENV, "").strip() or DEFAULT_DETECTOR,
             quiet_hours=getattr(settings, "quiet_hours", None),
+        )
+
+    @classmethod
+    def from_profile(cls, profile) -> VoiceConfig:
+        """Build from a voxscribe-core Profile; profile-driven fields replace defaults."""
+        from app.local.voice.wake_setup import DEFAULT_DETECTOR, DETECTOR_ENV
+
+        quiet_hours: QuietHours | None = None
+        if getattr(profile, "quiet_hours_enabled", False):
+            quiet_hours = QuietHours(
+                getattr(profile, "quiet_hours_start", "22:00"),
+                getattr(profile, "quiet_hours_end", "07:00"),
+            )
+
+        wake = getattr(profile, "wake", None)
+        wake_phrase = (getattr(wake, "phrase", "hey vox") if wake else "hey vox").lower().strip()
+
+        reply = getattr(profile, "reply", None)
+        max_turns = int(getattr(reply, "max_turns", 0)) if reply else 0
+        conv_idle_s = float(getattr(reply, "idle_timeout_s", CONV_IDLE_S)) if reply else CONV_IDLE_S
+
+        return cls(
+            wake_phrase=wake_phrase,
+            detector=os.environ.get(DETECTOR_ENV, "").strip() or DEFAULT_DETECTOR,
+            quiet_hours=quiet_hours,
+            max_turns=max_turns,
+            conv_idle_s=conv_idle_s,
         )
 
 
@@ -363,6 +414,14 @@ def build_ports(app) -> VoicePorts:
 
     settings = getattr(app.state, "settings", None)
     engine = getattr(app.state, "audio_engine", None)
+    profile_store = getattr(getattr(app, "state", None), "profile_store", None)
+
+    def _get_voice_speed():
+        if profile_store is not None:
+            asst = profile_store.get().assistant
+            return (asst.voice_id, asst.speed)
+        return ("", 1.0)
+
     recognizer = WhisperRecognizer(getattr(app.state, "providers", {}).get("asr"), settings)
     recognizer.warm()
     return VoicePorts(
@@ -370,7 +429,7 @@ def build_ports(app) -> VoicePorts:
         audio_out=audio_portaudio.PortAudioOut(engine),
         wake=make_detector(phrase=ASR_CONFIRM_PHRASE),
         recognizer=recognizer,
-        talker=KokoroTalker(),
+        talker=KokoroTalker(get_voice_speed=_get_voice_speed),
         delegate=OllamaDelegate(app),
         speech=HeuristicSpeech(),
         gate=RuleGate(getattr(settings, "voice_mode", "default") or "default"),
@@ -519,8 +578,12 @@ class VoiceHost:
     def from_app(cls, app) -> VoiceHost:
         from app.local.voice.adapters.events_app import publish_broadcast
 
-        return cls(VoiceConfig.from_settings(getattr(app.state, "settings", None)),
-                   build=lambda: build_ports(app), publish=publish_broadcast)
+        profile = getattr(getattr(app, "state", None), "profile", None)
+        if profile is not None:
+            config = VoiceConfig.from_profile(profile)
+        else:
+            config = VoiceConfig.from_settings(getattr(app.state, "settings", None))
+        return cls(config, build=lambda: build_ports(app), publish=publish_broadcast)
 
     # ------------------------------------------------------------------ state
 
@@ -776,9 +839,14 @@ class VoiceHost:
         last_reply: list[str] = [""]
         # T19: in-session fact store, cleared at session close.
         memory = MemoryStore()
+        max_turns = self.config.max_turns  # 0 means no limit
         try:
             while True:
                 turn_n += 1
+                if max_turns > 0 and turn_n > max_turns:
+                    log.info("voice host: max turns reached limit=%d session=%s",
+                             max_turns, session_id)
+                    break
                 if not await self._turn(p, audio_q, session_id, turn_n, use_turns, session,
                                         control_state, last_reply, memory):
                     break
@@ -1018,8 +1086,9 @@ class VoiceHost:
         Returns True when the turn timed out (no audio, or idle past the deadline)."""
         silence_needed = int(SILENCE_S * SAMPLE_RATE / CHUNK_FRAMES)
         cap_chunks = int(CAP_S * SAMPLE_RATE / CHUNK_FRAMES)
+        conv_idle_s = self.config.conv_idle_s
         idle_deadline = time.monotonic() + ((SILENCE_S + FIRST_TURN_GRACE_S) if turn_n == 1
-                                            else CONV_IDLE_S)
+                                            else conv_idle_s)
         if use_turns:
             p.speech.reset()
         p.clock.reset()
@@ -1042,7 +1111,7 @@ class VoiceHost:
 
                 rms = _rms(chunk)
                 if turn_n > 1 and rms > RMS_FLOOR * IDLE_SPEECH_RMS_FACTOR:
-                    idle_deadline = time.monotonic() + CONV_IDLE_S
+                    idle_deadline = time.monotonic() + conv_idle_s
 
                 # Echo guard: our own playback, cues and their tails never reach the recognizer.
                 # Pre-roll predates the acknowledgement chime and is never muted.
