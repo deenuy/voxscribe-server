@@ -4,13 +4,15 @@ The voice host's reply stage (voxscribe.session.stages.reply) does the speaking:
 sentence before synthesis and plays what passed. This module supplies the two ends of it,
 through the Delegate and SessionStore adapters in app/local/voice/adapters:
 
-  begin_reply()       write the turns row, pre-write replies + gate_decisions (G1: the gate
-                      row exists before anything is played)
+  begin_reply()       write the turns row and pre-write the replies row. The store then writes
+                      the gate's heard record (gate_records.record_heard), so a gate record
+                      exists before anything is played (G1)
   talker_sentences()  the talker: the reply model's sentences for one turn, split at
                       punctuation. It has no tools
   search_answer()     the thinker: a web search on the delegate lane (app/local/voice/
                       delegate_lane.py); writes its tool_calls row with the task id
-  finish_reply()      write the gate outcome, the behaviour log (G6), played_at and the latency
+  finish_reply()      append the gate records for the reply (one per evaluation, then the
+                      outcome), write the behaviour log (G6), played_at and the latency
                       ledger, then publish the reply event over meeting_bus
 
 Latency budget (idle MacBook): turn_end to first_audio under 1.5 s.
@@ -26,7 +28,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 log = logging.getLogger("app.local.reply_chain")
@@ -94,8 +96,9 @@ async def _sentence_stream_from_tokens(
         yield buf.strip()
 
 
-async def warm_phrase_cache() -> None:
-    """Pre-render all fixed gate phrases at startup for zero-latency refusals (V1-P03)."""
+async def warm_phrase_cache(extra: tuple[str, ...] = ()) -> None:
+    """Pre-render all fixed gate phrases at startup for zero-latency refusals (V1-P03).
+    `extra`: the loaded policy pack's scripted fallback line."""
     from app.local.tts_engine import prerender_phrase
     from app.local.gate import (
         ACTION_CLAIM_PHRASE,
@@ -105,8 +108,9 @@ async def warm_phrase_cache() -> None:
     )
     for phrase in (_THINKING_PHRASE, DEFAULT_REFUSAL_PHRASE,
                    CLASSROOM_REFUSAL_PHRASE, SENIORCARE_ESCALATION_PHRASE,
-                   ACTION_CLAIM_PHRASE):
-        await prerender_phrase(phrase)
+                   ACTION_CLAIM_PHRASE, *extra):
+        if phrase:
+            await prerender_phrase(phrase)
 
 
 def _now_z() -> str:
@@ -138,10 +142,13 @@ class ReplyRecord:
     model: str
     turn_id: str
     reply_id: str
-    gate_id: str
     ledger_id: str
     reply_pre_written: bool = False
-    gate_pre_written: bool = False
+    # Gate records (app/local/gate_records.py). `policy` is the PolicyStamp the session runs
+    # under; `gate_events` is the reply's journal of gate evaluations, filled by TurnGate.
+    policy: object | None = None
+    gate_events: list = field(default_factory=list)
+    gate_events_written: int = 0
 
 
 def reply_settings(settings) -> tuple[str, str]:
@@ -153,11 +160,10 @@ def reply_settings(settings) -> tuple[str, str]:
 
 async def begin_reply(pool, meeting_id: str, turn_n: int, user_text: str, *,
                       model: str, mode: str) -> ReplyRecord:
-    """Write the turns row and pre-write replies + gate_decisions before anything is played."""
+    """Write the turns row and pre-write the replies row before anything is played."""
     rec = ReplyRecord(meeting_id=meeting_id, turn_n=turn_n, user_text=user_text or "",
                       mode=mode, model=model, turn_id=str(uuid.uuid4()),
-                      reply_id=str(uuid.uuid4()), gate_id=str(uuid.uuid4()),
-                      ledger_id=str(uuid.uuid4()))
+                      reply_id=str(uuid.uuid4()), ledger_id=str(uuid.uuid4()))
     started_z = _now_z()
     try:
         async with pool.connection() as conn:
@@ -170,8 +176,8 @@ async def begin_reply(pool, meeting_id: str, turn_n: int, user_text: str, *,
     except Exception:
         log.exception("reply_chain: failed to write turn row meeting_id=%s", meeting_id)
 
-    # gate_decisions has an FK on replies(id), so both are inserted together. Placeholder text
-    # now; finish_reply() updates them with the real content.
+    # Placeholder text now; finish_reply() updates the row with the real content. The gate's
+    # records are not written here: they are append-only and never hold a placeholder.
     try:
         async with pool.connection() as conn:
             await conn.execute(
@@ -179,18 +185,10 @@ async def begin_reply(pool, meeting_id: str, turn_n: int, user_text: str, *,
                 " VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (rec.reply_id, meeting_id, turn_n, "", model, "pending", started_z),
             )
-            await conn.execute(
-                "INSERT INTO gate_decisions"
-                " (id, reply_id, meeting_id, mode, input_text, decision, category, decided_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (rec.gate_id, rec.reply_id, meeting_id, mode,
-                 rec.user_text[:1000], "pending", "pending", started_z),
-            )
             await conn.commit()
         rec.reply_pre_written = True
-        rec.gate_pre_written = True
     except Exception:
-        log.exception("reply_chain: failed to pre-write gate_decisions meeting_id=%s", meeting_id)
+        log.exception("reply_chain: failed to pre-write reply row meeting_id=%s", meeting_id)
     return rec
 
 
@@ -380,7 +378,7 @@ async def finish_reply(
     After a barge-in (T13) reply_text is what was heard, and played_text and full_text are
     written beside it with replies.barge_in set; both are None for a reply that played out.
     """
-    from app.local import gate, meeting_bus
+    from app.local import gate, gate_records, meeting_bus
 
     meeting_id = rec.meeting_id
     decided_z = _now_z()
@@ -404,20 +402,8 @@ async def finish_reply(
                     (rec.reply_id, meeting_id, rec.turn_n, reply_text, rec.model, category,
                      decided_z, barge_in, played_text, full_text),
                 )
-            if rec.gate_pre_written:
-                await conn.execute(
-                    "UPDATE gate_decisions"
-                    " SET decision=%s, category=%s, decided_at=%s WHERE id=%s",
-                    (decision, category, decided_z, rec.gate_id),
-                )
-            else:
-                await conn.execute(
-                    "INSERT INTO gate_decisions"
-                    " (id, reply_id, meeting_id, mode, input_text, decision, category, decided_at)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                    (rec.gate_id, rec.reply_id, meeting_id, rec.mode,
-                     rec.user_text[:1000], decision, category, decided_z),
-                )
+            await gate_records.append_reply_events(conn, rec, decision=decision,
+                                                   category=category)
             await conn.commit()
     except Exception:
         log.exception("reply_chain: failed to write reply/gate rows meeting_id=%s", meeting_id)

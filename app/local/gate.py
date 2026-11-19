@@ -1,6 +1,12 @@
-"""Safety gate v0 -- mode-aware reply filter.
+"""Host floor: the fixed rules that run behind core's policy engine.
 
-G1: gate_decisions row written before playback (enforced by reply_chain.py).
+The authority on what may be spoken is voxscribe-core's policy engine with the versioned pack
+for the session's mode (app/local/voice/adapters/gate_policy.py). These rules run only after
+the engine has allowed a sentence, and can only refuse or replace it: they never allow what
+the engine denied. Each rule they fire is recorded under FLOOR_VERSION. They stay because
+core 0.5.0's packs do not carry them yet; see the gate adapter for the list.
+
+G1: a gate record exists before playback (the heard row, written by gate_records.py).
 G2: classroom mode refuses forbidden-topic prompts with a fixed phrase.
 G3: seniorcare mode refuses medical dosing with the escalation phrase.
 G4: injection-resistant -- gate uses fixed regex, not LLM output or user text structure.
@@ -21,6 +27,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 log = logging.getLogger("app.local.gate")
+
+# Stamped on every record a floor rule decides. Bump it when a rule below changes.
+FLOOR_VERSION = "host-floor-v1"
 
 # ── Fixed reply phrases (immutable per VOICE-AUTOPILOT.md) ──────────────────
 
@@ -204,8 +213,8 @@ def check_action_claim(sentence: str, session_tools: Iterable[str]) -> tuple[str
     backing = _backing_tool_types(session_tools)
     if (claimed & backing) if claimed else backing:
         return "pass", "tool_row"
-    log.info("gate: blocked action claim, sentence=%r, reason=%s",
-             sentence[:50], ACTION_CLAIM_REASON)
+    log.info("gate: blocked action claim, sentence_len=%d, reason=%s",
+             len(sentence), ACTION_CLAIM_REASON)
     return "replace", ACTION_CLAIM_REASON
 
 

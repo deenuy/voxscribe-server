@@ -448,7 +448,7 @@ def build_ports(app) -> VoicePorts:
     from app.local.voice.adapters import audio_portaudio
     from app.local.voice.adapters.asr_whisper import WhisperRecognizer
     from app.local.voice.adapters.delegate_ollama import OllamaDelegate
-    from app.local.voice.adapters.gate_rule import RuleGate
+    from app.local.voice.adapters.gate_policy import CorePolicyGate, session_policy
     from app.local.voice.adapters.speech_heuristic import HeuristicSpeech
     from app.local.voice.adapters.store_postgres import PostgresSessionStore
     from app.local.voice.adapters.tts_kokoro import KokoroTalker
@@ -474,7 +474,7 @@ def build_ports(app) -> VoicePorts:
         talker=KokoroTalker(get_voice_speed=_get_voice_speed),
         delegate=OllamaDelegate(app),
         speech=HeuristicSpeech(),
-        gate=RuleGate(getattr(settings, "voice_mode", "default") or "default"),
+        gate=CorePolicyGate(session_policy(app)),
         store=PostgresSessionStore(app),
         clock=StreamClock(mono=audio_portaudio.monotonic_ms),
     )
@@ -1296,6 +1296,10 @@ class VoiceHost:
                 system_prefix = f"{system_prefix}\n\n{suffix}" if system_prefix else suffix
 
             turn = await p.store.begin_turn(session_id, turn_n, text)
+            # PL09: every gate evaluation in this reply is journalled for the gate records, and
+            # a gate that raises or answers late fails the reply closed.
+            from app.local.voice.adapters.gate_policy import TurnGate  # lazy: boundary test
+            turn_gate = TurnGate.for_turn(p.gate, turn)
             extra: dict = {}
             if note:
                 extra["system_note"] = note
@@ -1308,8 +1312,8 @@ class VoiceHost:
             clause_stream = ReplyStream(
                 sentences=_clause_sentence_stream(stream.sentences),
                 source=stream.source,
-                cue=stream.cue,
-                lead_in=stream.lead_in,
+                cue=turn_gate.scripted(stream.cue),          # scripted lines pass the gate too
+                lead_in=turn_gate.scripted(stream.lead_in),
                 fallback=stream.fallback,
             )
             clause_talker = _ClauseTalker(p.talker, p.clock)
@@ -1319,9 +1323,9 @@ class VoiceHost:
             sentences = heard.sentences(clause_stream.sentences)
             clause_stream.sentences = sentences
             speak = asyncio.create_task(speak_reply(
-                clause_stream, gate=heard.gate(p.gate), talker=heard.talker(clause_talker),
+                clause_stream, gate=heard.gate(turn_gate), talker=heard.talker(clause_talker),
                 audio_out=heard.audio_out(p.audio_out), clock=p.clock, user_text=text,
-                session_tools=lambda: p.store.session_tools(session_id)),
+                session_tools=turn_gate.tools(lambda: p.store.session_tools(session_id))),
                 name="voice-reply")
 
             pre_roll = None

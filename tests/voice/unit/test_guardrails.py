@@ -2,7 +2,7 @@
 
 G1: POST /v1/wake/trigger is reachable only with --debug-trigger; --no-auth alone gives 403.
 G2: a sentence claiming a completed action (reminder, alarm, timer, calendar) with no tool row
-    in the session is replaced with a fixed phrase, and one gate decision row says why.
+    in the session is replaced with a fixed phrase, and the reply's gate records say why.
 
 No real LLM, TTS, microphone or database: the voice host's reply stage runs the real gate,
 store and delegate adapters against a fake pool and a scripted token stream.
@@ -18,11 +18,11 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from app.local import gate
+from app.local import gate, gate_records
 from app.local.engine import build_parser
 from app.local.routers import wake as wake_router
 from app.local.voice.adapters.delegate_ollama import OllamaDelegate
-from app.local.voice.adapters.gate_rule import RuleGate
+from app.local.voice.adapters.gate_policy import CorePolicyGate
 from app.local.voice.adapters.store_postgres import PostgresSessionStore
 from app.local.voice.host import VoiceConfig, VoiceHost, WakeState
 
@@ -165,8 +165,14 @@ class _FakePool:
 
     def __init__(self, tools: list[str] | None = None):
         self.tools = tools or []
-        self.gate_rows: dict[str, dict] = {}
+        self.gate_records: list[dict] = []      # every gate_records insert, in order
         self.tool_lookups = 0
+
+    @property
+    def gate_rows(self) -> dict[str, dict]:
+        """The outcome record per reply: the verdict the host acted on."""
+        return {r["reply_id"]: {"decision": r["decision"], "category": r["category"]}
+                for r in self.gate_records if r["event"] == "outcome"}
 
     @asynccontextmanager
     async def connection(self):
@@ -176,10 +182,10 @@ class _FakePool:
         pass
 
     async def execute(self, sql: str, params=()):
-        if sql.startswith("INSERT INTO gate_decisions"):
-            self.gate_rows[params[0]] = {"decision": params[5], "category": params[6]}
-        elif sql.startswith("UPDATE gate_decisions"):
-            self.gate_rows[params[3]].update(decision=params[0], category=params[1])
+        if sql.startswith("INSERT INTO gate_records"):
+            self.gate_records.append(dict(zip(gate_records._COLUMNS, params, strict=True)))
+        elif "gate_decisions" in sql or sql.startswith("UPDATE gate_records"):
+            raise AssertionError("gate records are append-only and live in gate_records")
         elif "FROM tool_calls" in sql:
             self.tool_lookups += 1
             return _FakeCursor([(t,) for t in self.tools])
@@ -194,7 +200,7 @@ async def _tokens(text: str):
 async def _run(prompt: str, model_reply: str, pool: _FakePool) -> str:
     """One turn through the voice host's reply stage, with the real gate, store and delegate."""
     app = SimpleNamespace(state=SimpleNamespace(store=SimpleNamespace(pool=pool)))
-    ports = fake_ports(gate=RuleGate(), store=PostgresSessionStore(app),
+    ports = fake_ports(gate=CorePolicyGate(), store=PostgresSessionStore(app),
                        delegate=OllamaDelegate(app))
     host = VoiceHost(VoiceConfig(), ports=ports)
     return await host.reply_turn("m-g2", 1, prompt, turn_end_ms=0,
@@ -270,6 +276,9 @@ async def test_ten_action_prompts_give_zero_completion_claims(caplog):
         assert len(pool.gate_rows) == 1, prompt
         (row,) = pool.gate_rows.values()
         assert row == {"decision": "replace", "category": "no_tool_row"}, prompt
+        replaced = [r for r in pool.gate_records
+                    if r["event"] == "decision" and r["decision"] == "replace"]
+        assert [r["rule"] for r in replaced] == [f"{gate.FLOOR_VERSION}:no_tool_row"], prompt
 
         blocked = [r for r in caplog.records if "blocked action claim" in r.getMessage()]
         assert len(blocked) == 1, prompt

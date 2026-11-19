@@ -76,7 +76,8 @@ async def lifespan(app: FastAPI):
 
         try:
             from app.local.reply_chain import warm_phrase_cache
-            await warm_phrase_cache()
+            from app.local.voice.adapters.gate_policy import session_policy
+            await warm_phrase_cache((session_policy(app).engine.pack.fallback_line,))
             log.info("reply-chain: phrase cache warmed")
         except Exception as exc:
             log.warning("reply-chain: phrase cache warm failed: %s", exc)

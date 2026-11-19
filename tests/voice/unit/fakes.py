@@ -354,6 +354,25 @@ class FakeStore:
                 w["session_id"] = None
 
 
+def shipped_profile(name: str = "personal"):
+    """One of the product profiles the core wheel ships: personal, ideascribe, senior_care or
+    classroom."""
+    from pathlib import Path
+
+    import voxscribe.profile as core_profile
+    from voxscribe.profile.loader import load_profile
+
+    return load_profile(Path(core_profile.__file__).parent / "profiles" / f"{name}.yaml")
+
+
+def policy_gate(profile_name: str = "personal", settings=None):
+    """The production gate adapter (core's policy engine, host floor behind it) for a shipped
+    profile. Reads the pack from the wheel; no model, database or network."""
+    from app.local.voice.adapters.gate_policy import CorePolicyGate, load_policy
+
+    return CorePolicyGate(load_policy(shipped_profile(profile_name), settings))
+
+
 def fake_ports(**over) -> VoicePorts:
     ports = dict(
         audio_in=FakeAudioIn(), audio_out=FakeAudioOut(), wake=FakeWake(),

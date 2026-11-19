@@ -1,4 +1,5 @@
-"""SessionStore over Postgres: wake_events, meetings, segments and the reply chain's turn rows.
+"""SessionStore over Postgres: wake_events, meetings, segments, the reply chain's turn rows and
+the gate records (app/local/gate_records.py).
 Also the delegate lane's task rows (delegate_tasks), written by PostgresDelegateTaskStore.
 
 A voice session is a meeting with origin "wake", created and stopped through the same
@@ -14,7 +15,7 @@ from datetime import UTC, datetime
 
 from voxscribe.session.ports import ReplyOutcome, TranscriptSegment, TurnRecord
 
-from app.local import reply_chain
+from app.local import gate_records, reply_chain
 from app.local.voice.barge_in import Interruption
 from app.local.voice.delegate_lane import DelegateTask, TaskStatus
 
@@ -96,7 +97,14 @@ class PostgresSessionStore:
         model, mode = reply_chain.reply_settings(getattr(self._app.state, "settings", None))
         rec = await reply_chain.begin_reply(self._pool, session_id, turn_n, text,
                                             model=model, mode=mode)
+        # PL09: the gate's heard record, with the policy version, before anything is played.
+        await gate_records.record_heard(self._pool, rec, self._gate_policy().stamp)
         return TurnRecord(session_id=session_id, turn_n=turn_n, turn_id=rec.turn_id, handle=rec)
+
+    def _gate_policy(self):
+        from app.local.voice.adapters.gate_policy import session_policy
+
+        return session_policy(self._app)
 
     async def session_tools(self, session_id: str) -> list[str]:
         return await reply_chain.session_tools(self._pool, session_id)

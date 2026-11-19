@@ -1,7 +1,7 @@
 """The delegate lane against the real Postgres store (T14, migration 017).
 
 Faked: audio, talker, the search engine and the reply model. Real: PostgresSessionStore, the
-delegate adapter with its production lane and thinker, RuleGate, and the delegate_tasks and
+delegate adapter with its production lane and thinker, CorePolicyGate, and the delegate_tasks and
 tool_calls rows in a throwaway schema.
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from app.local import llm_adapter
 from app.local.tools import web_search
 from app.local.voice import delegate_lane as dl
 from app.local.voice.adapters.delegate_ollama import OllamaDelegate
-from app.local.voice.adapters.gate_rule import RuleGate
+from app.local.voice.adapters.gate_policy import CorePolicyGate
 from app.local.voice.adapters.store_postgres import PostgresSessionStore
 from app.local.voice.delegate_lane import TaskStatus
 from app.local.voice.host import VoiceConfig, VoiceHost
@@ -44,7 +44,7 @@ async def test_a_delegated_search_writes_its_task_row_and_a_tool_row_with_the_ta
     await lifespan.__aenter__()
     try:
         delegate = OllamaDelegate(app)
-        ports = fake_ports(store=PostgresSessionStore(app), gate=RuleGate(), delegate=delegate)
+        ports = fake_ports(store=PostgresSessionStore(app), gate=CorePolicyGate(), delegate=delegate)
         host = VoiceHost(VoiceConfig(), ports=ports)
         session_id = await ports.store.create_session(0.9, detector="fake:hey_vox")
 
