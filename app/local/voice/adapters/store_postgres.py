@@ -112,8 +112,19 @@ class PostgresSessionStore:
         rec = await reply_chain.begin_reply(self._pool, session_id, turn_n, text,
                                             model=model, mode=mode)
         # PL09: the gate's heard record, with the policy version, before anything is played.
+        # When it cannot be written, rec.heard_written stays False and the turn's gate decides
+        # whether the reply may be spoken (TurnGate.for_turn).
         await gate_records.record_heard(self._pool, rec, self._gate_policy().stamp)
         return TurnRecord(session_id=session_id, turn_n=turn_n, turn_id=rec.turn_id, handle=rec)
+
+    async def flush_gate_records(self, turn: TurnRecord, *, decision: str | None,
+                                 category: str | None, ended: str) -> None:
+        """The reply's gate journal and its outcome row, in their own transaction. This extends
+        the SessionStore port in this server: the host calls it however the reply ended
+        (`ended`: complete, interrupted, cancelled or failed). A failed write is logged by the
+        ledger, not raised; outside the session's tenant scope the pool itself refuses."""
+        await gate_records.flush_reply(self._pool, turn.handle, decision=decision,
+                                       category=category, ended=ended)
 
     def _gate_policy(self):
         from app.local.voice.adapters.gate_policy import session_policy

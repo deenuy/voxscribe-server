@@ -9,8 +9,17 @@ refuses UPDATE, DELETE and TRUNCATE on the table.
   cue             once per scripted line the gate was asked about: a cue, a lead-in, or the
                   line recorded when the reply source yielded nothing (category no_reply)
   decision        once per candidate clause the gate was asked about
-  outcome         once per reply: the verdict the host acted on
+  outcome         once per reply: the verdict the host acted on, or how the reply ended when
+                  it never reached one (category reply_cancelled or reply_failed)
   legacy          a row carried over from the old gate_decisions table by migration 021
+
+When they are written. The heard row before anything is played (record_heard). The evaluations
+are journalled in memory while the reply is spoken, so a clause costs no database round trip,
+and flush_reply() writes them with the outcome in one short transaction of their own: not the
+reply row's, and from the `finally` of the reply, so a reply that was cancelled, failed, or
+whose reply row could not be updated still leaves them. A heard row that could not be written
+at the start is written then, late. Whether a reply may be spoken at all without its heard row
+is the gate's decision, per policy (voice/adapters/gate_policy.py, ledger_required).
 
 No row holds what anyone said, and none holds a candidate. "Heard" is checked by reference:
 `input_digest(turn_id, text)` over the turn's transcript text (turns.user_text, which the tenant
@@ -23,6 +32,7 @@ the record of what the gate decided in it. Dropping a tenant's schema removes th
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import uuid
@@ -40,6 +50,14 @@ EVENT_LEGACY = "legacy"
 
 UNSTAMPED = "unstamped"          # policy_version of a decision from a gate that names no policy
 RULE_PASSED = "passed"
+
+# A ledger write that takes longer than this has failed: neither the start of a reply nor the
+# end of one waits on a database that does not answer.
+WRITE_TIMEOUT_S = 2.0
+
+# How a reply ended when the host never reached a verdict (the host's REPLY_CANCELLED and
+# REPLY_FAILED) -> the category of its outcome row.
+ENDED_CATEGORY = {"cancelled": "reply_cancelled", "failed": "reply_failed"}
 
 
 def input_digest(turn_id: str | None, text: str) -> str:
@@ -110,29 +128,77 @@ def _row(event: str, rec, **values) -> tuple:
     return tuple(base.get(c) for c in _COLUMNS)
 
 
-async def record_heard(pool, rec, stamp: PolicyStamp) -> None:
+async def _insert_heard(conn, rec, stamp: PolicyStamp) -> None:
+    await conn.execute(INSERT_ONCE_PER_SESSION_SQL, _row(
+        EVENT_POLICY_APPLIED, rec, turn_id=None, turn_n=None, reply_id=None,
+        posture=stamp.posture, policy_digest=stamp.digest or None,
+        engine=stamp.engine or None))
+    await conn.execute(INSERT_SQL, _row(
+        EVENT_HEARD, rec, input_hash=input_digest(rec.turn_id, rec.user_text),
+        input_len=len(rec.user_text)))
+
+
+async def record_heard(pool, rec, stamp: PolicyStamp) -> bool:
     """Stamp the session's policy (once) and record that this turn was heard, before anything
-    is played. Errors are logged, never raised: a broken ledger does not open the gate, and
-    does not close the session either."""
+    is played. True when the rows are written; rec.heard_written says the same.
+
+    Errors are logged, never raised: the ledger does not decide what a failed write means for
+    the reply. The gate does, from rec.heard_written (TurnGate.for_turn)."""
     rec.policy, rec.mode = stamp, stamp.mode
     try:
-        async with pool.connection() as conn:
-            await conn.execute(INSERT_ONCE_PER_SESSION_SQL, _row(
-                EVENT_POLICY_APPLIED, rec, turn_id=None, turn_n=None, reply_id=None,
-                posture=stamp.posture, policy_digest=stamp.digest or None,
-                engine=stamp.engine or None))
-            await conn.execute(INSERT_SQL, _row(
-                EVENT_HEARD, rec, input_hash=input_digest(rec.turn_id, rec.user_text),
-                input_len=len(rec.user_text)))
-            await conn.commit()
+        async with asyncio.timeout(WRITE_TIMEOUT_S):
+            async with pool.connection() as conn:
+                await _insert_heard(conn, rec, stamp)
+                await conn.commit()
     except Exception:
         log.exception("gate records: failed to write heard row meeting_id=%s", rec.meeting_id)
+        return False
+    rec.heard_written = True
+    return True
 
 
-async def append_reply_events(conn, rec, *, decision: str, category: str) -> None:
-    """The reply's journalled evaluations, then its outcome row. Runs on the caller's
-    connection so the records commit with the reply row they describe."""
-    events = rec.gate_events[rec.gate_events_written:]
+async def flush_reply(pool, rec, *, decision: str | None = None, category: str | None = None,
+                      ended: str = "complete") -> bool:
+    """Write the reply's journalled evaluations and its outcome row, in one short transaction
+    of their own. Once per reply: a second call after a successful one writes nothing.
+
+    `decision` and `category` are the verdict the host acted on. A reply that was cancelled or
+    failed (`ended`, a key of ENDED_CATEGORY) never reached one: its outcome row then carries
+    the decision of the last clause evaluated (NULL when none was) and the category that says
+    how it ended. A heard row that could not be written when the turn began is written first,
+    so the reply's records are whole if the ledger came back meanwhile.
+
+    Errors are logged (counts and ids, nothing that was said), never raised. True when the rows
+    are written."""
+    if rec.outcome_written:
+        return True
+    events = list(rec.gate_events[rec.gate_events_written:])
+    if ended in ENDED_CATEGORY:
+        clauses = [e for e in rec.gate_events if e.event == EVENT_DECISION]
+        decision = clauses[-1].decision if clauses else None
+        category = ENDED_CATEGORY[ended]
+    try:
+        async with asyncio.timeout(WRITE_TIMEOUT_S):
+            async with pool.connection() as conn:
+                if not rec.heard_written and rec.policy is not None:
+                    await _insert_heard(conn, rec, rec.policy)
+                await _insert_reply_events(conn, rec, events, decision=decision,
+                                           category=category)
+                await conn.commit()
+    except Exception:
+        log.exception("gate records: failed to write %d evaluation(s) and the outcome"
+                      " meeting_id=%s turn=%s ended=%s", len(events), rec.meeting_id,
+                      rec.turn_n, ended)
+        return False
+    rec.heard_written = rec.heard_written or rec.policy is not None
+    rec.gate_events_written += len(events)
+    rec.outcome_written = True
+    return True
+
+
+async def _insert_reply_events(conn, rec, events, *, decision: str | None,
+                               category: str | None) -> None:
+    """The reply's journalled evaluations, then its outcome row."""
     for ev in events:
         await conn.execute(INSERT_SQL, _row(
             ev.event, rec, step_n=ev.step_n, surface=ev.surface, decision=ev.decision,
@@ -141,7 +207,6 @@ async def append_reply_events(conn, rec, *, decision: str, category: str) -> Non
                                                  else UNSTAMPED),
             candidate_hash=ev.candidate_hash, candidate_len=ev.candidate_len,
             cost_us=ev.cost_us, recorded_at=ev.recorded_at))
-    rec.gate_events_written += len(events)
     # The rule behind the verdict: the last clause evaluation that did not pass, when there was
     # one; else the last scripted line that did not (a refused no-reply line has no clause).
     refused = [e for e in rec.gate_events if e.rule != RULE_PASSED]
@@ -149,6 +214,8 @@ async def append_reply_events(conn, rec, *, decision: str, category: str) -> Non
                     refused[-1] if refused else None)
     if decision == "pass":
         rule = RULE_PASSED
+    elif decision is None:              # the reply ended before any clause was evaluated
+        rule = category
     else:
         rule = deciding.rule if deciding is not None else category
     await conn.execute(INSERT_SQL, _row(

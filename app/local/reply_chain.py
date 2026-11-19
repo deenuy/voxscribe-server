@@ -11,9 +11,11 @@ through the Delegate and SessionStore adapters in app/local/voice/adapters:
                       punctuation. It has no tools
   search_answer()     the thinker: a web search on the delegate lane (app/local/voice/
                       delegate_lane.py); writes its tool_calls row with the task id
-  finish_reply()      append the gate records for the reply (one per evaluation, then the
-                      outcome), write the behaviour log (G6), played_at and the latency
-                      ledger, then publish the reply event over meeting_bus
+  finish_reply()      update the replies row, write the behaviour log (G6), played_at and
+                      the latency ledger, then publish the reply event over meeting_bus. The
+                      gate's records for the reply are not written here: they have their own
+                      transaction (gate_records.flush_reply), so a failed reply row update
+                      does not take them with it
 
 Latency budget (idle MacBook): turn_end to first_audio under 1.5 s.
 TTS: Kokoro-ONNX primary, macOS say fallback (see tts_engine.py).
@@ -149,6 +151,8 @@ class ReplyRecord:
     policy: object | None = None
     gate_events: list = field(default_factory=list)
     gate_events_written: int = 0
+    heard_written: bool = False       # the heard row is in the ledger
+    outcome_written: bool = False     # the journal and the outcome row are in the ledger
 
 
 def reply_settings(settings) -> tuple[str, str]:
@@ -378,7 +382,7 @@ async def finish_reply(
     After a barge-in (T13) reply_text is what was heard, and played_text and full_text are
     written beside it with replies.barge_in set; both are None for a reply that played out.
     """
-    from app.local import gate, gate_records, meeting_bus
+    from app.local import gate, meeting_bus
 
     meeting_id = rec.meeting_id
     decided_z = _now_z()
@@ -402,11 +406,9 @@ async def finish_reply(
                     (rec.reply_id, meeting_id, rec.turn_n, reply_text, rec.model, category,
                      decided_z, barge_in, played_text, full_text),
                 )
-            await gate_records.append_reply_events(conn, rec, decision=decision,
-                                                   category=category)
             await conn.commit()
     except Exception:
-        log.exception("reply_chain: failed to write reply/gate rows meeting_id=%s", meeting_id)
+        log.exception("reply_chain: failed to write reply row meeting_id=%s", meeting_id)
 
     gate.write_behaviour_log(meeting_id=meeting_id, turn_n=rec.turn_n, mode=rec.mode,
                              decision=decision, category=category)

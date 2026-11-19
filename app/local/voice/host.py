@@ -141,6 +141,13 @@ TRIGGER_DETECTOR = "trigger"    # wake_events.detector for the debug trigger rou
 QUIET_HOURS_REASON = "quiet_hours"
 STOP_HINT = "thank you vox"
 
+# How a reply ended, for its gate records (the store's flush_gate_records). The last two never
+# reached a verdict; the ledger gives their outcome row a category of its own.
+REPLY_COMPLETE = "complete"
+REPLY_INTERRUPTED = "interrupted"
+REPLY_CANCELLED = "cancelled"
+REPLY_FAILED = "failed"
+
 # Clause-streaming constants (T11) -- keep in sync with clause_splitter.CLAUSE_GAP_MAX_MS
 _CLAUSE_GAP_MAX_MS = 300        # gap above this is perceptible; log a warning
 
@@ -424,6 +431,10 @@ class _ClauseTalker:
 
     async def warm(self) -> None:
         await self._inner.warm()
+
+
+async def _only(sentence: str):
+    yield sentence
 
 
 async def _clause_sentence_stream(original_sentences):
@@ -1535,8 +1546,16 @@ class VoiceHost:
         Sentences are split into clauses (T11) so synthesis of clause N+1 starts while N plays.
         With `audio_q` (and an echo-cancelled capture) barge-in is watched during playback.
         `note` appended to the system prompt (barge-in); `control_state`/`memory` build prefix (T15/T19).
+
+        Gate records (5a): the turn's evaluations are journalled in memory while it is spoken
+        and handed to the store's ledger once the verdict is known, before the reply row and
+        its event; the `finally` does it for a reply that never got there (cancelled, failed),
+        so what was spoken always has its decisions and an outcome that says how it ended.
         """
         p = await self._ready()
+        turn = None                                  # the store's record, once the turn is open
+        verdict: tuple[str, str] | None = None       # (decision, category) the host acted on
+        ended = REPLY_FAILED
         try:
             log.info("[Vox Thinking] turn=%d words=%d history_turns=%d barge_in=%s", turn_n,
                      len(text.split()), len(history) // 2 if history else 0, note is not None)
@@ -1566,8 +1585,19 @@ class VoiceHost:
                 extra["system_note"] = note
             if system_prefix:
                 extra["system_prefix"] = system_prefix
-            stream = await p.delegate.reply(text, session_id, turn_id=turn.turn_id,
-                                            history=history, speculation=speculation, **extra)
+            if turn_gate.faulted:
+                # What was heard could not be put on record and this policy does not speak
+                # without that (5a). No model is asked and nothing is delegated. The stage is
+                # handed the gate's own line as its only candidate; the faulted gate refuses it
+                # like anything else, and the stage's refusal speaks the scripted fallback.
+                if speculation is not None:
+                    speculation.cancel()
+                stream = ReplyStream(sentences=_only(turn_gate.fail_closed_phrase),
+                                     source="gate_fault")
+            else:
+                stream = await p.delegate.reply(text, session_id, turn_id=turn.turn_id,
+                                                history=history, speculation=speculation,
+                                                **extra)
 
             # T11: split into clauses so synthesis of clause N+1 starts while N plays.
             clause_stream = ReplyStream(
@@ -1619,6 +1649,9 @@ class VoiceHost:
             if outcome.first_audio_ms is not None:
                 log.info("voice host: first audio +%d ms from turn end",
                          outcome.first_audio_ms - turn_end_ms)
+            verdict = (outcome.decision, outcome.category)
+            ended = REPLY_INTERRUPTED if interruption is not None else REPLY_COMPLETE
+            await self._flush_gate_records(p, turn, verdict, ended)
             extra_turn = {"interruption": interruption} if interruption is not None else {}
             await p.store.add_turn(turn, outcome, turn_end_ms=turn_end_ms,
                                    asr_final_ms=asr_final_ms, **extra_turn)
@@ -1626,9 +1659,34 @@ class VoiceHost:
                      "interrupted" if interruption else "complete", outcome.decision)
             return ReplyResult(text=outcome.text, interruption=interruption,
                                pre_roll=pre_roll)
+        except asyncio.CancelledError:
+            if verdict is None:
+                ended = REPLY_CANCELLED
+            raise
         except Exception:
             log.exception("voice host: reply failed meeting_id=%s", session_id)
             return ReplyResult(text="")
+        finally:
+            if turn is not None:
+                await self._flush_gate_records(p, turn, verdict, ended)
+
+    @staticmethod
+    async def _flush_gate_records(p: VoicePorts, turn, verdict: tuple[str, str] | None,
+                                  ended: str) -> None:
+        """Hand the reply's gate journal and its outcome to the store's ledger.
+
+        flush_gate_records extends the SessionStore port in this server and writes once per
+        reply, so the call in the `finally` of a reply does the work only when the one on the
+        way out did not happen or failed. A store without it keeps no gate records."""
+        flush = getattr(p.store, "flush_gate_records", None)
+        if flush is None:
+            return
+        decision, category = verdict or (None, None)
+        try:
+            await flush(turn, decision=decision, category=category, ended=ended)
+        except Exception:
+            log.exception("voice host: gate records not written meeting_id=%s turn=%d",
+                          turn.session_id, turn.turn_n)
 
     @staticmethod
     async def _settle(speak: asyncio.Task, *, interrupted: bool):
