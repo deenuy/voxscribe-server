@@ -216,13 +216,50 @@ def _owner_block(persona) -> str:
     return owner_preferences_block(getattr(persona, "system_prompt", "") or "")
 
 
-def _voice_system_prompt(settings, persona=None) -> str:
+# The spoken register (VOXSCRIBE_VOICE_EXPRESSIVENESS=natural, PL66): short rules and a few
+# examples, good and bad, for a small model. The length bound is the plain register's. What the
+# model still gets wrong is corrected after it, deterministically (app/local/voice/expression.py).
+SPOKEN_REGISTER = """You are talking out loud with a person. Sound like a person in conversation:
+- Answer first. One or two short sentences, under 30 words.
+- Use contractions: I'm, it's, you're, don't.
+- When it fits, react briefly to what they said before the answer: "Oh, nice." "Ah, got it." \
+"Hmm, good question." Not every time, and never the same way twice in a row.
+- Don't repeat their question. Don't thank them for asking, don't say you're here to help, \
+don't offer more help at the end.
+- No markdown, no lists, no headers.
+- You are an AI. If asked whether you are a person, say you're an AI. Never claim a body, a \
+past or feelings as facts.
+Examples:
+Person: How are you? Can you hear me?
+Good: Doing well, thanks. And yes, I can hear you fine.
+Bad: I'm functioning properly, thank you for asking. Yes, I can hear you, and I'm ready to \
+assist you with any questions or topics you'd like to discuss.
+Person: I just got back from a run.
+Good: Oh, nice. How far did you go?
+Bad: That's great to hear! Running is an excellent form of exercise. Is there anything else I \
+can help you with?
+Person: What's the capital of Australia?
+Good: Canberra. A lot of people guess Sydney.
+Bad: That's a great question! The capital of Australia is Canberra.
+Person: Are you a real person?
+Good: No, I'm an AI. Ask me anything, though.
+Bad: Yes, I'm right here with you."""
+
+
+def _voice_system_prompt(settings, persona=None, expressiveness: str = "plain") -> str:
     """The context header from the OS clock at turn start (not session start), then the voice
-    rules. `persona` names the assistant (the session's settings; None: the engine's wording)."""
+    rules. `persona` names the assistant (the session's settings; None: the engine's wording).
+    `expressiveness` natural gives the spoken register in place of the plain rules."""
     from app.local.context import current_context_header
     from app.local.llm_adapter import _build_system_prompt
+    from app.local.voice.expression import NATURAL
 
     ctx_header = current_context_header(settings) if settings else ""
+    if expressiveness == NATURAL:
+        if not ctx_header:
+            # The plain prompt's own date line stands in for the header, as it does in plain.
+            ctx_header = _build_system_prompt().split(". ", 2)[1].strip() + "."
+        return f"{ctx_header} {_identity(persona)}\n{SPOKEN_REGISTER}"
     if not ctx_header:
         return _build_system_prompt().replace(_ENGINE_IDENTITY, _identity(persona), 1)
     return (
@@ -233,13 +270,14 @@ def _voice_system_prompt(settings, persona=None) -> str:
         "Keep replies under 30 words."
     )
 
-def talker_system_prompt(settings, persona=None) -> str:
+def talker_system_prompt(settings, persona=None, expressiveness: str = "plain") -> str:
     """The talker's prompt: the voice prompt plus the instruction to hand anything that needs
     a tool to the delegate lane, then the owner's preferences when there are any. The talker
     itself has no tools."""
     from app.local.voice.delegate_lane import TALKER_DELEGATE_INSTRUCTION
 
-    prompt = f"{_voice_system_prompt(settings, persona)} {TALKER_DELEGATE_INSTRUCTION}"
+    voice = _voice_system_prompt(settings, persona, expressiveness)
+    prompt = f"{voice}{chr(10) if expressiveness == 'natural' else ' '}{TALKER_DELEGATE_INSTRUCTION}"
     owner = _owner_block(persona)
     return f"{prompt}\n\n{owner}" if owner else prompt
 
@@ -254,6 +292,7 @@ def talker_sentences(
     system_note: str | None = None,
     system_prefix: str | None = None,
     persona=None,
+    expressiveness: str = "plain",
 ) -> ReplySource:
     """The talker's reply to one turn, as sentences. No tools, nothing is spoken here.
 
@@ -262,6 +301,7 @@ def talker_sentences(
     system_note  appended to the system prompt for this turn (the barge-in note, T13).
     system_prefix  prepended to the system prompt (memory block T19 + control suffix T15).
     persona  the session's assistant settings (name, persona label, system prompt).
+    expressiveness  plain (the engine's prompt) or natural (the spoken register, PL66).
     """
     settings = getattr(app.state, "settings", None)
     model, _mode = reply_settings(settings)
@@ -271,7 +311,7 @@ def talker_sentences(
     if pre_stream is not None:
         return ReplySource(_sentence_stream_from_tokens(pre_stream, _OLLAMA_TIMEOUT_S),
                            source="pre_stream")
-    prompt = talker_system_prompt(settings, persona)
+    prompt = talker_system_prompt(settings, persona, expressiveness)
     if system_prefix:
         prompt = f"{system_prefix}\n\n{prompt}"
     if system_note:
@@ -297,7 +337,8 @@ def split_sentences(text: str) -> list[str]:
 
 async def search_answer(app, meeting_id: str | None, request: str, query: str, *,
                         task_id: str, turn_id: str | None = None,
-                        history: list[dict] | None = None, persona=None) -> str:
+                        history: list[dict] | None = None, persona=None,
+                        expressiveness: str = "plain") -> str:
     """The thinker's web search: `web.search` through the tool runtime, which checks the registry
     and the network decision (PL41) before anything is sent and writes the call's audit row
     with the task id; then the reply model summarises the results in one or two sentences. Runs
@@ -324,7 +365,7 @@ async def search_answer(app, meeting_id: str | None, request: str, query: str, *
     if not outcome.executed:
         return outcome.line
     search_system = (
-        f"{_voice_system_prompt(settings, persona)}\n\n"
+        f"{_voice_system_prompt(settings, persona, expressiveness)}\n\n"
         f"Use the following search results to answer the user's question. "
         f"Do not reproduce URLs. Summarise in 1-2 sentences.\n\n"
         f"{outcome.result['text']}"

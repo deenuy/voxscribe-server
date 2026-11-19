@@ -341,15 +341,22 @@ class VoiceConfig:
     conv_idle_s: float = CONV_IDLE_S            # idle timeout per turn; from profile.reply.idle_timeout_s
     # End-of-turn silence from the profile; falls back to SILENCE_S when the profile is absent.
     end_of_turn_pause_s: float = SILENCE_S
+    # How the assistant talks: "plain" (today's replies) or "natural" (voice/expression.py). The
+    # default here is plain; from_profile and from_settings resolve the product mode's default.
+    expressiveness: str = "plain"
 
     @classmethod
     def from_settings(cls, settings) -> VoiceConfig:
+        from app.local.voice.adapters.gate_policy import resolve_mode
+        from app.local.voice.expression import resolve_expressiveness
         from app.local.voice.wake_setup import DEFAULT_DETECTOR, DETECTOR_ENV
 
         return cls(
             wake_phrase=getattr(settings, "wake_phrase", "hey vox").lower().strip(),
             detector=os.environ.get(DETECTOR_ENV, "").strip() or DEFAULT_DETECTOR,
             quiet_hours=getattr(settings, "quiet_hours", None),
+            expressiveness=resolve_expressiveness(getattr(settings, "voice_expressiveness", None),
+                                                  resolve_mode(None, settings)),
         )
 
     @classmethod
@@ -364,7 +371,11 @@ class VoiceConfig:
             is True (i.e. VOXSCRIBE_QUIET_HOURS_ENABLED=true was set by the operator).
         Invariant: if the profile's quiet_hours_block_wake is False, no server setting
         may re-enable blocking. The profile field is the authority (VX-H5).
+        The expressiveness is settings.voice_expressiveness when set, else the default of the
+        product mode the gate runs under (gate_policy.resolve_mode).
         """
+        from app.local.voice.adapters.gate_policy import resolve_mode
+        from app.local.voice.expression import resolve_expressiveness
         from app.local.voice.wake_setup import DEFAULT_DETECTOR, DETECTOR_ENV
 
         # Wake-blocking policy comes from the profile field, not a mode-name check.
@@ -417,6 +428,8 @@ class VoiceConfig:
             max_turns=max_turns,
             conv_idle_s=conv_idle_s,
             end_of_turn_pause_s=end_of_turn_pause_s,
+            expressiveness=resolve_expressiveness(getattr(settings, "voice_expressiveness", None),
+                                                  resolve_mode(profile, settings)),
         )
 
 
@@ -543,6 +556,14 @@ def build_ports(app) -> VoicePorts:
     engine = getattr(app.state, "audio_engine", None)
     profile_store = getattr(getattr(app, "state", None), "profile_store", None)
 
+    def _pronounce(text: str) -> str:
+        # The pronunciation table belongs to the spoken register (PL66): plain keeps the text.
+        from app.local.voice.expression import NATURAL, pronounce
+
+        session = current_session()
+        return pronounce(text) if session is not None and session.expressiveness == NATURAL \
+            else text
+
     def _get_voice_speed():
         # Prefer the session's row (read once at session open); fall back to store defaults.
         session = current_session()
@@ -561,7 +582,7 @@ def build_ports(app) -> VoicePorts:
         wake=make_detector(phrase=ASR_CONFIRM_PHRASE,
                            transcribe=getattr(recognizer, "confirm_words", None)),
         recognizer=recognizer,
-        talker=KokoroTalker(get_voice_speed=_get_voice_speed),
+        talker=KokoroTalker(get_voice_speed=_get_voice_speed, pronounce=_pronounce),
         delegate=OllamaDelegate(app),
         speech=HeuristicSpeech(),
         gate=CorePolicyGate(session_policy(app)),
@@ -795,6 +816,11 @@ class SessionContext:
     # the person's speech began, in seconds on the ports' mono clock.
     reply_ended_mono: float | None = None
     speech_onset_mono: float | None = None
+    # How the assistant talks in this session (VoiceConfig.expressiveness, fixed at open), and
+    # what its last reply opened with and its last thinking line was (voice/expression.py names).
+    expressiveness: str = "plain"
+    last_opener: str | None = None
+    last_thinking: str | None = None
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     @property
@@ -1309,9 +1335,10 @@ class VoiceHost:
                 session.settings = prepared
                 session.voice_id = prepared.voice_id
                 session.speed = prepared.speed
-                log.info("voice host: session open tenant=%s product=%s device=%s profile=%s",
-                         session.tenant, session.product, session.device,
-                         session.profile_version)
+                session.expressiveness = self.config.expressiveness
+                log.info("voice host: session open tenant=%s product=%s device=%s profile=%s "
+                         "expressiveness=%s", session.tenant, session.product, session.device,
+                         session.profile_version, session.expressiveness)
                 self._open = session
                 if self._stop_pending:
                     session.request_stop()

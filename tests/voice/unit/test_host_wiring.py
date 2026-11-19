@@ -114,6 +114,7 @@ def test_host_imports_adapters_only_inside_builders():
       - app.local.voice.wake_setup   (detector factory)
       - app.local.voice.controls     (T15: spoken-control detection, pure logic)
       - app.local.voice.memory       (T19: in-session fact store, pure logic)
+      - app.local.voice.expression   (PL66: the spoken register's lists and rules, pure logic)
     """
     _ALLOWED = (
         "app.local.voice.adapters",
@@ -122,6 +123,7 @@ def test_host_imports_adapters_only_inside_builders():
         "app.local.voice.barge_in",         # T13
         "app.local.voice.controls",         # T15
         "app.local.voice.memory",           # T19
+        "app.local.voice.expression",       # PL66
     )
     tree = ast.parse(HOST_FILE.read_text(encoding="utf-8"))
     for name in _top_level_imports(HOST_FILE):

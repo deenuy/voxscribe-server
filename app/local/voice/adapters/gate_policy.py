@@ -152,6 +152,17 @@ def _resolve(profile, settings) -> tuple[str, str]:
     return mode, pack
 
 
+def resolve_mode(profile=None, settings=None) -> str:
+    """The product mode the gate runs under for this profile and these settings (what the
+    session's policy is stamped with). When the two contradict each other the gate fails closed;
+    the mode is then the profile's own, or senior care when the settings name it."""
+    try:
+        return _resolve(profile, settings)[0]
+    except Exception:  # noqa: BLE001 - a contradiction: the most restrictive reading
+        legacy = getattr(settings, "voice_mode", None) or "default"
+        return MODE_FOR_RESTRICTED_PACK.get(legacy) or getattr(profile, "mode", None) or "personal"
+
+
 def load_policy(profile=None, settings=None) -> LoadedPolicy:
     """The policy for the loaded profile, from the pack the wheel ships. Never raises: any
     failure returns core's fail-closed gate, stamped `gate-unavailable`."""

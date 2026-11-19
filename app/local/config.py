@@ -184,6 +184,10 @@ class Config:
     # How long a person may pause before the assistant takes its turn, in seconds
     # (VOXSCRIBE_END_OF_TURN_PAUSE_S). Unset: the product profile's value.
     end_of_turn_pause_s: float | None = None
+    # How the assistant talks (VOXSCRIBE_VOICE_EXPRESSIVENESS, PL66): "plain" (the engine's replies
+    # as before) or "natural" (a spoken register). Unset: the product mode's default, natural for
+    # personal and IdeaScribe, plain for senior care and classroom (app/local/voice/expression.py).
+    voice_expressiveness: str | None = None
 
     # Wake word — any phrase, no model training required (VOXSCRIBE_WAKE_PHRASE)
     wake_phrase: str = "hey vox"
@@ -439,6 +443,13 @@ class Config:
             if not 0.3 <= pause_value <= 60.0:
                 _fail("VOXSCRIBE_END_OF_TURN_PAUSE_S", f"must be between 0.3 and 60, got {pause_raw!r}")
             config_dict["end_of_turn_pause_s"] = pause_value
+
+        expressiveness = env_vars.get("VOXSCRIBE_VOICE_EXPRESSIVENESS", "").strip().lower()
+        if expressiveness:
+            if expressiveness not in ("plain", "natural"):
+                _fail("VOXSCRIBE_VOICE_EXPRESSIVENESS",
+                      f"must be plain|natural, got {expressiveness!r}")
+            config_dict["voice_expressiveness"] = expressiveness
 
         voice_reply_model = env_vars.get("VOXSCRIBE_VOICE_REPLY_MODEL", "").strip()
         if voice_reply_model:

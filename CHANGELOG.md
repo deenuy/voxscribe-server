@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### New Features
+- Added a spoken register, `VOXSCRIBE_VOICE_EXPRESSIVENESS` = `plain` | `natural` (PL66). The default follows the product mode the gate runs under: `natural` for personal and IdeaScribe, `plain` (the replies as before) for senior care and classroom. In `natural` the reply model is asked to talk as people talk, and deterministic rules hold on what it wrote before the gate: at most one reaction, only at the start and only from the interjections the voice pronounces, never the previous reply's opener, no stock assistant sentences, nothing added to scripted lines. A pronunciation table rewrites what the voice misreads (Mm-hmm, Mhm, Mm, Aww) after the gate; captions and the stored transcript keep the original spelling. The lists live in `app/local/voice/expression.py`.
+
 ### Bug Fixes
 - Fixed the first turn of a voice session ending at the first-turn wait instead of on the person's pause (PL59). The turn detector settled on digital silence before every turn, so the room after the person stopped still read as speech and the closing pause started a second or more late; it now settles on the room's own sound. The first-turn wait now applies only while nothing has been recognised, and a cue is muted from capture for its whole length (the cues are about 1.6 s; the mute was 1.1 s).
 

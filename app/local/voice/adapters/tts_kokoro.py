@@ -19,12 +19,18 @@ def _pcm(samples) -> np.ndarray:
 class KokoroTalker:
     sample_rate = tts_engine.PLAYBACK_RATE_HZ
 
-    def __init__(self, get_voice_speed: Callable[[], tuple[str, float]] | None = None) -> None:
+    def __init__(self, get_voice_speed: Callable[[], tuple[str, float]] | None = None,
+                 pronounce: Callable[[str], str] | None = None) -> None:
         # get_voice_speed() returns (voice_id, speed); empty voice_id uses the engine default.
+        # pronounce(text) is the text the voice is given (voice/expression.py): it runs here,
+        # after the gate and immediately before synthesis, so what was shown and stored keeps
+        # the original spelling.
         self._get_voice_speed = get_voice_speed or (lambda: ("", 1.0))
+        self._pronounce = pronounce or (lambda text: text)
 
     async def synthesize(self, text: str) -> np.ndarray:
         voice, speed = self._get_voice_speed()
+        text = self._pronounce(text)
         if voice:
             return _pcm(await tts_engine.synthesize(text, voice=voice, speed=speed))
         return _pcm(await tts_engine.synthesize(text, speed=speed))

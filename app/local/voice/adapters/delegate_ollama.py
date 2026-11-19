@@ -24,6 +24,12 @@ Routing, in order, all before the reply model is called (T14/T16):
   talker  the reply model, which has no tools; if it emits [DELEGATE: <request>] the request
            goes to the lane and the marker is never spoken
 
+The session's expressiveness (voice/expression.py, PL66) chooses the talker's prompt. In
+natural the talker's own sentences, and the thinker's summary, go through the register's
+deterministic rules before the gate; scripted lines (refusals, read-backs, confirmations, the
+lane's phrases) never do. In natural the reply has no immediate thinking cue: the host says one
+only when the reply is late (PL67).
+
 The lane is polled at the start of every turn: a finished result is spoken after the turn's own
 reply, through the same gate; a stale one is offered instead of read out. Nothing here runs on
 another thread, and the thinker is an asyncio task on the session's event loop.
@@ -43,6 +49,7 @@ from app.local.tools import builtin
 from app.local.tools import runtime as tool_runtime
 from app.local.tools.runtime import CallContext
 from app.local.voice import delegate_lane as dl
+from app.local.voice import expression
 from app.local.voice import reminder_store as rs
 from app.local.voice.adapters.events_app import publish as publish_event
 from app.local.voice.adapters.store_postgres import PostgresDelegateTaskStore
@@ -64,6 +71,41 @@ def _persona():
     opened; None outside a session. The thinker's task inherits the session it was started in."""
     session = current_session()
     return session.settings if session is not None else None
+
+
+def _expressiveness() -> str:
+    """The session's register; plain outside a session."""
+    session = current_session()
+    return getattr(session, "expressiveness", expression.PLAIN) if session is not None \
+        else expression.PLAIN
+
+
+def _natural() -> bool:
+    return _expressiveness() == expression.NATURAL
+
+
+def _cue(text: str) -> str | None:
+    """The thinking cue said at once before a reply: plain only (in natural the host says one
+    only when the reply is late)."""
+    return reply_chain.THINKING_PHRASE if text and not _natural() else None
+
+
+async def _shaped(sentences: AsyncIterator[str], *, reaction_allowed: bool = True
+                  ) -> AsyncIterator[str]:
+    """The reply model's sentences under the natural register's rules, and the opener kept for
+    the session's next reply. Names of what was removed are logged, never words."""
+    session = current_session()
+    shape = expression.ReplyShape()
+    previous = getattr(session, "last_opener", None) if session is not None else None
+    async for sentence in expression.shape_reply(sentences, previous_opener=previous,
+                                                 shape=shape,
+                                                 reaction_allowed=reaction_allowed):
+        yield sentence
+    if reaction_allowed and session is not None:
+        session.last_opener = shape.opener
+    if shape.reaction or shape.removed:
+        log.info("voice delegate: register reaction=%s removed=%s", shape.reaction or "none",
+                 ",".join(shape.removed or ()) or "none")
 
 
 def _waited() -> timedelta | None:
@@ -116,7 +158,8 @@ class OllamaDelegate:
 
         return _Speculation(stream_reply(
             partial_text, model=self.model, history=list(history) if history else None,
-            system_prompt=reply_chain.talker_system_prompt(self._settings, _persona())))
+            system_prompt=reply_chain.talker_system_prompt(self._settings, _persona(),
+                                                           _expressiveness())))
 
     async def reply(self, turn_text: str, session_id: str, *, turn_id: str | None = None,
                     history: Sequence[dict] | None = None, speculation=None,
@@ -140,7 +183,7 @@ class OllamaDelegate:
                 return ReplyStream(
                     sentences=_each(prefix),
                     source="reminder",
-                    cue=reply_chain.THINKING_PHRASE if text else None,
+                    cue=_cue(text),
                     fallback=reply_chain.FALLBACK_PHRASE,
                 )
 
@@ -163,8 +206,10 @@ class OllamaDelegate:
         if fixed is None:
             src = reply_chain.talker_sentences(self._app, session_id, text, history=hist,
                                                pre_stream=speculation, system_note=system_note,
-                                               system_prefix=system_prefix, persona=_persona())
-            own, source = _without_marker(src.sentences, submit), src.source
+                                               system_prefix=system_prefix, persona=_persona(),
+                                               expressiveness=_expressiveness())
+            talker = _shaped(src.sentences) if _natural() else src.sentences
+            own, source = _without_marker(talker, submit), src.source
         else:
             cancel = getattr(speculation, "cancel", None)
             if cancel is not None:
@@ -174,7 +219,7 @@ class OllamaDelegate:
         return ReplyStream(sentences=self._with_delivery(_prepend_then(prefix, own),
                                                          deliver),
                            source=source,
-                           cue=reply_chain.THINKING_PHRASE if text else None,
+                           cue=_cue(text),
                            fallback=reply_chain.FALLBACK_PHRASE)
 
     # ------------------------------------------------------------------ routing
@@ -236,7 +281,12 @@ class OllamaDelegate:
             lane.mark_delivered(task.task_id)
             if task.error is None:
                 yield dl.DELIVERY_LEAD.format(topic=dl.request_topic(task.request))
-            for sentence in reply_chain.split_sentences(task.result or ""):
+            found = _each(reply_chain.split_sentences(task.result or ""))
+            if task.error is None and _natural():
+                # The thinker's summary is the reply model's words: the register's rules, with
+                # no reaction, since it follows the scripted lead.
+                found = _shaped(found, reaction_allowed=False)
+            async for sentence in found:
                 yield sentence
         if stale is not None:
             lane.mark_delivered(stale.task_id)
@@ -250,7 +300,8 @@ class OllamaDelegate:
         history = self._contexts.pop(task.task_id, None)
         return await reply_chain.search_answer(
             self._app, task.session_id, task.request, dl.request_topic(task.request),
-            task_id=task.task_id, turn_id=task.turn_id, history=history, persona=_persona())
+            task_id=task.task_id, turn_id=task.turn_id, history=history, persona=_persona(),
+            expressiveness=_expressiveness())
 
     def _task_changed(self, task: DelegateTask) -> None:
         """Lane hook: keep the task's row current and tell the app its status."""
