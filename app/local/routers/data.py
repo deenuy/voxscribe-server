@@ -8,8 +8,6 @@ The contract (engine-v1.md) specifies the erase header as 'delete-all'.
 """
 from __future__ import annotations
 
-import asyncio
-import gzip
 import io
 import json
 import logging
@@ -50,6 +48,29 @@ async def _tenant_tables(conn) -> list[str]:
         """,
     )
     return [row[0] for row in await cur.fetchall()]
+
+
+# The append-only gate ledger (gate_records, migration 021) refuses DELETE and TRUNCATE unless this setting is 'on'
+# in the current transaction. Erase is the only code that sets it, and only with SET LOCAL inside the one
+# transaction that empties the tenant's tables, so it ends with that transaction.
+_ERASE_SETTING = "voxscribe.erase_tenant_data"
+
+
+async def _truncate_tenant_tables(conn) -> int:
+    """Empty every tenant-owned table in the current schema in one transaction, the gate ledger included."""
+    async with conn.transaction():
+        await conn.execute(f"SET LOCAL {_ERASE_SETTING} = 'on'")
+        tables = await _tenant_tables(conn)
+        if tables:
+            # One TRUNCATE ... CASCADE for all tables. psycopg cannot bind a list of identifiers to one placeholder,
+            # so the statement is composed from quoted names read from information_schema.
+            from psycopg import sql as psql
+
+            await conn.execute(psql.SQL("TRUNCATE TABLE {} CASCADE").format(
+                psql.SQL(", ").join(psql.Identifier(t) for t in tables)))
+    await conn.commit()
+    log.info("erase: truncated %d tables (shared schema)", len(tables))
+    return len(tables)
 
 
 def _tenant_data_dir(data_dir: Path, tenant_key: str | None) -> Path:
@@ -124,15 +145,7 @@ async def delete_all_data(
     else:
         # Isolation off (or no tenant key): empty all tenant-owned tables.
         async with pool.connection() as conn:
-            tables = await _tenant_tables(conn)
-            if tables:
-                # Build a single TRUNCATE ... CASCADE statement for all tables at once.
-                # psycopg does not let us pass a list of identifiers to a single placeholder,
-                # so we build the SQL string from validated names (table_name from
-                # information_schema cannot contain SQL injection).
-                table_list = ", ".join(tables)
-                await conn.execute(f"TRUNCATE TABLE {table_list} CASCADE")
-                log.info("erase: truncated %d tables (shared schema)", len(tables))
+            await _truncate_tenant_tables(conn)
 
     # Delete the tenant's files.
     tenant_dir = _tenant_data_dir(data_dir, tenant_key)

@@ -31,6 +31,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from app.local import tenancy
 from app.local.voice.host import (
@@ -39,6 +40,9 @@ from app.local.voice.host import (
     SessionTenantRequiredError,
     current_session,
 )
+
+if TYPE_CHECKING:  # for annotations only: the module imports this lazily at run time
+    from app.local.voice.profile_store import AssistantConfig
 
 log = logging.getLogger("app.local.voice.adapters.scope")
 
@@ -190,7 +194,7 @@ async def save_profile_for_request(app, partial: dict, tenant: str | None):
     Does not enforce product-profile limits here: the store's patch() method applies the
     clamp before we receive the validated config.
     """
-    from app.local.voice.profile_store import ProfileValidationError, _ProfileView
+    from app.local.voice.profile_store import _ProfileView
 
     store = getattr(getattr(app, "state", None), "profile_store", None)
     if store is None:

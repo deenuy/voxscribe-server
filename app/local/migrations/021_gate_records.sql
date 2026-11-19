@@ -92,9 +92,19 @@ CREATE OR REPLACE VIEW gate_outcomes AS
 
 -- Append-only: the application role may insert and read, nothing else. A database owner can
 -- still drop the triggers; this stops the engine's own code, not an administrator.
+--
+-- One door: a person's right to erase their data wins over the ledger. The erase path
+-- (DELETE /v1/data, app/local/routers/data.py) sets voxscribe.erase_tenant_data to 'on' with
+-- SET LOCAL inside the transaction that empties the tenant's tables, so DELETE and TRUNCATE
+-- pass for that transaction only. UPDATE never passes. No other engine code names the setting
+-- (tests/test_data.py checks).
 CREATE OR REPLACE FUNCTION gate_records_append_only() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
+    IF TG_OP IN ('DELETE', 'TRUNCATE')
+       AND current_setting('voxscribe.erase_tenant_data', true) = 'on' THEN
+        RETURN OLD;   -- a row trigger lets the delete through; a statement trigger ignores it
+    END IF;
     RAISE EXCEPTION 'gate_records is append-only: % refused', TG_OP
         USING ERRCODE = 'restrict_violation';
 END;
