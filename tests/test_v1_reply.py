@@ -13,18 +13,19 @@ Latency and streaming checks (V1-P01/P02) require hardware; not inline.
 
 from __future__ import annotations
 
+import shutil
+
 import pytest
 from app.local import gate
 from app.local.gate import (
-import shutil
-
-needs_say = pytest.mark.skipif(shutil.which("say") is None, reason="needs the macOS say command")
     CLASSROOM_REFUSAL_PHRASE,
     DEFAULT_REFUSAL_PHRASE,
     SENIORCARE_ESCALATION_PHRASE,
     check as gate_check,
     refusal_phrase,
 )
+
+needs_say = pytest.mark.skipif(shutil.which("say") is None, reason="needs the macOS say command")
 
 
 # ── V1-E01: empty user_text → gate refuses "empty" ──────────────────────────
