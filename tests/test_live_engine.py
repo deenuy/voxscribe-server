@@ -19,7 +19,8 @@ import psycopg
 import pytest
 from websockets.sync.client import connect
 
-BASE_DB = "postgresql://localhost:5432/ideascribe_dev"
+from tests.testdb import TEST_DATABASE_URL as BASE_DB
+from tests.testdb import schema_url
 TOKEN = "live-engine-test"
 
 
@@ -43,7 +44,7 @@ def _run_engine(**extra_env):
     with psycopg.connect(BASE_DB, autocommit=True) as c:
         c.execute(f"CREATE SCHEMA {schema}")
     asyncio.run(run_migrations(BASE_DB, schema=schema))
-    url = f"{BASE_DB}?options=-c%20search_path%3D{schema},public"
+    url = schema_url(schema)
     env = dict(os.environ, VOXSCRIBE_TOKEN=TOKEN, **extra_env)
     proc = subprocess.Popen(
         ["uv", "run", "voxscribe-engine", "--port", "0", "--providers", "fake", "--database-url", url],

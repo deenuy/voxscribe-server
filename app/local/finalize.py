@@ -16,6 +16,7 @@ from .store_meetings import MeetingStore
 log = logging.getLogger(__name__)
 
 _running: set[asyncio.Task] = set()
+_tenant_of: dict[asyncio.Task, str | None] = {}     # whose meeting each running task finishes
 
 
 async def finalize_meeting(app, meeting_id: str) -> None:
@@ -46,8 +47,21 @@ async def finalize_meeting(app, meeting_id: str) -> None:
 def schedule_finalize(app, meeting_id: str) -> asyncio.Task:
     task = asyncio.create_task(finalize_meeting(app, meeting_id))
     _running.add(task)
+    _tenant_of[task] = tenancy.current_tenant()
     task.add_done_callback(_running.discard)
+    task.add_done_callback(lambda t: _tenant_of.pop(t, None))
     return task
+
+
+async def cancel_for_tenant(tenant: str | None) -> int:
+    """Cancel and wait out every finalisation running for this tenant (erase), so none writes after it. Returns
+    how many were cancelled."""
+    tasks = [t for t in list(_running) if _tenant_of.get(t) == tenant and not t.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return len(tasks)
 
 
 async def recover_unfinished(app) -> int:

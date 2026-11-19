@@ -260,5 +260,16 @@ async def subscribe(last_event_id: str | None = None):
         stream.subscribers.discard(sub)
 
 
+def drop_stream(tenant: str | None) -> bool:
+    """Forget a tenant's stream and its replay buffer (erase). A later subscription starts a new stream with a new
+    epoch, so an id from before resumes with a reset and no old event. Subscribers still attached to the old stream
+    receive nothing more from it. True when there was a stream."""
+    stream = _streams.pop(tenant, None)
+    if stream is None:
+        return False
+    stream.buffer.clear()
+    return True
+
+
 def subscriber_count() -> int:
     return sum(len(s.subscribers) for s in _streams.values())

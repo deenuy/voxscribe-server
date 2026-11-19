@@ -7,6 +7,11 @@
 --
 -- The session id is held by value with no foreign key: deleting a meeting does not delete the
 -- record of what the gate decided in it, and no row holds anything the person said.
+--
+-- Expand only (README, "Migrations"): gate_decisions stays a table, so an engine on the
+-- previous release can still insert into and update it. Its stored text is cleared here and a
+-- trigger clears whatever older code writes there from now on. This release no longer writes to
+-- it. Dropping it is the contract step, in a later migration of a later release.
 
 CREATE TABLE IF NOT EXISTS gate_records (
     seq            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,   -- append order
@@ -60,11 +65,26 @@ LEFT JOIN replies r ON r.id = g.reply_id
 LEFT JOIN turns t ON t.meeting_id = g.meeting_id AND t.turn_n = r.turn_n
 ORDER BY g.decided_at, g.id;
 
-DROP TABLE gate_decisions;
+-- The old table keeps its rows and columns for the previous release, but no longer what the
+-- person said: the carried-over rows lose their text, and older code that still writes text
+-- there has it cleared on the way in.
+UPDATE gate_decisions SET input_text = NULL WHERE input_text IS NOT NULL;
 
--- Tools that read the old table keep working: one row per reply, the verdict the host acted
--- on, and no text column.
-CREATE VIEW gate_decisions AS
+CREATE OR REPLACE FUNCTION gate_decisions_keep_no_text() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.input_text := NULL;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER gate_decisions_no_text
+    BEFORE INSERT OR UPDATE ON gate_decisions
+    FOR EACH ROW EXECUTE FUNCTION gate_decisions_keep_no_text();
+
+-- One row per reply, the verdict the host acted on, and no text column: what tools read
+-- (tools/roomplay.py). A new name, so the old table stays a table.
+CREATE OR REPLACE VIEW gate_outcomes AS
     SELECT id, reply_id, session_id AS meeting_id, mode, decision, category,
            recorded_at AS decided_at
     FROM gate_records
@@ -72,9 +92,19 @@ CREATE VIEW gate_decisions AS
 
 -- Append-only: the application role may insert and read, nothing else. A database owner can
 -- still drop the triggers; this stops the engine's own code, not an administrator.
+--
+-- One door: a person's right to erase their data wins over the ledger. The erase path
+-- (DELETE /v1/data, app/local/routers/data.py) sets voxscribe.erase_tenant_data to 'on' with
+-- SET LOCAL inside the transaction that empties the tenant's tables, so DELETE and TRUNCATE
+-- pass for that transaction only. UPDATE never passes. No other engine code names the setting
+-- (tests/test_data.py checks).
 CREATE OR REPLACE FUNCTION gate_records_append_only() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
+    IF TG_OP IN ('DELETE', 'TRUNCATE')
+       AND current_setting('voxscribe.erase_tenant_data', true) = 'on' THEN
+        RETURN OLD;   -- a row trigger lets the delete through; a statement trigger ignores it
+    END IF;
     RAISE EXCEPTION 'gate_records is append-only: % refused', TG_OP
         USING ERRCODE = 'restrict_violation';
 END;

@@ -83,3 +83,11 @@ async def publish(meeting_id: str, event_type: str, data: Any) -> None:
     bus = get_bus(meeting_id)
     event = {"type": event_type, "data": data}
     await bus.publish(event)
+
+
+def drop_tenant(tenant: str | None) -> int:
+    """Forget every bus of this tenant, with the events held for a first watcher (erase). Returns how many."""
+    keys = [k for k in _buses if k[0] == tenant]
+    for key in keys:
+        _buses.pop(key)._held.clear()
+    return len(keys)

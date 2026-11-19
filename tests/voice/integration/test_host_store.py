@@ -42,7 +42,7 @@ async def test_three_turn_session_writes_every_row(throwaway_schema):
             wakes = await rows("SELECT accepted, detector, started_meeting_id FROM wake_events")
             turns = await rows("SELECT turn_n, user_text, ended_at IS NOT NULL FROM turns "
                                "ORDER BY turn_n")
-            gates = await rows("SELECT decision, category FROM gate_decisions")   # the view
+            gates = await rows("SELECT decision, category FROM gate_outcomes")    # the view
             events = await rows("SELECT event, count(*) FROM gate_records GROUP BY event")
             replies = await rows("SELECT turn_n, text FROM replies ORDER BY turn_n")
             ledger = await rows("SELECT count(*) FROM latency_ledger")

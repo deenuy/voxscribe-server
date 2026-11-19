@@ -316,10 +316,13 @@ async def search_answer(app, meeting_id: str | None, request: str, query: str, *
     search tool bounds its own request.
     """
     from app.local.tools.web_search import search as web_search
+    from app.local.voice.adapters.scope import scoped_pool
 
     settings = getattr(app.state, "settings", None)
     model, _mode = reply_settings(settings)
-    pool = app.state.store.pool
+    # Called from the voice delegate lane: the pool comes through the voice scope adapter, which refuses (before the
+    # search runs) outside a tenant's scope with isolation on, or in a session that is not the tenant's.
+    pool = scoped_pool(app)
     log.info("reply_chain: thinker search task_id=%s meeting_id=%s", task_id, meeting_id)
     t_search = time.monotonic()
     search_result = ""

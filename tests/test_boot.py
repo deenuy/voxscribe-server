@@ -15,7 +15,8 @@ import uuid
 import httpx
 import psycopg
 
-BASE_DB = "postgresql://localhost:5432/ideascribe_dev"
+from tests.testdb import TEST_DATABASE_URL as BASE_DB
+from tests.testdb import schema_url
 
 
 @contextlib.contextmanager
@@ -28,7 +29,7 @@ def _throwaway_database_url():
         c.execute(f"CREATE SCHEMA {schema}")
     try:
         asyncio.run(run_migrations(BASE_DB, schema=schema))
-        yield f"{BASE_DB}?options=-c%20search_path%3D{schema},public"
+        yield schema_url(schema)
     finally:
         with psycopg.connect(BASE_DB, autocommit=True) as c:
             c.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")

@@ -25,6 +25,7 @@ from app.local.voice.adapters.delegate_ollama import OllamaDelegate
 from app.local.voice.adapters.gate_policy import CorePolicyGate
 from app.local.voice.adapters.store_postgres import PostgresSessionStore
 from app.local.voice.host import VoiceConfig, VoiceHost, WakeState
+from tests.testdb import TEST_DATABASE_URL
 
 from .fakes import fake_ports
 
@@ -110,7 +111,7 @@ async def test_created_app_without_flag_returns_403(throwaway_schema, armed_wake
     from app.local.config import Config
 
     settings = Config(
-        database_url="postgresql://localhost:5432/ideascribe_dev",
+        database_url=TEST_DATABASE_URL,
         data_dir="/tmp/voxscribe_test",
         providers="fake",
     )

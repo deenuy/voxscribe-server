@@ -180,7 +180,40 @@ make db-migrate    # apply all pending migrations
 make db-shell      # psql into the development database
 ```
 
-Migrations: `app/local/migrations/001_init.sql` through `019_reminders.sql`. See `CHANGELOG.md` for which sprint introduced each.
+Migrations: numbered files in `app/local/migrations/`, one number each, no gaps. See `CHANGELOG.md` for which sprint introduced each.
+
+### Migrations only add: expand now, contract later
+
+Decision (PL32, 2026-11-18). A migration only adds: tables, columns, indexes, views, triggers, rows. Removing or
+renaming anything the previous release reads or writes happens in a later migration, shipped in a later release,
+once no supported version of the code uses it (the contract step).
+
+Why: the schema outlives the code that wrote it. A person who reinstalls the previous version, a second engine
+instance still on older code, and a feature branch run against a shared database all meet a schema migrated by newer
+code, and each must keep working. Migrations run automatically against whatever database an engine is pointed at, so
+there is no moment at which a breaking change could be coordinated by hand. On 2026-11-18 a test booted an engine on
+the developer's database and applied an unmerged migration that dropped `gate_decisions`, a table the running, older
+engine still wrote to.
+
+How it is enforced: `tests/test_migration_files.py` fails on `DROP TABLE`, `DROP COLUMN`, `DROP VIEW` or `RENAME` in a
+migration unless the file carries a marker naming the earlier migration that started the contract:
+
+```sql
+-- contract: completes 021 (gate_decisions has had no writer since 021's release)
+```
+
+The same file checks that numbers are unique and have no gap. The runner (`app/local/migrations.py`) applies every
+file whose number is not recorded in that schema's `schema_migrations`, in ascending order, and logs a warning naming
+any number it applies after a higher one, so a migration that arrives late from another branch still runs. Two
+engines or two requests migrating one schema exclude each other with the advisory lock earlier releases also take.
+
+Open contract steps:
+
+- `gate_decisions` (expanded in 021). Since 021 the engine writes the gate's ledger to `gate_records` and never writes
+  `gate_decisions`; the old table keeps its rows with `input_text` cleared, and a trigger clears any text an older
+  engine still writes. Per-reply outcomes are read from the view `gate_outcomes`. Contract, in a release after the one
+  that ships 021: copy into `gate_records` any `gate_decisions` rows written by older engines after 021 (as 021 copied
+  the earlier ones), then drop `gate_decisions` and its trigger function, with the marker above.
 
 Locally: `ideascribe_dev`. Production: set `DATABASE_URL`.
 
@@ -205,7 +238,9 @@ uv run --extra dev pytest tests/ -q                # full suite
 uv run --extra dev ruff check app/                 # lint
 ```
 
-No test touches a real microphone, real database, or the network. Every adapter has a fake.
+No test touches a real microphone or the network, and no test touches the engine's database: tests use their own
+database (`VOXSCRIBE_TEST_DATABASE_URL`, default `ideascribe_test`), created once with `make test-db`, and refuse to
+run when it is the engine's database. See `tests/README.md`.
 
 ## Project structure
 
@@ -228,7 +263,7 @@ app/
       wake.py              GET /v1/wake/state, POST /v1/wake/power, POST /v1/wake/trigger
       meetings.py          /v1/meetings/*
       live.py              WebSocket /v1/live
-    migrations/            001_init.sql … 019_reminders.sql
+    migrations/            numbered SQL migrations (expand only; see Database)
 tools/
   fetch_wake_models.py     Download keyword spotter and OWW models (run once)
   train_wake_model.py      Train a custom OWW model on synthetic clips

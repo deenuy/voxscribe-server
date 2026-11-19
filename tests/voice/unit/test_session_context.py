@@ -351,6 +351,28 @@ def test_the_scoped_pool_is_handed_out_only_inside_a_tenants_scope():
     assert scoped_pool(off) is off.state.store.pool       # isolation off: as before
 
 
+async def test_the_thinkers_web_search_takes_its_pool_through_the_scope_adapter(monkeypatch):
+    """reply_chain.search_answer runs on the voice delegate lane; outside the tenant's scope, or in a session of
+    another tenant, it is refused before the search is sent anywhere."""
+    from app.local import reply_chain
+    from app.local.tools import web_search
+
+    searched: list[str] = []
+
+    async def search(query):
+        searched.append(query)
+        raise ConnectionError("no network in tests")
+
+    monkeypatch.setattr(web_search, "search", search)
+    app = _app(enforced=True, settings=None)
+    with pytest.raises(tenancy.TenantRequiredError):
+        await reply_chain.search_answer(app, "m1", "look it up", "it", task_id="k1")
+    with TenantSessionScope(app).session(ALICE), tenancy.tenant_scope("t_bob"):
+        with pytest.raises(tenancy.TenantRequiredError):
+            await reply_chain.search_answer(app, "m1", "look it up", "it", task_id="k2")
+    assert searched == []
+
+
 # ── the boundary ──────────────────────────────────────────────────────────────
 
 

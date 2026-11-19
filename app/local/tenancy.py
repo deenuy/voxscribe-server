@@ -111,6 +111,18 @@ class _Provisioner:
             cur = await conn.execute("SELECT schema_name FROM information_schema.schemata WHERE schema_name ~ '^t_[0-9a-f]{24}$' ORDER BY 1")
             return [r[0] for r in await cur.fetchall()]
 
+    async def drop(self, key: str) -> None:
+        """Drop a tenant's schema (erase). Under the tenant's lock, so no provisioning runs meanwhile, the tenant
+        leaves the ready set first and the schema goes second: a borrow from here on provisions a new, empty schema
+        instead of trusting one that is being dropped. A borrow already holding a connection keeps its locks and
+        the drop waits for it."""
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            self._ready.discard(key)
+            async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+                await conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(key)))
+        log.info("Tenant schema %s dropped", key)
+
     def evict(self, key: str) -> None:
         """Remove a tenant from the ready set so the next connection re-provisions them.
 
@@ -146,8 +158,18 @@ class _Borrow:
         self._conn = await self._cm.__aenter__()
         if self._key:
             try:
+                # public stays on the path for the extension objects every schema uses (the vector type and its
+                # operators live there), never for tables: the check below refuses a path whose first schema is
+                # not the tenant's.
                 await self._conn.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(self._key)))
+                # PostgreSQL skips a schema on the path that does not exist, so a dropped (or never created) tenant
+                # schema would resolve every name in public. The ready set cannot be trusted for that: erase may have
+                # dropped the schema, or another engine process on the same database may have.
+                schema = (await (await self._conn.execute("SELECT current_schema()")).fetchone())[0]
                 await self._conn.commit()
+                if schema != self._key:
+                    owner.provisioner.evict(self._key)     # the next borrow provisions it again
+                    raise TenantRequiredError("the tenant's schema is missing: refusing to fall through to public")
             except BaseException as exc:
                 await self._discard()
                 await self._cm.__aexit__(type(exc), exc, exc.__traceback__)

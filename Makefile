@@ -197,6 +197,16 @@ local: ## Run the local engine with voxscribe-engine
 test: ## Run tests with pytest
 	uv run pytest tests/ -v
 
+# Tests use their own database (VOXSCRIBE_TEST_DATABASE_URL, default ideascribe_test), never the engine's.
+.PHONY: test-db
+test-db: ## Create the test database and its extensions (safe to repeat; refuses the engine's own database)
+	uv run python -m tests.testdb create
+
+.PHONY: test-db-reset
+test-db-reset: ## Drop and recreate the test database (requires CONFIRM=yes)
+	@test "$$CONFIRM" = "yes" || (echo "This drops the test database. Run with: make test-db-reset CONFIRM=yes"; exit 1)
+	uv run python -m tests.testdb reset
+
 .PHONY: lint
 lint: ## Lint with ruff
 	uv run ruff check app/

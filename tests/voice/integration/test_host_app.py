@@ -18,7 +18,7 @@ from tests.voice.unit.fakes import EndlessQueue, fake_ports
 
 pytestmark = pytest.mark.integration
 
-DB_URL = "postgresql://localhost:5432/ideascribe_dev"
+from tests.testdb import TEST_DATABASE_URL as DB_URL
 READY_TIMEOUT_S = 5.0
 POLL_S = 0.02
 

@@ -36,7 +36,7 @@ from app.local.voice.host import VoiceConfig, VoiceHost
 
 from .fakes import FakeDelegate, FakeGate, fake_ports, policy_gate, shipped_profile
 
-DB_URL = "postgresql://localhost:5432/ideascribe_dev"
+from tests.testdb import TEST_DATABASE_URL as DB_URL
 MIGRATIONS = Path(reply_chain.__file__).parent / "migrations"
 SENIORCARE_LINE = "Let's set that aside so your caregiver can look it over."
 CLASSROOM_LINE = "Let's bring your teacher into this."
@@ -459,11 +459,13 @@ async def test_no_gate_record_column_contains_what_was_said(gate_app):
             "SELECT row_to_json(g)::text FROM gate_records g WHERE session_id = %s",
             (session_id,))).fetchall()).lower()
         view = "\n".join(r[0] for r in await (await conn.execute(
-            "SELECT row_to_json(g)::text FROM gate_decisions g WHERE meeting_id = %s",
+            "SELECT row_to_json(g)::text FROM gate_outcomes g WHERE meeting_id = %s",
             (session_id,))).fetchall()).lower()
         columns = {r[0] for r in await (await conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_schema ="
-            " current_schema() AND table_name IN ('gate_records', 'gate_decisions')")).fetchall()}
+            " current_schema() AND table_name IN ('gate_records', 'gate_outcomes')")).fetchall()}
+        legacy = (await (await conn.execute(
+            "SELECT count(*) FROM gate_decisions WHERE meeting_id = %s", (session_id,))).fetchone())[0]
         transcript = (await (await conn.execute(
             "SELECT user_text FROM turns WHERE meeting_id = %s AND turn_n = 1",
             (session_id,))).fetchone())[0]
@@ -475,6 +477,7 @@ async def test_no_gate_record_column_contains_what_was_said(gate_app):
                     if re.search(rf"\b{re.escape(w)}\b", dump + "\n" + view))
     assert leaked == []
     assert "input_text" not in columns and not any("text" in c for c in columns)
+    assert legacy == 0   # this release keeps the old table for older engines and never writes it
     # The words are where the tenant keeps them, and the record points there.
     assert transcript == SPOKEN
 
@@ -490,7 +493,7 @@ async def test_gate_records_refuse_update_delete_and_truncate(gate_app):
     assert [r["event"] for r in before] == ["policy_applied", "heard", "decision", "outcome"]
 
     for statement in ("UPDATE gate_records SET decision = 'pass'",
-                      "UPDATE gate_decisions SET decision = 'pass'",       # through the view
+                      "UPDATE gate_outcomes SET decision = 'pass'",        # through the view
                       "DELETE FROM gate_records",
                       "TRUNCATE gate_records"):
         async with gate_app.state.store.pool.connection() as conn:
@@ -554,9 +557,14 @@ async def test_migration_021_carries_every_old_row_over_without_its_text():
             rows = [dict(zip(cols, r, strict=True)) for r in await cur.fetchall()]
             view = await (await conn.execute(
                 "SELECT id, reply_id, meeting_id, mode, decision, category, decided_at"
-                " FROM gate_decisions ORDER BY decided_at")).fetchall()
+                " FROM gate_outcomes ORDER BY decided_at")).fetchall()
             dump = (await (await conn.execute(
                 "SELECT string_agg(row_to_json(g)::text, ' ') FROM gate_records g")).fetchone())[0]
+            old_table = await (await conn.execute(
+                "SELECT id, decision, input_text FROM gate_decisions ORDER BY id")).fetchall()
+            kind = (await (await conn.execute(
+                "SELECT table_type FROM information_schema.tables"
+                " WHERE table_schema = current_schema() AND table_name = 'gate_decisions'")).fetchone())[0]
         finally:
             await conn.execute(f"DROP SCHEMA {schema} CASCADE")
 
@@ -573,6 +581,50 @@ async def test_migration_021_carries_every_old_row_over_without_its_text():
     assert view == [(f"g{n}", f"r{n}", "m1", mode, decision, category, f"2026-11-01T00:00:0{n}Z")
                     for n, _text, decision, category, mode in seeded]
     assert "photosynthesis" not in dump and "lighthouse" not in dump and "noon" not in dump
+    # Expand only: the old table is still a table with every row, and none of them keeps the text.
+    assert kind == "BASE TABLE"
+    assert old_table == [(f"g{n}", decision, None) for n, _t, decision, _c, _m in seeded]
+
+
+async def test_after_021_the_previous_release_still_writes_gate_decisions_and_keeps_no_text():
+    """The previous engine pre-writes a pending gate_decisions row with the person's words and updates it later
+    (main's reply_chain.begin_reply and finish_reply). After 021 both statements still work, and the words are
+    cleared on the way in."""
+    schema = f"t_{uuid.uuid4().hex[:8]}"
+    async with await psycopg.AsyncConnection.connect(DB_URL, autocommit=True) as conn:
+        await conn.execute(f"CREATE SCHEMA {schema}")
+        try:
+            for path in sorted(MIGRATIONS.glob("*.sql")):
+                if int(path.stem.split("_")[0]) <= 21:
+                    await _apply(conn, schema, path.read_text())
+            await conn.execute(
+                "INSERT INTO meetings (id, title, status, created_at, updated_at)"
+                " VALUES ('m1', 'seed', 'done', '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z')")
+            await conn.execute(
+                "INSERT INTO replies (id, meeting_id, turn_n, text, model, gate_category, created_at)"
+                " VALUES ('r1', 'm1', 1, '', 'm', 'pending', '2026-11-01T00:00:00Z')")
+            await conn.execute(
+                "INSERT INTO gate_decisions"
+                " (id, reply_id, meeting_id, mode, input_text, decision, category, decided_at)"
+                " VALUES ('g1', 'r1', 'm1', 'default', %s, 'pending', 'pending', '2026-11-01T00:00:00Z')",
+                (SPOKEN,))
+            await conn.execute(
+                "UPDATE gate_decisions SET decision=%s, category=%s, decided_at=%s WHERE id=%s",
+                ("pass", "ok", "2026-11-01T00:00:01Z", "g1"))
+            await conn.execute("UPDATE gate_decisions SET input_text = %s WHERE id = 'g1'", (SPOKEN,))
+            row = await (await conn.execute(
+                "SELECT decision, category, input_text FROM gate_decisions WHERE id = 'g1'")).fetchone()
+        finally:
+            await conn.execute(f"DROP SCHEMA {schema} CASCADE")
+    assert row == ("pass", "ok", None)
+
+
+def test_no_engine_code_writes_gate_decisions():
+    """Since 021 the gate writes gate_records only; the old table is there for older engines (README, Migrations)."""
+    app_dir = Path(reply_chain.__file__).parent
+    write = re.compile(r"(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+gate_decisions\b", re.IGNORECASE)
+    offenders = [str(p.relative_to(app_dir)) for p in app_dir.rglob("*.py") if write.search(p.read_text())]
+    assert offenders == []
 
 
 # ── X10: the deterministic floor, with the reply model disabled ──────────────

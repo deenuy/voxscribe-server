@@ -1,96 +1,80 @@
-"""Database migration system."""
+"""Database migration system.
 
+Every numbered file in migrations/ is applied once per schema, in ascending order, each in its own transaction, and
+recorded in that schema's schema_migrations table. The runner works from the set of recorded versions, not the
+highest one: a file whose number is not recorded is applied even when a higher number already is (a migration that
+arrived late from another branch), and that is logged as a warning naming both versions.
+
+Two engines, or two requests, migrating one schema at once exclude each other with the same PostgreSQL advisory lock
+the runner has always taken (key 123), so an engine on older code and one on this code also exclude each other. The
+lock is held from reading the recorded versions until the last file is recorded, so each file runs exactly once.
+"""
+
+import logging
 import sys
 from pathlib import Path
 
 import psycopg
+from psycopg import sql
+
+log = logging.getLogger(__name__)
+
+MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+_LOCK_KEY = 123  # unchanged from earlier releases: older engines take the same lock
 
 
-async def run_migrations(database_url: str, schema: str = None) -> int:
-    """Run pending migrations and return the final schema version.
+def migration_files(migrations_dir: Path = MIGRATIONS_DIR) -> list[tuple[int, Path]]:
+    """(version, path) for every numbered .sql file, in ascending order of version."""
+    found = []
+    for path in migrations_dir.glob("*.sql"):
+        try:
+            found.append((int(path.stem.split("_")[0]), path))
+        except ValueError:
+            continue
+    return sorted(found)
 
-    schema: optional schema name (for tests); defaults to public
+
+async def run_migrations(database_url: str, schema: str = None, *, migrations_dir: Path = MIGRATIONS_DIR) -> int:
+    """Apply every migration not yet recorded in the schema; return the highest recorded version.
+
+    schema: the schema to migrate (tenant schemas, tests); defaults to the connection's own search path (public).
     """
-    migrations_dir = Path(__file__).parent / "migrations"
-
-    # Get all migration files
-    migration_files = sorted(migrations_dir.glob("*.sql"))
-    if not migration_files:
+    files = migration_files(migrations_dir)
+    if not files:
         return 0
 
-    # Connect and run migrations
-    async with await psycopg.AsyncConnection.connect(database_url) as conn:
-        # Set search_path if schema is specified (for test isolation)
+    async with await psycopg.AsyncConnection.connect(database_url, autocommit=True) as conn:
         if schema:
-            await conn.execute(f"SET search_path TO {schema}, public")
-            await conn.commit()
-
-        # Ensure the schema_migrations table exists (inside transaction with lock)
-        async with conn.transaction():
-            await conn.execute("SELECT pg_advisory_lock(123)")
-
-            try:
-                await conn.execute(
-                    """CREATE TABLE IF NOT EXISTS schema_migrations (
-                        version INTEGER PRIMARY KEY,
-                        applied_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-                    )"""
-                )
-            except psycopg.ProgrammingError as e:
-                # If table exists, that's OK
-                if "already exists" not in str(e):
-                    raise
-
-            # Get the current schema version (now that table definitely exists)
-            cursor = await conn.execute(
-                "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
+            await conn.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(schema)))
+        # Session-level lock, held for the whole run; released explicitly, and by the server if the connection drops.
+        await conn.execute("SELECT pg_advisory_lock(%s)", (_LOCK_KEY,))
+        try:
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                )"""
             )
-            row = await cursor.fetchone()
-            current_version = row[0] if row else 0
+            cur = await conn.execute("SELECT version FROM schema_migrations")
+            applied = {row[0] for row in await cur.fetchall()}
+            highest = max(applied, default=0)
 
-            await conn.execute("SELECT pg_advisory_unlock(123)")
+            for version, path in files:
+                if version in applied:
+                    continue
+                if version < highest:
+                    log.warning("migration %03d applied out of order: %03d was applied before it", version, highest)
+                try:
+                    async with conn.transaction():
+                        await conn.execute(path.read_text())
+                        await conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
+                except psycopg.DatabaseError as e:
+                    print(f"Error running migration {version}: {e}", file=sys.stderr, flush=True)
+                    raise
+                applied.add(version)
+                highest = max(highest, version)
+        finally:
+            if not conn.closed:
+                await conn.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
 
-        # Apply pending migrations
-        final_version = current_version
-        for mig_file in migration_files:
-            # Extract version number from filename
-            version_str = mig_file.stem.split("_")[0]
-            try:
-                version = int(version_str)
-            except ValueError:
-                continue
-
-            if version <= current_version:
-                continue
-
-            # Read and execute the migration
-            migration_sql = mig_file.read_text()
-            try:
-                async with conn.transaction():
-                    # Use advisory lock to prevent concurrent migrations
-                    await conn.execute("SELECT pg_advisory_lock(123)")
-
-                    # Check again after acquiring lock
-                    cursor = await conn.execute(
-                        "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
-                    )
-                    row = await cursor.fetchone()
-                    latest_version = row[0] if row else 0
-
-                    if version > latest_version:
-                        # Execute migration
-                        await conn.execute(migration_sql)
-                        # Record it
-                        await conn.execute(
-                            "INSERT INTO schema_migrations (version) VALUES (%s)",
-                            (version,),
-                        )
-
-                    await conn.execute("SELECT pg_advisory_unlock(123)")
-
-                final_version = version
-            except psycopg.DatabaseError as e:
-                print(f"Error running migration {version}: {e}", file=sys.stderr, flush=True)
-                raise
-
-    return final_version
+    return highest

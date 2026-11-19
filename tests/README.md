@@ -54,11 +54,24 @@ Key points:
 - The schema is guaranteed to be fresh and isolated
 - Remember to call `await store.close()` for resource cleanup
 
-## Schema Isolation Rule
+## The test database
 
-**Tests NEVER touch the public schema of ideascribe_dev.** All queries run against the throwaway schema created by the fixture. This is enforced by the pool configuration which sets `search_path` to `<test_schema>, public`.
+Tests use one database, defined once in `tests/testdb.py`: `VOXSCRIBE_TEST_DATABASE_URL`, default
+`postgresql://localhost:5432/ideascribe_test`. Never the engine's database. Create it once (safe to repeat):
 
-The public schema is used only for system objects (vector type, etc.) that resolve from the search_path. Data rows always live in the test schema and are cleaned up automatically.
+```bash
+make test-db                       # creates ideascribe_test and installs the vector extension in its public schema
+make test-db-reset CONFIRM=yes     # drop and recreate it
+```
+
+Inside that database every test works in a throwaway schema (`t_<hex>`), created by the fixture and dropped afterwards.
+The public schema holds only extension objects (the vector type) that resolve through the search path.
+
+A session guard in `conftest.py` refuses the run, before any test, when the test database is the one the engine's own
+configuration resolves to (the default `Config` database, or `VOXSCRIBE_DATABASE_URL` in a `.env` at the repository
+root or, from a linked worktree, the main checkout's root), or when its public schema holds rows. Its message names a
+database by name, host and port only. `tests/test_boot.py` also fails when any test starts an engine process without
+`--database-url`.
 
 ## Running Tests
 

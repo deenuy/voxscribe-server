@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from app.local import engine
+from tests.testdb import TEST_DATABASE_URL
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.20", "10.0.0.5", "example.com"])
@@ -36,7 +37,10 @@ def test_the_engine_entry_point_exits_non_zero_before_touching_the_database(monk
     monkeypatch.setattr(engine, "run_migrations", must_not_run)
     monkeypatch.setattr(engine, "create_app", must_not_run)
     monkeypatch.setenv("VOXSCRIBE_ENV_FILE", str(tmp_path / "no.env"))
-    monkeypatch.setattr(sys, "argv", ["voxscribe-engine", "--no-auth", "--providers", "fake"])
+    # The database is named even though it is never opened: were the refusal to regress, the engine would reach the
+    # test database, not the default one (tests/test_boot.py checks every engine start names its database).
+    argv = ["voxscribe-engine", "--no-auth", "--providers", "fake", "--database-url", TEST_DATABASE_URL]
+    monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(SystemExit) as exc:
         asyncio.run(engine.main())
     assert exc.value.code not in (0, None)
