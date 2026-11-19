@@ -1,6 +1,6 @@
 """Who is calling? Verifies the account service's access token and names the tenant.
 
-The account service (ideascribe-api) signs short-lived access tokens with an Ed25519 key and publishes the public
+The account service signs short-lived access tokens with an Ed25519 key and publishes the public
 keys. The engine holds no secret: it checks the signature against those keys (cached, with a copy on disk so
 verification keeps working offline), and requires the right issuer, audience, expiry and token type.
 
