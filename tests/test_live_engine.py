@@ -209,7 +209,10 @@ def test_stopping_over_http_finishes_the_meeting_with_a_summary(engine, http):
             break
         time.sleep(1)
     assert status == "done"
-    assert http.get(f"/meetings/{meeting_id}/summary").json()["status"] in ("ready", "none")
+    # "skipped" is a valid terminal state when the transcript has fewer than MIN_WORDS_FOR_SUMMARY
+    # words; the fake engine produces short transcripts.  Added after commit 9f1e81f introduced
+    # the "skipped" status but did not update this assertion.
+    assert http.get(f"/meetings/{meeting_id}/summary").json()["status"] in ("ready", "none", "skipped")
 
 
 # ---- speech activity on the socket (ADR 0001, phase S2) ------------------------------------------------------------

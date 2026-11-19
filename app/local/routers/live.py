@@ -13,6 +13,7 @@ from app.local.audio_ring import AudioRing
 from app.local.identity import IdentityError, tenant_for
 from app.local.enrichment import EnrichmentService
 from app.local.live_support import (
+    ENERGY_DETECTOR,
     LEVEL_INTERVAL_MS,
     build_live_assist,
     build_live_transcriber,
@@ -196,6 +197,9 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
         async def audio_consumer():
             nonlocal last_level_ms, finalize_scheduled
             _auto_stop_silence_start_ms = None
+            # Energy-gate modes (adaptive/fixed) do not record speech transitions in the core
+            # library; track in_speech changes here and synthesize the wire frame directly.
+            _prev_in_speech = False
 
             while True:
                 frame = await ring.pop()
@@ -216,6 +220,21 @@ async def _live_meeting(websocket: WebSocket, meeting_id: str, token: str | None
                         await websocket.send_json(vad_message(transition))
                     except Exception:
                         pass
+                # Detector modes already emit via pop_speech_transitions(); energy gates do not.
+                if transcriber.vad_mode in ("adaptive", "fixed"):
+                    _now_in_speech = transcriber.in_speech
+                    if _now_in_speech != _prev_in_speech:
+                        try:
+                            await websocket.send_json({
+                                "type": "vad",
+                                "speech": _now_in_speech,
+                                "at_ms": int(transcriber.elapsed_ms),
+                                "p": None,
+                                "detector": ENERGY_DETECTOR,
+                            })
+                        except Exception:
+                            pass
+                    _prev_in_speech = _now_in_speech
                 if (
                     send_levels
                     and transcriber.speech_probability is not None
