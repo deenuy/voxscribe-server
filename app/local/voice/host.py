@@ -61,6 +61,7 @@ from enum import Enum
 
 import numpy as np
 from voxscribe.session.ports import (
+    GATE_PASS,
     AudioIn,
     AudioOut,
     ClockDomainError,
@@ -139,6 +140,13 @@ MAX_NO_SPEECH_PROB = 0.6        # Whisper's own no-speech threshold
 TRIGGER_DETECTOR = "trigger"    # wake_events.detector for the debug trigger route
 QUIET_HOURS_REASON = "quiet_hours"
 STOP_HINT = "thank you vox"
+
+# How a reply ended, for its gate records (the store's flush_gate_records). The last two never
+# reached a verdict; the ledger gives their outcome row a category of its own.
+REPLY_COMPLETE = "complete"
+REPLY_INTERRUPTED = "interrupted"
+REPLY_CANCELLED = "cancelled"
+REPLY_FAILED = "failed"
 
 # Clause-streaming constants (T11) -- keep in sync with clause_splitter.CLAUSE_GAP_MAX_MS
 _CLAUSE_GAP_MAX_MS = 300        # gap above this is perceptible; log a warning
@@ -424,6 +432,10 @@ class _ClauseTalker:
 
     async def warm(self) -> None:
         await self._inner.warm()
+
+
+async def _only(sentence: str):
+    yield sentence
 
 
 async def _clause_sentence_stream(original_sentences):
@@ -730,6 +742,7 @@ class VoiceHost:
         self._binding = binding or SessionBinding()    # who the device's sessions are for
         self._served: SessionBinding | None = None      # the binding the adapters last worked for
         self._open: SessionContext | None = None        # the device's session, while one runs
+        self._claimed = False                           # a session took its binding: starting or running
         self._rebound = False                           # bind() changed it: the armed loop re-enters
         self._task: asyncio.Task | None = None
         self._cues: set[asyncio.Task] = set()      # cues playing off the hot path
@@ -785,12 +798,19 @@ class VoiceHost:
 
         The armed loop leaves the old scope on its next frame and comes back in the new one. A
         session in progress keeps the binding it opened with, so binding the device to another
-        tenant while one runs is refused. A binding with no tenant unbinds: with isolation on
-        the host then goes off until it is bound again."""
+        tenant while one runs is refused, from the moment the session takes its binding (it may
+        still be starting). A binding with no tenant unbinds: with isolation on the host then
+        goes off until it is bound again.
+
+        When the tenant changes, the previous one is told the device is off for them, in their
+        own scope and before the swap: from here on the room's speech is someone else's."""
         if binding == self._binding:
             return False
-        if binding.tenant != self._binding.tenant and self._open is not None:
+        if binding.tenant != self._binding.tenant and (self._claimed or self._open is not None):
             raise SessionInProgressError("a voice session is in progress for another tenant")
+        if binding.tenant != self._binding.tenant and self.state != WakeState.OFF:
+            self._publish_device("wake_state", self.snapshot() | {"state": WakeState.OFF.value,
+                                                                  "meeting_id": None})
         self._binding = binding
         self._rebound = True
         log.info("voice host: bound tenant=%s product=%s device=%s", binding.tenant,
@@ -1079,23 +1099,32 @@ class VoiceHost:
         is written."""
         if binding is None:
             binding = self._device_binding()
-        # Load the tenant's assistant profile once before the session scope is entered.
-        # prepare() may query the database; it is not on the audio path.
-        _prepare = getattr(self._scope, "prepare", None)
-        _voice_id, _speed = "", 1.0
-        if _prepare is not None:
-            _voice_id, _speed, _ = await _prepare(binding)
-        with self._scope.session(binding) as session:
-            session.voice_id = _voice_id
-            session.speed = _speed
-            log.info("voice host: session open tenant=%s product=%s device=%s profile=%s",
-                     session.tenant, session.product, session.device, session.profile_version)
-            self._open = session
-            try:
-                await self._conversation(audio_q, session, score=score, detector=detector,
-                                         speech_ratio=speech_ratio)
-            finally:
-                self._open = None
+        # The device is taken from this line, with no await since the binding was read: bind()
+        # refuses another tenant until the session has ended. prepare() below is a round trip,
+        # and an arm that landed in it used to be told the device was theirs while this
+        # conversation was written for the tenant before them.
+        self._claimed = True
+        try:
+            # Load the tenant's assistant profile once before the session scope is entered.
+            # prepare() may query the database; it is not on the audio path.
+            _prepare = getattr(self._scope, "prepare", None)
+            _voice_id, _speed = "", 1.0
+            if _prepare is not None:
+                _voice_id, _speed, _ = await _prepare(binding)
+            with self._scope.session(binding) as session:
+                session.voice_id = _voice_id
+                session.speed = _speed
+                log.info("voice host: session open tenant=%s product=%s device=%s profile=%s",
+                         session.tenant, session.product, session.device,
+                         session.profile_version)
+                self._open = session
+                try:
+                    await self._conversation(audio_q, session, score=score, detector=detector,
+                                             speech_ratio=speech_ratio)
+                finally:
+                    self._open = None
+        finally:
+            self._claimed = False
 
     async def _conversation(self, audio_q, session: SessionContext, *, score: float,
                             detector: str, speech_ratio: float | None) -> None:
@@ -1519,8 +1548,16 @@ class VoiceHost:
         Sentences are split into clauses (T11) so synthesis of clause N+1 starts while N plays.
         With `audio_q` (and an echo-cancelled capture) barge-in is watched during playback.
         `note` appended to the system prompt (barge-in); `control_state`/`memory` build prefix (T15/T19).
+
+        Gate records (5a): the turn's evaluations are journalled in memory while it is spoken
+        and handed to the store's ledger once the verdict is known, before the reply row and
+        its event; the `finally` does it for a reply that never got there (cancelled, failed),
+        so what was spoken always has its decisions and an outcome that says how it ended.
         """
         p = await self._ready()
+        turn = None                                  # the store's record, once the turn is open
+        verdict: tuple[str, str] | None = None       # (decision, category) the host acted on
+        ended = REPLY_FAILED
         try:
             log.info("[Vox Thinking] turn=%d words=%d history_turns=%d barge_in=%s", turn_n,
                      len(text.split()), len(history) // 2 if history else 0, note is not None)
@@ -1550,8 +1587,19 @@ class VoiceHost:
                 extra["system_note"] = note
             if system_prefix:
                 extra["system_prefix"] = system_prefix
-            stream = await p.delegate.reply(text, session_id, turn_id=turn.turn_id,
-                                            history=history, speculation=speculation, **extra)
+            if turn_gate.faulted:
+                # What was heard could not be put on record and this policy does not speak
+                # without that (5a). No model is asked and nothing is delegated. The stage is
+                # handed the gate's own line as its only candidate; the faulted gate refuses it
+                # like anything else, and the stage's refusal speaks the scripted fallback.
+                if speculation is not None:
+                    speculation.cancel()
+                stream = ReplyStream(sentences=_only(turn_gate.fail_closed_phrase),
+                                     source="gate_fault")
+            else:
+                stream = await p.delegate.reply(text, session_id, turn_id=turn.turn_id,
+                                                history=history, speculation=speculation,
+                                                **extra)
 
             # T11: split into clauses so synthesis of clause N+1 starts while N plays.
             clause_stream = ReplyStream(
@@ -1559,7 +1607,7 @@ class VoiceHost:
                 source=stream.source,
                 cue=turn_gate.scripted(stream.cue),          # scripted lines pass the gate too
                 lead_in=turn_gate.scripted(stream.lead_in),
-                fallback=stream.fallback,
+                fallback="",        # recorded below, and only once the gate has seen it
             )
             clause_talker = _ClauseTalker(p.talker, p.clock)
 
@@ -1593,9 +1641,19 @@ class VoiceHost:
                          len(heard.played_clauses), len(heard.released))
             else:
                 outcome = completed
+            if interruption is None and outcome.decision == GATE_PASS and not outcome.sentences:
+                # The source yielded nothing. The stream's fallback line would become the reply
+                # text (the reply event, the stored reply, the history, the repeat phrase), so
+                # it passes the gate like the other scripted lines and is recorded as the
+                # no-reply line, not as a reply that passed.
+                outcome.text, outcome.decision, outcome.category = turn_gate.fallback(
+                    stream.fallback)
             if outcome.first_audio_ms is not None:
                 log.info("voice host: first audio +%d ms from turn end",
                          outcome.first_audio_ms - turn_end_ms)
+            verdict = (outcome.decision, outcome.category)
+            ended = REPLY_INTERRUPTED if interruption is not None else REPLY_COMPLETE
+            await self._flush_gate_records(p, turn, verdict, ended)
             extra_turn = {"interruption": interruption} if interruption is not None else {}
             await p.store.add_turn(turn, outcome, turn_end_ms=turn_end_ms,
                                    asr_final_ms=asr_final_ms, **extra_turn)
@@ -1603,9 +1661,34 @@ class VoiceHost:
                      "interrupted" if interruption else "complete", outcome.decision)
             return ReplyResult(text=outcome.text, interruption=interruption,
                                pre_roll=pre_roll)
+        except asyncio.CancelledError:
+            if verdict is None:
+                ended = REPLY_CANCELLED
+            raise
         except Exception:
             log.exception("voice host: reply failed meeting_id=%s", session_id)
             return ReplyResult(text="")
+        finally:
+            if turn is not None:
+                await self._flush_gate_records(p, turn, verdict, ended)
+
+    @staticmethod
+    async def _flush_gate_records(p: VoicePorts, turn, verdict: tuple[str, str] | None,
+                                  ended: str) -> None:
+        """Hand the reply's gate journal and its outcome to the store's ledger.
+
+        flush_gate_records extends the SessionStore port in this server and writes once per
+        reply, so the call in the `finally` of a reply does the work only when the one on the
+        way out did not happen or failed. A store without it keeps no gate records."""
+        flush = getattr(p.store, "flush_gate_records", None)
+        if flush is None:
+            return
+        decision, category = verdict or (None, None)
+        try:
+            await flush(turn, decision=decision, category=category, ended=ended)
+        except Exception:
+            log.exception("voice host: gate records not written meeting_id=%s turn=%d",
+                          turn.session_id, turn.turn_n)
 
     @staticmethod
     async def _settle(speak: asyncio.Task, *, interrupted: bool):
@@ -1655,6 +1738,10 @@ class VoiceHost:
         p = self.ports
         binding = self._device_binding()    # refused here, before a task or a subscription
         audio_q = p.audio_in.subscribe()
+        # Taken now, not when the task below first runs: a bind landing in between would give
+        # the device to someone else while this session opens for `binding`. Released when the
+        # session ends.
+        self._claimed = True
 
         async def _session() -> None:
             try:
@@ -1663,6 +1750,7 @@ class VoiceHost:
                 log.exception("voice host: triggered session failed")
             finally:
                 # The trigger path never goes through the armed loop, so reset here.
+                self._claimed = False
                 self.set_state(WakeState.ARMED)
                 p.audio_in.unsubscribe(audio_q)
 

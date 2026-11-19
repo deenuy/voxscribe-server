@@ -17,6 +17,13 @@ fallback and every record says `gate-unavailable`.
 TurnGate is the per-reply wrapper the host puts around the Gate port. It journals every
 evaluation for the gate records, and it turns a gate that raises or answers late into a raise,
 which the reply stage speaks as the scripted fallback.
+
+The ledger is part of the gate where the policy says so (invariant 5a). Under a restricted pack
+(senior care, classroom) or any pack in allowlist posture, a turn whose heard record could not
+be written is a gate fault: TurnGate refuses everything and the reply is the scripted fallback.
+Under a denylist pack (personal, ideascribe) the reply proceeds: every clause is still
+evaluated, the failed write is logged, and the records are written at the end of the reply if
+the ledger is back by then (gate_records.flush_reply).
 """
 from __future__ import annotations
 
@@ -67,6 +74,9 @@ CATEGORY_POLICY_DENY = "policy_deny"                 # the pack denied the candi
 CATEGORY_POLICY_FALLBACK = "policy_fallback"         # the engine could not allow it (fail closed)
 CATEGORY_GATE_ERROR = "gate_error"                   # the gate raised
 CATEGORY_GATE_TIMEOUT = "gate_timeout"               # the gate answered late, or its lookup hung
+CATEGORY_NO_REPLY = "no_reply"                       # the source yielded nothing: the fallback line
+CATEGORY_GATE_LEDGER = "gate_ledger"                 # the gate's ledger could not be written
+RULE_HEARD_UNWRITTEN = "gate_ledger:heard_unwritten"
 
 # A verdict that took longer than this is discarded and the reply fails closed. The port's
 # check is synchronous, so this cannot interrupt a gate that never returns; it bounds what the
@@ -79,6 +89,18 @@ TOOLS_TIMEOUT_S = 1.0
 
 class GateTimeout(RuntimeError):
     """The gate did not answer in time. Carries no text."""
+
+
+class GateLedgerError(RuntimeError):
+    """What was heard could not be put on record under a policy that requires it. Carries no
+    text."""
+
+
+def ledger_required(stamp) -> bool:
+    """True when the session's policy makes the gate's records a condition of speaking: a
+    restricted pack, or any pack in allowlist posture."""
+    return stamp is not None and (getattr(stamp, "pack", "") in RESTRICTED_PACKS
+                                  or getattr(stamp, "posture", "") == "allowlist")
 
 
 @dataclass(frozen=True)
@@ -240,7 +262,8 @@ class TurnGate:
     Every evaluation is appended to `events` (the store writes them as gate records when the
     reply ends). A gate that raises, a verdict that arrives past the deadline, and a tool-row
     lookup that hangs are each journalled and then raised, so the reply stage refuses with the
-    gate's scripted fallback and the candidate is never synthesised.
+    gate's scripted fallback and the candidate is never synthesised. Scripted lines (the cue,
+    the lead-in and the line recorded when the source yields nothing) pass through it too.
     """
 
     def __init__(self, inner, events: list[GateEvent] | None = None, *,
@@ -252,11 +275,24 @@ class TurnGate:
         self._tools_timeout_s = TOOLS_TIMEOUT_S if tools_timeout_s is None else tools_timeout_s
         self._timer = timer
         self._asked: str = ""            # the sentence the stage last asked about
+        self._fault: str = ""            # the rule that faulted this turn's gate, if one did
 
     @classmethod
     def for_turn(cls, inner, turn) -> TurnGate:
-        """Journal onto the store's record for this turn when it keeps one."""
-        return cls(inner, getattr(getattr(turn, "handle", None), "gate_events", None))
+        """Journal onto the store's record for this turn when it keeps one. When that record
+        says the turn's heard row could not be written and its policy requires the ledger, the
+        gate is faulted for the whole reply."""
+        handle = getattr(turn, "handle", None)
+        gate = cls(inner, getattr(handle, "gate_events", None))
+        if getattr(handle, "heard_written", True) is False \
+                and ledger_required(getattr(handle, "policy", None)):
+            gate._fault = RULE_HEARD_UNWRITTEN
+        return gate
+
+    @property
+    def faulted(self) -> bool:
+        """True when nothing this turn may be spoken but the scripted fallback."""
+        return bool(self._fault)
 
     @property
     def fail_closed_phrase(self) -> str:
@@ -264,6 +300,8 @@ class TurnGate:
 
     def needs_session_tools(self, sentence: str) -> bool:
         self._asked = sentence
+        if self._fault:
+            return False                 # check() refuses; no lookup is spent on it
         try:
             return self._inner.needs_session_tools(sentence)
         except Exception as exc:
@@ -305,10 +343,31 @@ class TurnGate:
             return None
         return phrase if verdict.decision == GATE_PASS else None
 
+    def fallback(self, phrase: str) -> tuple[str, str, str]:
+        """(text, decision, category) to record for a reply whose source yielded nothing.
+
+        The stream's fallback line is not spoken by the reply stage, but it becomes the reply
+        text: shown, stored, kept in the history and spoken if the person asks for a repeat.
+        It is scripted text like a cue, so it is evaluated like one and journalled. Passed, it
+        is recorded under CATEGORY_NO_REPLY (the journal row too), never as a reply that
+        passed. Refused, or with the gate down, no text is recorded at all."""
+        if not phrase:
+            return "", GATE_PASS, CATEGORY_NO_REPLY
+        try:
+            verdict = self._evaluate(EVENT_CUE, phrase, (), "", passed_as=CATEGORY_NO_REPLY)
+        except Exception:  # noqa: BLE001 - journalled in _evaluate; the line is dropped
+            return "", GATE_REFUSE, self.events[-1].category
+        if verdict.decision == GATE_PASS:
+            return phrase, GATE_PASS, CATEGORY_NO_REPLY
+        return "", GATE_REFUSE, verdict.category
+
     # ------------------------------------------------------------------ internals
 
     def _evaluate(self, event: str, text: str, session_tools: Sequence[str],
-                  user_text: str) -> GateDecision:
+                  user_text: str, *, passed_as: str | None = None) -> GateDecision:
+        if self._fault:
+            self._journal(event, text, GATE_REFUSE, CATEGORY_GATE_LEDGER, self._fault, cost_us=0)
+            raise GateLedgerError("the gate's ledger could not be written")
         started = self._timer()
         try:
             verdict = self._inner.check(text, session_tools, user_text=user_text)
@@ -325,6 +384,8 @@ class TurnGate:
             raise GateTimeout("gate verdict arrived past its deadline")
         rule = getattr(verdict, "rule", None) or (RULE_PASSED if decision == GATE_PASS
                                                   else category)
+        if passed_as and decision == GATE_PASS:
+            category = passed_as
         self._journal(event, text, decision, category, rule, cost_us=cost_us,
                       policy_version=getattr(verdict, "policy_version", ""),
                       candidate_hash=getattr(verdict, "candidate_hash", ""))

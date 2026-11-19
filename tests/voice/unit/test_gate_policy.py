@@ -16,6 +16,7 @@ import logging
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,7 +35,7 @@ from app.local.voice.adapters.gate_policy import CorePolicyGate, TurnGate, load_
 from app.local.voice.adapters.store_postgres import PostgresSessionStore
 from app.local.voice.host import VoiceConfig, VoiceHost
 
-from .fakes import FakeDelegate, FakeGate, fake_ports, policy_gate, shipped_profile
+from .fakes import FakeDelegate, FakeGate, FakeTalker, fake_ports, policy_gate, shipped_profile
 
 from tests.testdb import TEST_DATABASE_URL as DB_URL
 MIGRATIONS = Path(reply_chain.__file__).parent / "migrations"
@@ -439,6 +440,267 @@ async def test_heard_record_is_written_before_anything_is_played(gate_app):
     assert records[1]["turn_id"] == turn.turn_id and records[1]["input_len"] == 16
 
 
+# ── the ledger is written however a reply ends ───────────────────────────────
+
+
+class _Pool:
+    """The app's pool. A statement `fails` returns True for raises, as a table the engine
+    cannot write would; `borrows` counts connections taken."""
+
+    def __init__(self, pool, fails=None) -> None:
+        self._pool, self.fails, self.borrows = pool, fails, 0
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+    @asynccontextmanager
+    async def connection(self, **kw):
+        self.borrows += 1
+        async with self._pool.connection(**kw) as conn:
+            yield _Conn(conn, self)
+
+
+class _Conn:
+    def __init__(self, conn, pool: _Pool) -> None:
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_pool", pool)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value) -> None:          # row_factory and the like
+        setattr(self._conn, name, value)
+
+    async def execute(self, query, *args, **kw):
+        if self._pool.fails is not None and self._pool.fails(str(query)):
+            raise psycopg.OperationalError("injected: not writable")     # carries no text
+        return await self._conn.execute(query, *args, **kw)
+
+
+def _over(app, fails=None) -> _Pool:
+    """Put a _Pool between the app's adapters and its database."""
+    pool = _Pool(app.state.store.pool, fails)
+    app.state.store = SimpleNamespace(pool=pool)
+    return pool
+
+
+def _ledger_insert(query: str) -> bool:
+    return query.lstrip().startswith("INSERT INTO gate_records")
+
+
+def _once(fails):
+    """`fails`, for the first statement it matches only: the ledger comes back."""
+    seen: list[str] = []
+
+    def first_only(query: str) -> bool:
+        if not seen and fails(query):
+            seen.append(query)
+            return True
+        return False
+
+    return first_only
+
+
+class _HoldsTheSecondClause(FakeTalker):
+    """Speaks the first clause; the second never finishes synthesis."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.holding = asyncio.Event()
+
+    async def synthesize(self, text: str):
+        if self.synthesized:
+            self.holding.set()
+            await asyncio.Event().wait()
+        return await super().synthesize(text)
+
+
+async def _reply_records(app, session_id: str) -> tuple[list[dict], dict | None]:
+    """(decision rows, outcome row or None) for the session's one reply."""
+    records = await _records(app, session_id)
+    outcomes = [r for r in records if r["event"] == "outcome"]
+    assert len(outcomes) <= 1
+    return [r for r in records if r["event"] == "decision"], (outcomes or [None])[0]
+
+
+async def test_a_reply_cancelled_mid_speech_leaves_its_decisions_and_how_it_ended(gate_app):
+    """A host stop while the reply plays: the clauses already spoken have their records."""
+    talker = _HoldsTheSecondClause()
+    ports = _ports(gate_app, replies=[SAID[1]], talker=talker)
+    session_id = await gate_app.session()
+    reply = asyncio.create_task(_host(ports).reply_turn(session_id, 1, HEARD[1], turn_end_ms=0))
+    await asyncio.wait_for(talker.holding.wait(), 10)
+    assert ports.audio_out.played                          # the first clause was spoken
+    reply.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reply
+
+    decisions, outcome = await _reply_records(gate_app, session_id)
+    assert [d["candidate_hash"] for d in decisions] == \
+        [gate_records.candidate_digest(c) for c in SAID[1]]
+    assert [(d["decision"], d["rule"]) for d in decisions] == [("pass", "passed")] * 2
+    assert (outcome["decision"], outcome["category"], outcome["rule"]) == \
+        (GATE_PASS, "reply_cancelled", "passed")
+    assert outcome["policy_version"] == "seniorcare-v1"
+
+
+async def test_a_reply_that_fails_after_speaking_leaves_its_decisions_and_how_it_ended(
+        gate_app, monkeypatch):
+    async def fails_after_speech(speak, *, interrupted):
+        await speak
+        raise RuntimeError("injected after speech")
+
+    monkeypatch.setattr(VoiceHost, "_settle", staticmethod(fails_after_speech))
+    ports = _ports(gate_app, replies=[SAID[2]])            # the pack denies the first clause
+    session_id = await gate_app.session()
+    assert await _host(ports).reply_turn(session_id, 1, HEARD[2], turn_end_ms=0) == ""
+    assert ports.talker.fixed_phrases == [SENIORCARE_LINE]
+
+    decisions, outcome = await _reply_records(gate_app, session_id)
+    assert [(d["decision"], d["category"]) for d in decisions] == [(GATE_REFUSE, "policy_deny")]
+    assert (outcome["decision"], outcome["category"], outcome["rule"]) == \
+        (GATE_REFUSE, "reply_failed", decisions[0]["rule"])
+
+
+async def test_a_reply_that_fails_before_any_clause_still_has_an_outcome(gate_app):
+    class _NoDelegate(FakeDelegate):
+        async def reply(self, *a, **kw):
+            raise ConnectionError("injected")
+
+    ports = _ports(gate_app)
+    ports.delegate = _NoDelegate()
+    session_id = await gate_app.session()
+    assert await _host(ports).reply_turn(session_id, 1, HEARD[1], turn_end_ms=0) == ""
+    decisions, outcome = await _reply_records(gate_app, session_id)
+    assert decisions == []
+    assert (outcome["decision"], outcome["category"], outcome["rule"]) == \
+        (None, "reply_failed", "reply_failed")
+
+
+async def test_a_failed_reply_row_update_does_not_take_the_gate_records_with_it(gate_app):
+    _over(gate_app, lambda q: q.lstrip().startswith("UPDATE replies SET text"))
+    ports = _ports(gate_app, replies=[SAID[1]])
+    session_id = await gate_app.session()
+    assert await _host(ports).reply_turn(session_id, 1, HEARD[1], turn_end_ms=0) == \
+        " ".join(SAID[1])
+
+    decisions, outcome = await _reply_records(gate_app, session_id)
+    assert len(decisions) == 2
+    assert (outcome["decision"], outcome["category"], outcome["rule"]) == (GATE_PASS, "ok", "passed")
+    async with gate_app.state.store.pool.connection() as conn:     # the reply row did fail
+        cur = await conn.execute("SELECT gate_category FROM replies WHERE meeting_id = %s",
+                                 (session_id,))
+        assert (await cur.fetchone())[0] == "pending"
+
+
+async def test_the_clauses_of_a_reply_cost_no_database_round_trip(gate_app):
+    pool = _over(gate_app)
+    ports = _ports(gate_app, replies=[["One."], ["One.", "Two.", "Three.", "Four.", "Five."]])
+    host = _host(ports)
+    session_id = await gate_app.session()
+    borrows = []
+    for turn_n in (1, 2):
+        before = pool.borrows
+        await host.reply_turn(session_id, turn_n, HEARD[1], turn_end_ms=0)
+        borrows.append(pool.borrows - before)
+    assert borrows[0] == borrows[1]                        # one clause or five: the same
+    assert len(ports.talker.synthesized) == 6
+
+
+# ── the ledger cannot be written ─────────────────────────────────────────────
+
+
+async def test_in_a_restricted_mode_an_unwritable_ledger_is_a_gate_fault(gate_app, caplog):
+    """5a: with no record of what was heard the assistant does not answer. It asks no model,
+    takes no action, and says the pack's scripted line."""
+    _over(gate_app, _ledger_insert)
+    ports = _ports(gate_app, replies=[[CANDIDATE]])
+    session_id = await gate_app.session()
+    with caplog.at_level(logging.DEBUG):
+        text = await _host(ports).reply_turn(session_id, 1, "what is the capital of France",
+                                             turn_end_ms=0)
+
+    assert text == SENIORCARE_LINE
+    assert ports.talker.synthesized == [] and ports.talker.fixed_phrases == [SENIORCARE_LINE]
+    assert ports.delegate.calls == []
+    assert await _records(gate_app, session_id) == []      # and the ledger really was down
+    assert "gate records: failed to write" in caplog.text  # which the log says, without the words
+    assert "France" not in caplog.text and "Paris" not in caplog.text
+
+
+async def test_a_restricted_ledger_that_comes_back_holds_the_whole_faulted_reply(gate_app):
+    _over(gate_app, _once(_ledger_insert))
+    ports = _ports(gate_app, replies=[[CANDIDATE]])
+    session_id = await gate_app.session()
+    heard_text = "what is the capital of France"
+    assert await _host(ports).reply_turn(session_id, 1, heard_text, turn_end_ms=0) == \
+        SENIORCARE_LINE
+    assert ports.talker.synthesized == [] and ports.delegate.calls == []
+
+    (reply_id, turn_id, transcript_text) = (await _reply_ids(gate_app, session_id))[1]
+    async with gate_app.state.store.pool.connection() as conn:
+        seen = await gate_records.reconstruct(conn, reply_id)
+    assert seen["policy"]["policy_version"] == "seniorcare-v1"
+    assert gate_records.heard_matches(seen["heard"], turn_id, transcript_text)
+    (decision,) = seen["decisions"]
+    assert (decision["decision"], decision["category"], decision["rule"]) == \
+        (GATE_REFUSE, "gate_ledger", "gate_ledger:heard_unwritten")
+    outcome = seen["outcome"]
+    assert (outcome["decision"], outcome["category"], outcome["rule"]) == \
+        (GATE_REFUSE, "gate_error", "gate_ledger:heard_unwritten")
+
+
+@pytest.mark.parametrize("comes_back", [False, True])
+async def test_in_an_unrestricted_mode_an_unwritable_ledger_does_not_silence_the_assistant(
+        gate_app, caplog, comes_back):
+    """Personal and ideascribe keep answering: the gate still evaluates every clause, the
+    failure is logged without the words, and the records are written late if the ledger is
+    back by the end of the reply."""
+    gate_app.state.profile = shipped_profile("personal")
+    _over(gate_app, _once(_ledger_insert) if comes_back else _ledger_insert)
+    ports = _ports(gate_app, replies=[[CANDIDATE]])
+    assert ports.gate.stamp.posture == "denylist"
+    session_id = await gate_app.session()
+    with caplog.at_level(logging.DEBUG):
+        text = await _host(ports).reply_turn(session_id, 1, "what is the capital of France",
+                                             turn_end_ms=0)
+
+    assert text == CANDIDATE and ports.talker.synthesized == [CANDIDATE]
+    assert "gate records: failed to write" in caplog.text
+    assert "France" not in caplog.text and "Paris" not in caplog.text
+    events = [r["event"] for r in await _records(gate_app, session_id)]
+    assert events == (["policy_applied", "heard", "decision", "outcome"] if comes_back else [])
+
+
+def test_the_turn_gate_is_faulted_only_where_the_pack_makes_the_ledger_a_condition():
+    def turn(profile: str, heard_written: bool):
+        stamp = load_policy(shipped_profile(profile)).stamp
+        handle = SimpleNamespace(gate_events=[], heard_written=heard_written, policy=stamp)
+        return SimpleNamespace(handle=handle)
+
+    for profile in ("senior_care", "classroom"):
+        assert TurnGate.for_turn(policy_gate(profile), turn(profile, False)).faulted
+        assert not TurnGate.for_turn(policy_gate(profile), turn(profile, True)).faulted
+    for profile in ("personal", "ideascribe"):
+        assert not TurnGate.for_turn(policy_gate(profile), turn(profile, False)).faulted
+    assert not TurnGate.for_turn(FakeGate(), SimpleNamespace(handle=None)).faulted
+
+    secret = "zanzibar marmalade"
+    faulted = TurnGate.for_turn(policy_gate("senior_care"), turn("senior_care", False))
+    with pytest.raises(gate_policy.GateLedgerError) as raised:
+        faulted.check(f"Tell them about the {secret}.", user_text=secret)
+    assert secret not in str(raised.value) and faulted.scripted("hm") is None
+    assert [(e.decision, e.category, e.rule) for e in faulted.events] == \
+        [(GATE_REFUSE, "gate_ledger", "gate_ledger:heard_unwritten")] * 2
+    assert all(secret not in str(v) for e in faulted.events for v in vars(e).values())
+
+
+def test_the_hosts_names_for_an_abnormal_ending_are_the_ledgers():
+    from app.local.voice import host as host_mod
+
+    assert set(gate_records.ENDED_CATEGORY) == {host_mod.REPLY_CANCELLED, host_mod.REPLY_FAILED}
+
+
 # ── no column in a gate record contains user speech ──────────────────────────
 
 
@@ -659,10 +921,82 @@ async def test_with_the_reply_model_disabled_deterministic_replies_still_pass_th
         second = await gate_records.reconstruct(conn, replies[2][0])
     assert [(d["decision"], d["rule"]) for d in first["decisions"]] == [("pass", "passed")]
     assert [(c["decision"], c["candidate_len"]) for c in first["cues"]] == [("pass", 2)]
-    assert second["decisions"] == [] and second["outcome"]["decision"] == GATE_PASS
+    # The fallback line was evaluated like the cue, and nothing says a model reply passed.
+    assert second["decisions"] == []
+    assert [(c["decision"], c["category"], c["candidate_hash"]) for c in second["cues"]] == [
+        ("pass", "ok", gate_records.candidate_digest("hm")),
+        ("pass", "no_reply", gate_records.candidate_digest(reply_chain.FALLBACK_PHRASE))]
+    outcome = second["outcome"]
+    assert (outcome["decision"], outcome["category"], outcome["rule"]) == \
+        (GATE_PASS, "no_reply", "passed")
+    async with gate_app.state.store.pool.connection() as conn:
+        cur = await conn.execute("SELECT gate_category FROM replies WHERE id = %s",
+                                 (replies[2][0],))
+        assert (await cur.fetchone())[0] == "no_reply"
     for seen in (first, second):
         assert seen["heard"]["policy_version"] == "seniorcare-v1"
         assert seen["outcome"]["policy_version"] == "seniorcare-v1"
+
+
+# ── the fallback line is scripted text too: gated, and recorded as what it is ─
+
+
+NO_REPLY = "nothing"                # FakeDelegate's fallback line
+
+
+@pytest.mark.parametrize("gate,recorded,decision,category", [
+    (FakeGate(), NO_REPLY, GATE_PASS, "no_reply"),
+    (FakeGate(refuse=NO_REPLY), "", GATE_REFUSE, "blocked"),
+    (FakeGate(raises=True), "", GATE_REFUSE, "gate_error"),
+])
+async def test_the_fallback_line_is_shown_and_stored_only_if_the_gate_passes_it(
+        gate, recorded, decision, category):
+    """When the reply model yields nothing the stream's fallback line becomes the reply text:
+    shown, stored, kept in the history and repeated on request. It is evaluated like the cue
+    and the lead-in, and the outcome says it was the no-reply line, not a reply that passed."""
+    ports = fake_ports(gate=gate, delegate=FakeDelegate([[]]))
+    text = await _host(ports).reply_turn("s1", 1, "tell me about the tomatoes", turn_end_ms=0)
+
+    assert gate.checked == [NO_REPLY]                       # the gate saw it
+    assert text == recorded
+    ((_turn_n, outcome),) = ports.store.turns
+    assert (outcome.text, outcome.decision, outcome.category) == (recorded, decision, category)
+    assert ports.talker.synthesized == [] and ports.talker.fixed_phrases == []   # never spoken
+
+
+async def test_a_reply_with_sentences_never_evaluates_the_fallback_line():
+    gate = FakeGate()
+    ports = fake_ports(gate=gate, delegate=FakeDelegate([["One."]]))
+    assert await _host(ports).reply_turn("s1", 1, "question", turn_end_ms=0) == "One."
+    assert gate.checked == ["One."]
+
+
+class _DeniesTheFallback(CorePolicyGate):
+    def check(self, sentence, session_tools=(), *, user_text=""):
+        if sentence == NO_REPLY:
+            return gate_policy.PolicyDecision(GATE_REFUSE, "policy_deny", self.fail_closed_phrase,
+                                              rule="deny_pattern:test",
+                                              policy_version=self.policy_version)
+        return super().check(sentence, session_tools, user_text=user_text)
+
+
+async def test_a_refused_fallback_line_leaves_no_text_and_a_record_of_the_rule(gate_app):
+    gate = _DeniesTheFallback(gate_policy.session_policy(gate_app))
+    ports = _ports(gate_app, gate=gate, replies=[[]])
+    session_id = await gate_app.session()
+    assert await _host(ports).reply_turn(session_id, 1, "anything at all", turn_end_ms=0) == ""
+
+    records = await _records(gate_app, session_id)
+    (line,) = [r for r in records if r["event"] == "cue"]
+    assert (line["decision"], line["rule"]) == (GATE_REFUSE, "deny_pattern:test")
+    assert line["candidate_hash"] == gate_records.candidate_digest(NO_REPLY)
+    (outcome,) = [r for r in records if r["event"] == "outcome"]
+    assert (outcome["decision"], outcome["category"], outcome["rule"]) == \
+        (GATE_REFUSE, "policy_deny", "deny_pattern:test")
+    async with gate_app.state.store.pool.connection() as conn:
+        cur = await conn.execute("SELECT text, gate_category FROM replies WHERE meeting_id = %s",
+                                 (session_id,))
+        assert await cur.fetchone() == ("", "policy_deny")
 
 
 def test_verdict_is_the_port_type_the_reply_stage_expects():

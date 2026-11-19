@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -114,3 +115,40 @@ async def test_with_isolation_off_a_client_with_no_tenant_gets_every_event_with_
     assert set(by_kind["wake.transcript"]) == {"meetingId", "turn", "segment"}
     assert set(by_kind["wake.reply"]) == {"meetingId", "turn", "phase", "userText", "text"}
     assert all(set(e) == {"type", "data"} for e in got)
+
+
+# ── the device changes hands ──────────────────────────────────────────────────
+
+
+async def test_the_previous_tenant_is_told_off_in_its_own_stream_before_the_device_is_rebound():
+    """Without it the previous person's app keeps showing "armed" while the room's speech goes
+    to someone else."""
+    host = _host(enforced=True, tenant=A)
+    async with AsyncExitStack() as stack:
+        sub_a, sub_b = await _subscribe(stack, A), await _subscribe(stack, B)
+        assert host.arm()
+        assert [(e.type, e.data["state"]) for e in _drain(sub_a)] == [("wake_state", "armed")]
+
+        with tenancy.tenant_scope(B):           # B's request rebinds the device
+            assert host.bind(replace(host.binding, tenant=B))
+        (told,) = _drain(sub_a)
+        assert (told.type, told.data["state"], told.data["meeting_id"]) == ("wake_state", "off", None)
+        event_schema.validate(told.type, told.data)
+        assert _drain(sub_b) == []              # the off state was A's, not the newcomer's
+        assert host.state.value == "armed"      # the device itself stays armed, now for B
+
+        assert host.bind(replace(host.binding, tenant=None))       # unbound: B is told too
+        assert [(e.type, e.data["state"]) for e in _drain(sub_b)] == [("wake_state", "off")]
+        assert _drain(sub_a) == []
+
+
+async def test_a_new_role_for_the_same_tenant_or_a_device_that_is_off_tells_nobody_anything():
+    host = _host(enforced=True, tenant=A)
+    async with AsyncExitStack() as stack:
+        sub_a = await _subscribe(stack, A)
+        assert host.bind(replace(host.binding, tenant=B))           # off: A was never told armed
+        assert host.bind(replace(host.binding, tenant=A))
+        assert host.arm()
+        _drain(sub_a)
+        assert host.bind(replace(host.binding, role="admin"))       # same tenant: still theirs
+        assert _drain(sub_a) == []

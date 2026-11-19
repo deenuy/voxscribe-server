@@ -24,7 +24,7 @@ from app.local.routers import wake as wake_router
 from app.local.voice.adapters.delegate_ollama import OllamaDelegate
 from app.local.voice.adapters.gate_policy import CorePolicyGate
 from app.local.voice.adapters.store_postgres import PostgresSessionStore
-from app.local.voice.host import VoiceConfig, VoiceHost, WakeState
+from app.local.voice.host import SessionBinding, VoiceConfig, VoiceHost, WakeState
 from tests.testdb import TEST_DATABASE_URL
 
 from .fakes import fake_ports
@@ -103,6 +103,60 @@ async def test_trigger_allowed_with_debug_flag(armed_wake_state, monkeypatch):
     assert body["triggered"] is True
     assert body["meeting_id"] == "m-trigger-test"
     assert started == [1.0]
+
+
+# ── wake state does not cross tenants ────────────────────────────────────────
+
+
+def _tenant_wake_app(host) -> FastAPI:
+    """The wake routes behind a stand-in for the identity middleware: the header names the
+    verified caller's tenant."""
+    app = _wake_app(auth_disabled=True, debug_trigger=False)
+    app.state.voice_host = host
+
+    @app.middleware("http")
+    async def _tenant(request, call_next):
+        tenant = request.headers.get("X-Test-Tenant")
+        if tenant:
+            request.state.tenant = tenant
+        return await call_next(request)
+
+    return app
+
+
+async def _get_state(app: FastAPI, tenant: str | None) -> dict:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/v1/wake/state",
+                                headers={"X-Test-Tenant": tenant} if tenant else {})
+    assert resp.status_code == 200
+    return resp.json()
+
+
+async def test_wake_state_gives_the_meeting_id_only_to_the_tenant_the_device_is_bound_to():
+    host = VoiceHost(VoiceConfig(), ports=fake_ports(),
+                     binding=SessionBinding(tenant="t_alice", device="kitchen"))
+    host.set_state(WakeState.LISTENING)
+    host._state["meeting_id"] = "m-alice-1"
+    app = _tenant_wake_app(host)
+
+    mine = await _get_state(app, "t_alice")
+    assert (mine["state"], mine["meeting_id"], mine["bound_to_caller"]) == \
+        ("listening", "m-alice-1", True)
+
+    theirs = await _get_state(app, "t_bob")
+    # Another verified caller still learns the device is in use, and nothing about the session.
+    assert (theirs["state"], theirs["meeting_id"], theirs["bound_to_caller"]) == \
+        ("listening", None, False)
+    assert "m-alice-1" not in str(theirs)
+
+
+async def test_wake_state_with_isolation_off_is_as_before(armed_wake_state):
+    host = armed_wake_state
+    host._state["meeting_id"] = "m-shared"
+    state = await _get_state(_tenant_wake_app(host), None)
+    assert (state["state"], state["meeting_id"], state["bound_to_caller"]) == \
+        ("armed", "m-shared", True)
 
 
 async def test_created_app_without_flag_returns_403(throwaway_schema, armed_wake_state):

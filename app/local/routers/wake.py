@@ -1,7 +1,11 @@
 """Wake word state API, read from the voice host (app.state.voice_host).
 
-GET  /v1/wake/state     → {state, model, phrase, trigger, meeting_id}
+GET  /v1/wake/state     → {state, model, phrase, trigger, meeting_id, bound_to_caller}
                           states: armed | listening | off | error
+                          meeting_id is the running session's, and only the tenant the device is
+                          bound to gets it. Any other verified caller still learns whether the
+                          device is in use (state), with meeting_id null and bound_to_caller
+                          false: the device is listening, but not for them
 GET  /v1/wake/profile   → {mode, delegate, quiet_hours_enabled}  current product profile summary
 POST /v1/wake/arm       → arm (no-op if already armed/listening). With tenant isolation on, the
                           verified person who arms is who the device listens for from then on
@@ -102,14 +106,18 @@ async def wake_state(request: Request):
     if host is None:
         return {"state": WakeState.OFF.value, "model": _OFF_CONFIG.detector,
                 "phrase": _OFF_CONFIG.wake_phrase, "trigger": _OFF_CONFIG.trigger_phrase,
-                "meeting_id": None}
+                "meeting_id": None, "bound_to_caller": False}
     s = host.snapshot()
+    # A session is its tenant's: the meeting id goes to the tenant the device is bound to and to
+    # nobody else. With isolation off both sides are None, the one shared scope.
+    mine = getattr(request.state, "tenant", None) == host.binding.tenant
     return {
         "state":      _value(s["state"]),
         "model":      s["model"],
         "phrase":     s["phrase"],
         "trigger":    s.get("trigger"),
-        "meeting_id": s.get("meeting_id"),
+        "meeting_id": s.get("meeting_id") if mine else None,
+        "bound_to_caller": mine,
     }
 
 
