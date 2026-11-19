@@ -87,7 +87,7 @@ _ERRORS: list[dict] = [
     {"code": "conflict",             "status": 409, "detail": "the operation conflicts with the current state"},
     {"code": "provider_unavailable", "status": 503, "detail": "the requested AI provider is not reachable"},
     {"code": "consent_required",     "status": 400, "detail": "the caller has not given the required consent"},
-    {"code": "network_disabled",     "status": 403, "detail": "the engine is in offline mode; network calls are blocked"},
+    {"code": "network_disabled",     "status": 403, "detail": "network calls are blocked: privacy is offline, the product mode has no network (senior care, classroom) or the profile turns it off"},
     {"code": "database_unavailable", "status": 503, "detail": "the database is not reachable"},
     {"code": "connector_not_connected", "status": 409, "detail": "the connector has no active token"},
     {"code": "connector_token_expired", "status": 409, "detail": "the connector token has expired"},

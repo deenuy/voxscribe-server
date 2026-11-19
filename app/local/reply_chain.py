@@ -311,24 +311,44 @@ def split_sentences(text: str) -> list[str]:
     return [p for p in parts if p]
 
 
-async def record_tool_call(pool, *, task_id: str, turn_id: str | None, meeting_id: str | None,
-                           tool: str, query: str, engine: str | None, result_count: int,
-                           duration_ms: int, error: str | None) -> None:
-    """One tool_calls row. Every row carries the delegate task that made the call (A5)."""
+async def record_tool_call(pool, *, task_id: str | None, turn_id: str | None,
+                           meeting_id: str | None, tool: str, query: str | None,
+                           engine: str | None, result_count: int, duration_ms: int,
+                           error: str | None, status: str | None = None,
+                           error_code: str | None = None) -> None:
+    """One tool_calls row. A thinker's row carries the delegate task that made the call (A5); a
+    call refused before it ran carries status `refused` and the decision's reason code."""
     try:
         async with pool.connection() as conn:
             await conn.execute(
                 "INSERT INTO tool_calls"
                 " (id, turn_id, meeting_id, tool, query, engine, result_count,"
-                "  duration_ms, error, called_at, task_id)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                "  duration_ms, error, called_at, task_id, status, error_code)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT DO NOTHING",
-                (str(uuid.uuid4()), turn_id, meeting_id, tool, query, engine, result_count,
-                 duration_ms, error, _now_z(), task_id),
+                (str(uuid.uuid4()), turn_id or "", meeting_id, tool, query, engine,
+                 result_count, duration_ms, error, _now_z(), task_id, status, error_code),
             )
             await conn.commit()
     except Exception:
         log.exception("reply_chain: tool_calls insert failed task_id=%s", task_id)
+
+
+async def refuse_search(app, meeting_id: str | None, *, turn_id: str | None,
+                        task_id: str | None = None) -> str | None:
+    """PL41: the network decision for a web search. Returns None when the search may run;
+    otherwise writes one `refused` row, sends nothing, and returns the scripted refusal line."""
+    from app.local.tools.network import network_decision
+    from app.local.voice.adapters.scope import scoped_pool
+
+    decision = await network_decision(app)
+    if decision.allowed:
+        return None
+    await record_tool_call(scoped_pool(app), task_id=task_id, turn_id=turn_id,
+                           meeting_id=meeting_id, tool="web_search", query=None, engine=None,
+                           result_count=0, duration_ms=0, error=None, status="refused",
+                           error_code=decision.reason)
+    return decision.line
 
 
 def _count_results(search_result: str) -> int:
@@ -354,6 +374,11 @@ async def search_answer(app, meeting_id: str | None, request: str, query: str, *
     # search runs) outside a tenant's scope with isolation on, or in a session that is not the tenant's.
     pool = scoped_pool(app)
     log.info("reply_chain: thinker search task_id=%s meeting_id=%s", task_id, meeting_id)
+    # PL41: the decision is taken again when the search is about to run, so a privacy setting
+    # changed after the request was submitted is obeyed.
+    refusal = await refuse_search(app, meeting_id, turn_id=turn_id, task_id=task_id)
+    if refusal is not None:
+        return refusal
     t_search = time.monotonic()
     search_result = ""
     search_error: str | None = None
@@ -369,7 +394,8 @@ async def search_answer(app, meeting_id: str | None, request: str, query: str, *
     row = record_tool_call(
         pool, task_id=task_id, turn_id=turn_id, meeting_id=meeting_id, tool="web_search",
         query=query, engine="searxng", result_count=_count_results(search_result),
-        duration_ms=int((time.monotonic() - t_search) * 1000), error=search_error)
+        duration_ms=int((time.monotonic() - t_search) * 1000), error=search_error,
+        status="cancelled" if cancelled else ("failed" if search_error else "executed"))
     if cancelled:
         # The call was made, so the row is still written; then the cancel carries on.
         await asyncio.shield(row)

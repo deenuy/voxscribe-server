@@ -17,8 +17,10 @@ Routing, in order, all before the reply model is called (T14/T16):
   results  "what did you find?": the waiting results, or that the task is still running
   clock    the pre-router's answer from the OS clock, one sentence, no model and no tool
   thinker  a delegation signal or a pre-router search route: the request is submitted to the
-           lane and the talker says it is looking it up
-  talker   the reply model, which has no tools; if it emits [DELEGATE: <request>] the request
+           lane and the talker says it is looking it up. When the network decision refuses
+           web search (senior care, classroom, the profile, privacy offline: PL41) nothing is
+           submitted, one `refused` tool row is written and the scripted refusal is spoken
+  talker  the reply model, which has no tools; if it emits [DELEGATE: <request>] the request
            goes to the lane and the marker is never spoken
 
 The lane is polled at the start of every turn: a finished result is spoken after the turn's own
@@ -30,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 from voxscribe.session.ports import ReplyStream
 
@@ -46,7 +48,9 @@ log = logging.getLogger("app.local.voice.delegate")
 
 TASK_EVENT = "wake.delegate"     # status only: a result reaches a person through the gate
 
-Submit = Callable[[str], DelegateTask]
+# Hands a request to the thinker. Returns None when it was submitted, or the scripted refusal
+# line when the network decision (PL41) refuses the search it needs: then nothing is submitted.
+Submit = Callable[[str], Awaitable[str | None]]
 
 
 def _persona():
@@ -140,14 +144,20 @@ class OllamaDelegate:
                 fallback=reply_chain.FALLBACK_PHRASE,
             )
 
-        def submit(request: str) -> DelegateTask:
+        async def submit(request: str) -> str | None:
+            # The thinker's one tool is web search: it is refused here, before the lane, so the
+            # person hears why at once and no task is started (PL41).
+            refusal = await reply_chain.refuse_search(self._app, session_id, turn_id=turn_id)
+            if refusal is not None:
+                log.info("voice delegate: search refused session_id=%s", session_id)
+                return refusal
             task = self.lane.submit(request, session_id=session_id, turn_id=turn_id)
             if hist and task.status in dl.ACTIVE_STATUSES:
                 self._contexts[task.task_id] = hist
-            return task
+            return None
 
         offered, self._offered = self._offered, None
-        fixed, source, deliver = self._route(text, offered, submit)
+        fixed, source, deliver = await self._route(text, offered, submit)
         if fixed is None:
             src = reply_chain.talker_sentences(self._app, session_id, text, history=hist,
                                                pre_stream=speculation, system_note=system_note,
@@ -167,13 +177,13 @@ class OllamaDelegate:
 
     # ------------------------------------------------------------------ routing
 
-    def _route(self, text: str, offered: DelegateTask | None,
-               submit: Submit) -> tuple[list[str] | None, str, bool]:
+    async def _route(self, text: str, offered: DelegateTask | None,
+                     submit: Submit) -> tuple[list[str] | None, str, bool]:
         """(scripted sentences or None for the talker, source, deliver waiting results)."""
         lane = self.lane
         if offered is not None and dl.is_affirmative(text):
-            submit(offered.request)
-            return [dl.RERUN_PHRASE], "delegate", True
+            refusal = await submit(offered.request)
+            return [refusal or dl.RERUN_PHRASE], "delegate", True
 
         intent = dl.detect_intent(text)
         kind = intent.kind if intent is not None else None
@@ -186,8 +196,8 @@ class OllamaDelegate:
             return [dl.CANCELLED_PHRASE], "cancel", False
         if kind is IntentKind.CHANGE and open_task is not None and not is_clock:
             lane.cancel(open_task.task_id)
-            submit(intent.request)
-            return [dl.CHANGED_PHRASE], "delegate", True
+            refusal = await submit(intent.request)
+            return [refusal or dl.CHANGED_PHRASE], "delegate", True
         if kind is IntentKind.RESULTS:
             if lane.get_pending():
                 return [], "delivery", True
@@ -201,8 +211,8 @@ class OllamaDelegate:
             return [route[1]], "clock", True
         if route is not None or dl.delegation_signal(text):
             explicit = kind is IntentKind.CHANGE and intent.explicit
-            submit(intent.request if explicit else text)
-            return [dl.DELEGATING_PHRASE], "delegate", True
+            refusal = await submit(intent.request if explicit else text)
+            return [refusal or dl.DELEGATING_PHRASE], "delegate", True
         return None, "llm", True
 
     async def _with_delivery(self, own: AsyncIterator[str], deliver: bool) -> AsyncIterator[str]:
@@ -269,7 +279,11 @@ class OllamaDelegate:
     async def drain(self) -> None:
         """Wait for task rows still being written (shutdown and tests)."""
         while self._writes:
-            await asyncio.gather(*list(self._writes), return_exceptions=True)
+            # Gathering writes that have all finished returns without yielding to the loop, so
+            # their done callbacks never run: drop what was awaited here, or this never ends.
+            pending = list(self._writes)
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._writes.difference_update(pending)
 
     # ------------------------------------------------------------------ T16 reminder helpers
 
@@ -319,16 +333,14 @@ async def _without_marker(sentences: AsyncIterator[str], submit: Submit) -> Asyn
             yield text
             continue
         if request:
-            submit(request)
-            yield dl.DELEGATING_PHRASE
+            yield await submit(request) or dl.DELEGATING_PHRASE
         return
     # A marker the model never closed: what follows it is the request.
     if held:
         start = held.lower().find(dl.DELEGATE_MARKER_OPEN.lower()) + len(dl.DELEGATE_MARKER_OPEN)
         request = held[start:].strip()
         if request:
-            submit(request)
-            yield dl.DELEGATING_PHRASE
+            yield await submit(request) or dl.DELEGATING_PHRASE
 
 
 class _Speculation:

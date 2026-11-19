@@ -18,6 +18,9 @@ _SEARXNG_URL = os.environ.get("VOX_SEARXNG_URL", "http://127.0.0.1:8080")
 _TOP_N       = 5
 _TIMEOUT_S   = 6.0
 
+# The HTTP transport: None is httpx's own. Tests put a fake here to count what would be sent.
+TRANSPORT = None
+
 
 async def _call(arguments: dict) -> str:
     import httpx
@@ -30,13 +33,14 @@ async def _call(arguments: dict) -> str:
     params = {"q": query, "format": "json", "language": "en"}
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_S, transport=TRANSPORT) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
             data = r.json()
     except Exception as exc:
-        log.warning("web_search: SearXNG request failed: %s", exc)
-        return f"[web_search: unavailable — {exc}]"
+        # The exception's text can carry the request URL, and so the query: log its type only.
+        log.warning("web_search: SearXNG request failed: %s", type(exc).__name__)
+        return f"[web_search: unavailable: {type(exc).__name__}]"
 
     results = data.get("results", [])[:_TOP_N]
     if not results:

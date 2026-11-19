@@ -28,7 +28,7 @@
     },
     {
       "code": "network_disabled",
-      "detail": "the engine is in offline mode; network calls are blocked",
+      "detail": "network calls are blocked: privacy is offline, the product mode has no network (senior care, classroom) or the profile turns it off",
       "status": 403
     },
     {
