@@ -25,6 +25,11 @@ any other scripted line:
   - stock assistant sentences (STOCK_LEADING) are removed when they lead the reply, and closing
     offers (STOCK_OFFERS) wherever they stand; a reply made of nothing else keeps its last one
   - hesitation fillers between commas (", um,") are removed
+  - stage directions in brackets ("(singing)", "[Chorus]") are removed: they are read, not sung
+  - a sentence describing the assistant as a program built for a purpose ("I'm a computer
+    program designed to ...") goes the way of the closing offers; "I'm an AI." stays
+  - a reply stops before the sentence that would take it past SPOKEN_WORD_BUDGET words; the
+    first sentence is always kept, however long
 Replies arrive sentence by sentence; the rules work on that stream and hold nothing but a stock
 sentence they are about to remove.
 
@@ -207,7 +212,18 @@ STOCK_OFFERS: dict[str, re.Pattern] = {name: re.compile(p, re.IGNORECASE) for na
     "let_me_know": r"(?:just )?let me know if (?:you have any (?:other |more )?questions|(?:there's|there is) anything else(?: i can (?:do|help with))?|you need anything(?: else)?)",
     "feel_free": r"feel free to ask(?: me)?(?: (?:anything|any other questions))?",
     "how_can_i_help": STOCK_LEADING["how_can_i_help"].pattern,
+    # Measured 2026-11-19 on llama3.2: asked whether it is a person, the model answered "Nope,
+    # I'm an AI." and then this, in most samples. The first sentence is the honest answer.
+    "program_purpose": r"(?:i'm|i am) (?:just |actually |only |really )?(?:a |an )?(?:computer "
+                       r"program|program|language model|ai(?: model| program| assistant)?|machine)"
+                       r"\b[^.!?]*\b(?:designed|trained|built|programmed|made) to\b.*",
+    "ready_to_help": r"(?:i'm |i am )?(?:always )?ready to (?:chat|help|assist)(?: and (?:help|chat))?"
+                     r"(?: you)?(?: out)?(?: with anything(?: (?:that's )?on your mind)?| today)?",
 }.items()}
+# Reply length in natural speech: a reply stops before the sentence that would pass this.
+SPOKEN_WORD_BUDGET = 35
+# A stage direction the model writes for itself: "(singing)", "[Chorus]", "*clears throat*".
+_STAGE_DIRECTION = re.compile(r"\s*(?:\([^()]{1,40}\)|\[[^\[\]]{1,40}\]|\*[^*]{1,40}\*)\s*")
 # A clause of thanks at either end of a sentence: "I'm well, thanks for asking."
 _THANKS_CLAUSE_END = re.compile(r",\s*(?:thank you|thanks)(?: so much)? for asking\s*([.!?]*)\s*$",
                                 re.IGNORECASE)
@@ -216,6 +232,12 @@ _THANKS_CLAUSE_START = re.compile(r"^\s*(?:thank you|thanks)(?: so much)? for as
 # A closing clause offering help: "Yes, I can hear you, and I'm ready to assist you with ..."
 _HELP_CLAUSE_END = re.compile(r",\s*and (?:i'm|i am) (?:here|ready|happy|glad|always here) to "
                               r"(?:help|assist)\b[^.!?]*([.!?]*)\s*$", re.IGNORECASE)
+# The same description as a closing clause: "Nope, I'm an AI, just a computer program designed to
+# chat and help." keeps "Nope, I'm an AI."
+_PROGRAM_CLAUSE_END = re.compile(r",\s*(?:(?:i'm|i am) )?(?:just |only |really )?(?:a |an )?"
+                                 r"(?:computer program|program|language model|machine)\b[^.!?]*"
+                                 r"\b(?:designed|trained|built|programmed|made) to\b[^.!?]*"
+                                 r"([.!?]*)\s*$", re.IGNORECASE)
 _HESITATION_CLAUSE = re.compile(r",\s*(?:u+m+|u+h+|e+r+m*)\s*,", re.IGNORECASE)
 
 
@@ -273,9 +295,10 @@ def split_interjections(sentence: str) -> Opening:
 
 
 def _tidy(text: str) -> str:
+    text = _STAGE_DIRECTION.sub(" ", text).strip()
     text = _HESITATION_CLAUSE.sub(",", text)
     text = _THANKS_CLAUSE_START.sub(lambda m: m.group(1).upper(), text)
-    for clause in (_THANKS_CLAUSE_END, _HELP_CLAUSE_END):
+    for clause in (_THANKS_CLAUSE_END, _HELP_CLAUSE_END, _PROGRAM_CLAUSE_END):
         m = clause.search(text.replace("’", "'"))
         if m and text[:m.start()].strip():
             text = text[:m.start()].rstrip() + (m.group(1) or ".")
@@ -305,10 +328,16 @@ async def shape_reply(sentences: AsyncIterator[str], *, previous_opener: str | N
     the reply goes. With `reaction_allowed` False no sentence keeps an interjection (the
     thinker's summary, delivered after a scripted line)."""
     emitted = 0
+    spoken_words = 0                 # words in the sentences yielded so far
     held: str | None = None          # a stock sentence, kept only if nothing else comes
     slot_open = reaction_allowed     # the reply's one reaction, at its start
     async for raw in sentences:
         sentence = _tidy(raw)
+        if not sentence:
+            continue                     # a sentence that was only a stage direction
+        if emitted and spoken_words + len(sentence.split()) > SPOKEN_WORD_BUDGET:
+            shape.note("length")
+            break
         opening = split_interjections(sentence)
         rest = opening.rest
         stock = (_is(STOCK_LEADING, rest) if emitted == 0 else None) or _is(STOCK_OFFERS, rest)
@@ -351,6 +380,7 @@ async def shape_reply(sentences: AsyncIterator[str], *, previous_opener: str | N
             else:
                 shape.opener = kept
         emitted += 1
+        spoken_words += len(sentence.split())
         held = None
         yield sentence
     if emitted == 0 and held is not None:

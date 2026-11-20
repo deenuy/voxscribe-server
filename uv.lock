@@ -2832,7 +2832,7 @@ provides-extras = ["dev", "mac", "listen", "speech", "wake", "knowledge", "meeti
 
 [[package]]
 name = "voxscribe-server"
-version = "0.11.0"
+version = "0.12.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

@@ -27,12 +27,16 @@ from app.local.voice.barge_in import (
     BACKCHANNEL_MAX_ENERGY,
     BARGE_IN,
     BARGE_IN_DEBOUNCE_MS,
+    BARGE_IN_ECHO_MARGIN,
     BARGE_IN_ENERGY_THRESHOLD,
     BARGE_IN_FRAME_MS,
     BARGE_IN_MIN_FRAMES,
+    BARGE_IN_ONSET_GUARD_MS,
+    BARGE_IN_THRESHOLD_CAP,
     OVERLAP,
     BargeInDetector,
     interruption_note,
+    is_self_echo,
 )
 from app.local.voice.host import SAMPLE_RATE, VoiceConfig, VoiceHost
 
@@ -103,8 +107,17 @@ def _started(clauses, silent_at_playback_ms: float) -> list[str]:
 # ── detector ─────────────────────────────────────────────────────────────────
 
 
+GUARD_FRAMES = BARGE_IN_ONSET_GUARD_MS // BARGE_IN_FRAME_MS
+
+
+def _playing(det: BargeInDetector, echo: float = 0.0) -> list[str]:
+    """Playback starts and its onset guard passes, with `echo` RMS reaching capture."""
+    return det.feed(_frames(echo, GUARD_FRAMES), playing=True)
+
+
 def test_detector_fires_on_the_min_frames_th_loud_frame():
     det = BargeInDetector(SAMPLE_RATE)
+    _playing(det)
     assert det.feed(_frames(LOUD, BARGE_IN_MIN_FRAMES - 1), playing=True) == []
     assert det.feed(_frames(LOUD, 1), playing=True) == [BARGE_IN]
 
@@ -118,6 +131,7 @@ def test_detector_ignores_energy_when_nothing_plays():
 def test_debounce():
     """Two barge-in signals within BARGE_IN_DEBOUNCE_MS produce one barge-in event."""
     det = BargeInDetector(SAMPLE_RATE)
+    _playing(det)
     gap_frames = 2
     events = det.feed(_frames(LOUD, BARGE_IN_MIN_FRAMES), playing=True)
     events += det.feed(_frames(0.0, gap_frames), playing=True)
@@ -134,6 +148,7 @@ def test_debounce():
 
 def test_detector_classifies_short_and_long_bursts_that_keep_the_floor():
     det = BargeInDetector(SAMPLE_RATE)
+    _playing(det)
     short = det.feed(_frames(LOUD, BARGE_IN_MIN_FRAMES - 1), playing=True)
     short += det.feed(_frames(0.0, 1), playing=True)
     assert short == [BACKCHANNEL]
@@ -145,12 +160,65 @@ def test_detector_classifies_short_and_long_bursts_that_keep_the_floor():
     assert det.barge_ins == 0
 
 
+def test_the_reply_onset_is_measured_not_judged():
+    """Measured 2026-11-19: a reply was cut at its first audio by its own echo. Loud capture
+    in the first BARGE_IN_ONSET_GUARD_MS of playback interrupts nothing."""
+    det = BargeInDetector(SAMPLE_RATE)
+    assert det.feed(_frames(LOUD, GUARD_FRAMES), playing=True) == []
+    assert det.barge_ins == 0
+
+
+def test_an_echo_raises_the_level_an_interruption_needs():
+    echo = BARGE_IN_ENERGY_THRESHOLD * 0.75             # leaks past the canceller
+    det = BargeInDetector(SAMPLE_RATE)
+    _playing(det, echo)
+    assert det.threshold == pytest.approx(BARGE_IN_ECHO_MARGIN * echo)
+    # The echo going on at the same level, and a little louder, keeps the floor.
+    assert BARGE_IN not in det.feed(_frames(echo * 1.5, BARGE_IN_MIN_FRAMES * 5), playing=True)
+    # A person talking over it interrupts.
+    assert det.feed(_frames(LOUD * 2, BARGE_IN_MIN_FRAMES), playing=True)[-1:] == [BARGE_IN]
+
+
+def test_a_person_talking_as_playback_starts_can_still_interrupt():
+    """The onset can be the person, not the echo: the level it sets is capped."""
+    det = BargeInDetector(SAMPLE_RATE)
+    _playing(det, LOUD)
+    assert det.threshold == BARGE_IN_THRESHOLD_CAP < LOUD
+    assert det.feed(_frames(LOUD, BARGE_IN_MIN_FRAMES), playing=True) == [BARGE_IN]
+
+
+def test_each_playback_start_has_its_own_guard():
+    det = BargeInDetector(SAMPLE_RATE)
+    _playing(det)
+    det.feed(_frames(0.0, 2), playing=False)            # the gap between two clauses
+    assert det.feed(_frames(LOUD, GUARD_FRAMES), playing=True) == []
+    assert det.feed(_frames(LOUD, BARGE_IN_MIN_FRAMES), playing=True) == [BARGE_IN]
+
+
+# ── self-echo ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("heard, said, echo", [
+    # The owner's session, 2026-11-19: the reply came back as the next turn.
+    ("I'm gonna do it. Hey, Waks, how about you?", "Pretty good, thanks! How about you?", True),
+    ("thanks", "Pretty good, thanks!", True),
+    ("one moment", "One moment.", True),
+    ("wait, what about tomorrow?", "The first is a bakery on Main Street.", False),
+    ("no, the other one", "Sure, here is the first one.", False),
+    ("", "Anything.", False),
+    ("anything", "", False),
+])
+def test_is_self_echo(heard, said, echo):
+    assert is_self_echo(heard, said) is echo
+
+
 # ── 1. interruption stops playback and generation ────────────────────────────
 
 
 async def test_barge_in_stops_playback():
     """Energy above threshold for BARGE_IN_MIN_FRAMES while a reply plays calls stop_playback."""
-    burst = Burst(at_playback_ms=_ms(CLAUSES[0]) / 2, dur_ms=INTERJECTION_MS, amp=LOUD)
+    burst = Burst(at_playback_ms=BARGE_IN_ONSET_GUARD_MS + _ms(CLAUSES[0]) / 2,
+                  dur_ms=INTERJECTION_MS, amp=LOUD)
     ports, capture = sim_ports([burst], delegate=FakeDelegate([CLAUSES]))
     result = await _reply(ports, capture)
 
@@ -363,7 +431,8 @@ class _StableRecognizer(FakeRecognizer):
 async def test_no_speculation_on_the_turn_after_a_barge_in():
     """The speculative stream has no system prompt, so it cannot carry the note."""
     clauses = CLAUSES[:3]
-    burst = Burst(at_playback_ms=_ms(clauses[0]) / 2, dur_ms=SESSION_INTERJECTION_MS, amp=LOUD)
+    burst = Burst(at_playback_ms=BARGE_IN_ONSET_GUARD_MS + _ms(clauses[0]) / 2,
+                  dur_ms=SESSION_INTERJECTION_MS, amp=LOUD)
 
     class Spec(FakeDelegate):
         def __init__(self, replies):
@@ -382,6 +451,39 @@ async def test_no_speculation_on_the_turn_after_a_barge_in():
     assert ports.delegate.calls == turns
     assert ports.delegate.speculated == [turns[0]]
     assert ports.delegate.notes[1] is not None
+
+
+async def test_the_reply_heard_back_is_not_the_person_and_the_question_is_answered_again():
+    """The owner's session, 2026-11-19: the reply was cut by its own sound and came back as the
+    next turn. That turn gets no reply of its own; the question it cut off is answered again."""
+    clauses = ["Pretty good, thanks!", "How about you?"]
+    echo = Burst(at_playback_ms=BARGE_IN_ONSET_GUARD_MS + 100, dur_ms=SESSION_INTERJECTION_MS,
+                 amp=LOUD)
+    turns = ["how are you doing", "thanks how about you"]
+    ports, capture = sim_ports([echo], delegate=FakeDelegate([clauses, ["Doing well!"]]),
+                               recognizer=_StableRecognizer(turns))
+    await asyncio.wait_for(_host(ports).run_session(capture, score=0.9, detector="fake"),
+                           REPLY_TIMEOUT_S)
+    assert ports.delegate.calls == [turns[0], turns[0]]
+    assert ports.delegate.notes[1] is None         # answered as the question, not an interjection
+
+
+async def test_the_question_is_answered_again_only_once():
+    """The second answer is cut by its own sound too: its echo gets no reply, and the question is
+    not asked a third time. Playback time runs across replies, so the second echo is placed
+    after the first reply's heard part and inside the second answer, past its onset guard."""
+    clauses = ["Pretty good, thanks!", "How about you?"]
+    first = BARGE_IN_ONSET_GUARD_MS + 100
+    second = first + 2 * BARGE_IN_ONSET_GUARD_MS + 100
+    bursts = [Burst(at_playback_ms=at, dur_ms=SESSION_INTERJECTION_MS, amp=LOUD)
+              for at in (first, second)]
+    turns = ["how are you doing", "thanks how about you", "pretty good thanks"]
+    ports, capture = sim_ports(bursts, delegate=FakeDelegate([clauses, clauses, ["Fine."]]),
+                               recognizer=_StableRecognizer(turns))
+    await asyncio.wait_for(_host(ports).run_session(capture, score=0.9, detector="fake"),
+                           REPLY_TIMEOUT_S)
+    assert ports.delegate.calls == [turns[0], turns[0]]
+    assert len(ports.audio_out.stops) == 2
 
 
 @pytest.mark.parametrize("case", range(SCENARIOS))
