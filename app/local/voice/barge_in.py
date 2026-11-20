@@ -3,11 +3,20 @@
 Three parts, all used by the voice host's reply stage:
 
   BargeInDetector   reads capture energy while the speaker plays. Capture is cleaned against
-                    the playback reference (T12), so energy there is the user, not the reply.
-                    BARGE_IN_MIN_FRAMES consecutive 40 ms frames above BARGE_IN_ENERGY_THRESHOLD
-                    is an interruption; a shorter burst, or one that never gets that loud, is a
+                    the playback reference (T12), but the cleaning is not perfect: some of the
+                    reply still reaches capture, most of all as each playback starts, before
+                    the canceller has caught up and while the device's own latency plays out.
+                    So each time playback starts, the first BARGE_IN_ONSET_GUARD_MS are not
+                    judged; their loudest frame is the reply's echo as this room and this volume
+                    leave it, and from then on an interruption must be BARGE_IN_ECHO_MARGIN
+                    times louder than that echo (never quieter than BARGE_IN_ENERGY_THRESHOLD,
+                    never louder than BARGE_IN_THRESHOLD_CAP).
+                    BARGE_IN_MIN_FRAMES consecutive 40 ms frames above that level is an
+                    interruption; a shorter burst, or one that never gets that loud, is a
                     backchannel ("mm-hmm", "yeah") and the reply keeps the floor. After an
                     interruption the detector holds off for BARGE_IN_DEBOUNCE_MS.
+  is_self_echo      the check on the turn after an interruption: words that mostly repeat what
+                    the assistant was saying are the assistant heard back, not the person.
   HeardReply        wraps the talker, the gate, the speaker and the sentence source for one
                     reply, and records which clauses were released for speech (full text) and
                     which finished playing (heard text). After an interruption the stored turn
@@ -20,6 +29,7 @@ No transcript text or audio is logged.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 
@@ -43,6 +53,15 @@ BARGE_IN_DEBOUNCE_MS = 500          # cooldown after a barge-in fires
 BACKCHANNEL_MAX_ENERGY = 0.015      # "mm-hmm" stays below this (don't treat as barge-in)
 BACKCHANNEL_MAX_DURATION_MS = 600   # a voiced burst shorter than this that did not interrupt
 #                                     is a backchannel; a longer one is reported as overlap
+# Measured 2026-11-19 on the owner's laptop speakers (engine log): a reply was cut at its first
+# audio twice running and its own words came back as the next turn ("... how about you?").
+BARGE_IN_ONSET_GUARD_MS = 400       # not judged after playback starts: the echo is measured here
+BARGE_IN_ECHO_MARGIN = 2.0          # an interruption is this many times louder than that echo
+# The echo measured can be the person, already talking as playback starts; the level it sets is
+# capped so that a person talking at an ordinary level still interrupts.
+BARGE_IN_THRESHOLD_CAP = 2 * BARGE_IN_ENERGY_THRESHOLD
+SELF_ECHO_MIN_RUN = 3               # words in a row shared with what the assistant was saying
+SELF_ECHO_MIN_SHARE = 0.6           # or this share of the turn's words found in it
 BARGE_IN_PRE_ROLL_MS = 480          # capture kept before the trigger, handed to the next turn
 BARGE_IN_POLL_S = 0.05              # capture wait while watching, so the end of playback is seen
 
@@ -57,6 +76,32 @@ INTERRUPTION_NOTE = ('[The user interrupted. The assistant had said: "{played_te
 def interruption_note(played_text: str) -> str:
     """The system prompt append for the turn after a barge-in."""
     return INTERRUPTION_NOTE.format(played_text=played_text.replace('"', "'"))
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", (text or "").lower().replace("\u2019", "'"))
+
+
+def is_self_echo(heard: str, said: str) -> bool:
+    """True when `heard` (the turn after an interruption) is mostly `said` (what the assistant
+    was saying when it was cut): SELF_ECHO_MIN_RUN words in a row in common, or at least
+    SELF_ECHO_MIN_SHARE of the turn's words found in it. Used only right after a barge-in."""
+    h, s = _words(heard), _words(said)
+    if not h or not s:
+        return False
+    vocabulary = set(s)
+    if sum(w in vocabulary for w in h) / len(h) >= SELF_ECHO_MIN_SHARE:
+        return True
+    best = 0
+    previous = [0] * (len(s) + 1)
+    for hw in h:
+        current = [0] * (len(s) + 1)
+        for j, sw in enumerate(s, 1):
+            if hw == sw:
+                current[j] = previous[j - 1] + 1
+                best = max(best, current[j])
+        previous = current
+    return best >= SELF_ECHO_MIN_RUN
 
 
 def _rms(frame: np.ndarray) -> float:
@@ -86,15 +131,28 @@ class BargeInDetector:
         self._voiced = 0         # frames in the current burst above BACKCHANNEL_MAX_ENERGY
         self._fired = False      # the current burst already interrupted (or was debounced)
         self._hold_until_ms = float("-inf")
+        self._was_playing = False
+        self._guard_ms = 0.0     # what is left of the onset guard of the current playback
+        self._echo_rms = 0.0     # loudest echo measured in any onset guard of this reply
+
+    @property
+    def threshold(self) -> float:
+        """The energy an interruption must pass, given the echo measured so far."""
+        return max(BARGE_IN_ENERGY_THRESHOLD,
+                   min(BARGE_IN_ECHO_MARGIN * self._echo_rms, BARGE_IN_THRESHOLD_CAP))
 
     def feed(self, chunk, *, playing: bool) -> list[str]:
         """Events for this chunk: BARGE_IN, BACKCHANNEL or OVERLAP, usually none."""
         arr = np.asarray(chunk, dtype=np.float32).reshape(-1)
         if not playing:
+            self._was_playing = False
             self._t_ms += arr.size * self._ms_per_sample
             self._buf = np.zeros(0, dtype=np.float32)
             self._loud = 0
             return self._end_burst()
+        if not self._was_playing:
+            self._was_playing = True
+            self._guard_ms = BARGE_IN_ONSET_GUARD_MS
         self._buf = np.concatenate([self._buf, arr])
         events: list[str] = []
         while self._buf.size >= self._frame:
@@ -104,12 +162,18 @@ class BargeInDetector:
 
     def _frame_event(self, rms: float) -> list[str]:
         self._t_ms += BARGE_IN_FRAME_MS
+        if self._guard_ms > 0:
+            # Playback just started: this is the reply's echo, measured, not judged.
+            self._guard_ms -= BARGE_IN_FRAME_MS
+            self._echo_rms = max(self._echo_rms, rms)
+            return []
+        threshold = self.threshold
         events: list[str] = []
-        if rms > BACKCHANNEL_MAX_ENERGY:
+        if rms > threshold * BACKCHANNEL_MAX_ENERGY / BARGE_IN_ENERGY_THRESHOLD:
             self._voiced += 1
         else:
             events.extend(self._end_burst())
-        self._loud = self._loud + 1 if rms > BARGE_IN_ENERGY_THRESHOLD else 0
+        self._loud = self._loud + 1 if rms > threshold else 0
         if self._loud >= BARGE_IN_MIN_FRAMES and not self._fired:
             self._fired = True
             if self._t_ms >= self._hold_until_ms:
@@ -143,13 +207,20 @@ class HeardReply:
 
     `scripted` are the stream's cue and lead-in: spoken first, through Talker.fixed, and not
     part of the reply text (the reply stage does not record them either).
+
+    `on_speaking` is called each time a reply clause is handed to the speaker, with the reply
+    text handed over so far: the host tells the app the reply is being spoken, and with which
+    words. Every clause in it has passed the gate, or is the gate's own phrase.
     """
 
-    def __init__(self, clock, *, scripted: Sequence[str | None] = ()) -> None:
+    def __init__(self, clock, *, scripted: Sequence[str | None] = (),
+                 on_speaking: Callable[[str], None] | None = None) -> None:
         self._clock = clock
         self._scripted = [s for s in scripted if s]
         self._pending: tuple[object, str | None] | None = None
+        self._on_speaking = on_speaking
         self.released: list[str] = []
+        self.speaking_clauses: list[str] = []
         self.played_clauses: list[str] = []
         self.verdict: GateDecision | None = None     # the last verdict that was not a pass
         self.started_ms: int = clock.mono_ms()
@@ -232,6 +303,16 @@ class HeardReply:
             return True
         return False
 
+    def _speaking(self, clause: str) -> None:
+        # At hand-off to the speaker. A listener that fails must not cost the clause its audio.
+        self.speaking_clauses.append(clause)
+        if self._on_speaking is None:
+            return
+        try:
+            self._on_speaking(" ".join(self.speaking_clauses))
+        except Exception as exc:  # noqa: BLE001 - named by type only: its message may hold the words
+            log.warning("barge-in: the speaking listener failed: %s", type(exc).__name__)
+
     def _played(self, clause: str) -> None:
         self.played_clauses.append(clause)
 
@@ -305,6 +386,7 @@ class _HeardAudioOut:
         if clause is None:
             await self._inner.play(pcm_float32_mono, sample_rate)
             return
+        self._heard._speaking(clause)
         done: Callable[[], None] = lambda: self._heard._played(clause)  # noqa: E731
         if getattr(self._inner, "reports_played", False):
             await self._inner.play(pcm_float32_mono, sample_rate, on_played=done)

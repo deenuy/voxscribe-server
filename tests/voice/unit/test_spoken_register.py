@@ -40,7 +40,7 @@ OWNER_QUESTION = "How are you? Can you hear me?"
 OWNER_BOT_REPLY = ("I'm functioning properly, thank you for asking. Yes, I can hear you, and I'm "
                    "ready to assist you with any questions or topics you'd like to discuss.")
 CONTRACTIONS = ("i'm", "it's", "you're", "don't", "can't", "that's", "i'll", "we're")
-REGISTER_MARK = reply_chain.SPOKEN_REGISTER.splitlines()[0]
+REGISTER_MARK = "How you talk:"
 STOCK_WORDS = ("thank you for asking", "here to help", "ready to assist", "how can i help",
                "how can i assist", "anything else i can help", "great question")
 
@@ -137,14 +137,30 @@ def test_natural_keeps_what_the_prompt_must_carry():
     owner = "Call me Sam."
     prompt = reply_chain.talker_system_prompt(_settings(), _persona(owner), NATURAL)
     assert prompt.startswith(current_context_header(_settings()))
-    assert "You are Nova, a helpful voice companion." in prompt
+    assert "Your name is Nova." in prompt and "I'm Nova" not in prompt.split("How you sound")[0]
     assert TALKER_DELEGATE_INSTRUCTION in prompt
     assert prompt.endswith(owner_preferences_block(owner))
     assert "under 30 words" in prompt                      # the length bound
-    assert "say you're an AI" in prompt and "Never claim a body, a past or feelings" in prompt
-    assert "Good: Doing well, thanks. And yes, I can hear you fine." in prompt
-    assert OWNER_BOT_REPLY.split(".")[0] in prompt          # the bad example, as a bad example
+    assert "You're an AI" in prompt and "You don't make up a body or a life story" in prompt
+    assert "{name}" not in prompt                           # every placeholder filled
     assert "—" not in prompt
+
+
+def test_natural_shows_only_wanted_replies():
+    """A small model copies what it is shown, bad examples included (measured 2026-11-19: the
+    old prompt's bad reply came back nearly word for word), so the prompt shows none."""
+    prompt = reply_chain.talker_system_prompt(_settings(), _persona(), NATURAL)
+    assert "Bad:" not in prompt
+    assert OWNER_BOT_REPLY.split(".")[0] not in prompt
+    assert not any(stock in prompt.lower() for stock in STOCK_WORDS)
+
+
+def test_natural_writes_a_lowercase_profile_name_as_a_name():
+    persona = SimpleNamespace(assistant_name="vox", persona_label="", system_prompt="")
+    assert "Your name is Vox." in reply_chain.talker_system_prompt(_settings(), persona, NATURAL)
+    nameless = SimpleNamespace(assistant_name="", persona_label="", system_prompt="")
+    assert f"Your name is {reply_chain.DEFAULT_SPOKEN_NAME}." in reply_chain.talker_system_prompt(
+        _settings(), nameless, NATURAL)
 
 
 async def test_natural_reaches_the_model_with_the_barge_in_note(monkeypatch):
@@ -171,6 +187,30 @@ async def test_the_owners_reply_loses_its_stock_phrases_and_keeps_its_answer():
     assert out == ["I'm functioning properly.", "Yes, I can hear you."]
     assert any(c in text.split() for c in CONTRACTIONS)
     assert not any(stock in text for stock in STOCK_WORDS)
+
+
+async def test_stage_directions_are_not_read_out():
+    out, _ = await _shape(["(singing) Pitter, patter, on the roof.", "[Chorus]", "*clears throat* Okay."])
+    assert out == ["Pitter, patter, on the roof.", "Okay."]
+
+
+async def test_a_program_description_goes_and_the_honest_answer_stays():
+    out, shape = await _shape(["Nope, I'm an AI.",
+                               "I'm just a computer program designed to chat and help."])
+    assert out == ["Nope, I'm an AI."]
+    out, _ = await _shape(["Nope, I'm an AI, just a computer program designed to chat and help."])
+    assert out == ["Nope, I'm an AI."]
+    out, _ = await _shape(["Yes, I'm an AI."])
+    assert out == ["Yes, I'm an AI."]
+
+
+async def test_a_reply_stops_before_it_runs_past_the_word_budget():
+    long_first = " ".join(["word"] * (expression.SPOKEN_WORD_BUDGET + 5)) + "."
+    out, shape = await _shape([long_first, "More."])
+    assert out == [long_first]                                  # the first sentence always stays
+    assert "length" in (shape.removed or [])
+    out, _ = await _shape(["Canberra.", "Most people guess Sydney."])
+    assert out == ["Canberra.", "Most people guess Sydney."]
 
 
 async def test_at_most_one_interjection_and_only_at_the_start():

@@ -97,6 +97,7 @@ from app.local.voice.barge_in import (
     HeardReply,
     Interruption,
     interruption_note,
+    is_self_echo,
 )
 
 log = logging.getLogger("app.local.wake")
@@ -922,6 +923,13 @@ class SessionContext:
     silent: bool = False            # turn 1 heard no genuine speech: leave no meeting behind
     barge_in: bool = False         # the user interrupted the previous reply
     played_text: str = ""          # what the user heard of it
+    # After an interruption: what the assistant was saying (every clause handed to the speaker
+    # and its thinking line) and the question it was answering, so a next turn that is only the
+    # reply heard back is not taken for the person (barge_in.is_self_echo), and the question is
+    # answered again, once.
+    echo_text: str = ""
+    echo_question: str = ""
+    echo_retried: bool = False
     pre_roll: np.ndarray | None = None   # the interjection's start, captured during the reply
     seq: int = 0                   # sequence number of the last event the session published
     stop_requested: bool = False   # End from the app: the session closes at its next step
@@ -1661,6 +1669,22 @@ class VoiceHost:
             log.info("[Vox Listening] the turn held no words (turn=%d); listening on", turn_n)
             cancel_speculation()
             return self._ignore_turn(session)
+        if session.barge_in and is_self_echo(turn_text, session.echo_text):
+            # The interruption was the reply's own sound, and this turn is the reply heard back.
+            # Checked before the stop and closing phrases: an echoed "thanks" ends nothing.
+            cancel_speculation()
+            speculation = None
+            question = session.echo_question
+            session.barge_in, session.played_text, session.echo_text = False, "", ""
+            if not question or session.echo_retried:
+                log.info("[Vox Listening] heard its own reply (turn=%d); listening on", turn_n)
+                return self._ignore_turn(session)
+            log.info("[Vox Thinking] heard its own reply (turn=%d); answering the question "
+                     "again", turn_n)
+            session.echo_retried = True
+            if history and history[-1] == {"role": "user", "content": question}:
+                history.pop()                   # the unanswered question goes in once
+            turn_text = question
         if session.barge_in and is_stop_speaking(turn_text):
             # "Stop" said over the assistant: the speech stopped when it was interrupted, and
             # the session goes on listening.
@@ -1713,6 +1737,7 @@ class VoiceHost:
         self._publish("wake.reply", {"meetingId": session_id, "turn": turn_n,
                                      "phase": "thinking", "userText": turn_text, "text": ""})
         note = interruption_note(session.played_text) if session.barge_in else None
+        thinking_before = session.last_thinking
         result = await self._reply(session_id, turn_n, turn_text, history=history or None,
                                    speculation=speculation, turn_end_ms=turn_end_ms,
                                    asr_final_ms=asr_final_ms, audio_q=audio_q, note=note,
@@ -1726,6 +1751,15 @@ class VoiceHost:
             history.append({"role": "assistant", "content": result.text})
         session.barge_in = interrupted
         session.played_text = result.text if interrupted else ""
+        if interrupted:
+            said = [result.interruption.full_text]
+            if session.last_thinking is not None and session.last_thinking != thinking_before:
+                from app.local.voice.expression import THINKING  # lazy: boundary test
+                said.insert(0, THINKING.get(session.last_thinking, ""))
+            session.echo_text = " ".join(t for t in said if t)
+            session.echo_question = turn_text
+        else:
+            session.echo_text, session.echo_question, session.echo_retried = "", "", False
         if interrupted:
             session.pre_roll = result.pre_roll
         else:
@@ -2177,7 +2211,15 @@ class VoiceHost:
             clause_talker = _ClauseTalker(p.talker, p.clock)
 
             # T13: wrap with HeardReply so an interruption records only played clauses.
-            heard = HeardReply(p.clock, scripted=(clause_stream.cue, clause_stream.lead_in))
+            # Each clause handed to the speaker tells the app the reply is being spoken, with
+            # the words handed over so far: "thinking" before it and "done" after it stand.
+            def speaking(spoken: str) -> None:
+                self._publish("wake.reply", {"meetingId": session_id, "turn": turn_n,
+                                             "phase": "speaking", "userText": text,
+                                             "text": spoken})
+
+            heard = HeardReply(p.clock, scripted=(clause_stream.cue, clause_stream.lead_in),
+                               on_speaking=speaking)
             sentences = heard.sentences(clause_stream.sentences)
             clause_stream.sentences = sentences
             heard_out = heard.audio_out(p.audio_out)

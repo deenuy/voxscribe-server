@@ -119,11 +119,11 @@ class WakeTranscript(_Payload):
 
 
 class WakeReply(_Payload):
-    """A reply in a voice session: `thinking` when the turn has closed, `done` with what was spoken."""
+    """A reply in a voice session: `thinking` when the turn has closed, `speaking` once per clause handed to the speaker (with the words so far), `done` with what was spoken."""
 
     meetingId: str
     turn: int
-    phase: Literal["thinking", "done"]
+    phase: Literal["thinking", "speaking", "done"]
     userText: str
     text: str
     interrupted: bool | None = None

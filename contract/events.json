@@ -1159,7 +1159,7 @@
     },
     "WakeReply": {
       "additionalProperties": true,
-      "description": "A reply in a voice session: `thinking` when the turn has closed, `done` with what was spoken.",
+      "description": "A reply in a voice session: `thinking` when the turn has closed, `speaking` once per clause handed to the speaker (with the words so far), `done` with what was spoken.",
       "properties": {
         "interrupted": {
           "anyOf": [
@@ -1180,6 +1180,7 @@
         "phase": {
           "enum": [
             "thinking",
+            "speaking",
             "done"
           ],
           "title": "Phase",

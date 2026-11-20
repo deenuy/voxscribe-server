@@ -1,5 +1,26 @@
 # Changelog
 
+## What's New in VoxScribe Server 0.12.0
+
+Release of 2026-11-20. Uses voxscribe-core 0.6.0. No database migration.
+
+### New Features
+- Added a speaking signal for voice replies that carries the words as they are spoken, making it possible for an app to show the reply and animate its companion while the assistant talks.
+- Improved the natural spoken style with a warm, curious companion personality that knows its name and talks like a friend instead of a product description.
+
+### UX Improvements
+- Improved spoken replies by leaving out stage directions such as "(singing)" or "[Chorus]" instead of reading them aloud.
+- Improved spoken replies by dropping sentences that describe the assistant as a program built for a purpose, while still saying plainly that it is an AI when asked.
+- Improved spoken replies by stopping at a natural length, so a long answer no longer runs on.
+
+### Bug Fixes
+- Fixed replies being cut off the moment they started when the assistant's own voice reached the microphone.
+- Prevented the assistant from answering its own words after a cut-off reply, so the person's question is answered again instead.
+- Prevented an echo of the assistant saying "thanks" from ending the conversation.
+
+### Changed
+- Interrupting the assistant now needs a voice clearly louder than the assistant's own echo in the room, and is not judged during the first moments of each reply.
+
 ## What's New in VoxScribe Server 0.11.0
 
 Release of 2026-11-19. Uses voxscribe-core 0.6.0. No database migration.
